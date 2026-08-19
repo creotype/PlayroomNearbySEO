@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { SheetRecord } from "../domain/article.js";
 import { booleanCell, stringCell } from "../domain/article.js";
 
-const generatedArticleSchema = z.object({
+export const generatedArticleResponseSchema = z.object({
   title: z.string().min(10).max(120),
   slug: z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
   excerpt: z.string().min(40).max(300),
@@ -12,10 +12,17 @@ const generatedArticleSchema = z.object({
   meta_description: z.string().min(80).max(160),
   body_markdown: z.string().min(2_500),
   tags: z.array(z.string().min(1)).max(8),
-  source_urls: z.array(z.string().url()).min(1),
-  internal_links: z.array(z.string().url()).min(1),
+  // OpenAI strict structured outputs reject JSON Schema `format: uri`.
+  // Keep the wire schema format-free and apply URL validation after parsing.
+  source_urls: z.array(z.string().min(8).max(2_048)).min(1),
+  internal_links: z.array(z.string().min(8).max(2_048)).min(1),
   quality_score: z.number().min(0).max(10),
   qa_blockers: z.array(z.string()),
+});
+
+const generatedArticleSchema = generatedArticleResponseSchema.extend({
+  source_urls: z.array(z.string().url()).min(1),
+  internal_links: z.array(z.string().url()).min(1),
 });
 
 export type GeneratedArticle = z.infer<typeof generatedArticleSchema>;
@@ -84,9 +91,9 @@ export class OpenAiArticleGenerator {
           ].join("\n"),
         },
       ],
-      text: { format: zodTextFormat(generatedArticleSchema, "seo_article") },
+      text: { format: zodTextFormat(generatedArticleResponseSchema, "seo_article") },
     });
     if (!response.output_parsed) throw new Error("OpenAI returned no parsed article");
-    return response.output_parsed;
+    return generatedArticleSchema.parse(response.output_parsed);
   }
 }

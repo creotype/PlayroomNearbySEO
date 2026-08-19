@@ -2,7 +2,8 @@ import { Buffer } from "node:buffer";
 import { google, type sheets_v4 } from "googleapis";
 import type { AppConfig } from "../config.js";
 import type { Article, ArticleStatus, CellValue, SheetRecord } from "../domain/article.js";
-import { ARTICLE_STATUSES, stringCell } from "../domain/article.js";
+import { ARTICLE_STATUSES, dateCell, stringCell } from "../domain/article.js";
+import { KeyedMutex } from "../lib/keyed-mutex.js";
 
 const REQUIRED_HEADERS = {
   articles: [
@@ -67,6 +68,8 @@ export class GoogleSheetsStore {
   readonly #sheets: sheets_v4.Sheets;
   readonly #spreadsheetId: string;
   readonly #headerCache = new Map<SheetName, string[]>();
+  readonly #sheetIdCache = new Map<SheetName, number>();
+  readonly #eventWriteMutex = new KeyedMutex();
 
   constructor(config: AppConfig) {
     const credentials = config.googleServiceAccountJson
@@ -136,45 +139,47 @@ export class GoogleSheetsStore {
     patch: Record<string, CellValue>,
     event: AuditEvent,
   ): Promise<Article> {
-    const [articles, events] = await Promise.all([
-      this.#readTable("articles"),
-      this.#readTable("events", true),
-    ]);
-    const matches = articles.rows.filter(
-      (row) => stringCell(row.article_id).toLowerCase() === articleId.trim().toLowerCase(),
-    );
-    if (matches.length !== 1) {
-      throw new Error(`Expected exactly one article ${articleId}; found ${matches.length}`);
-    }
-    const eventValues: Record<string, CellValue> = {
-      event_id: event.event_id,
-      article_id: event.article_id,
-      event_type: event.event_type,
-      from_status: event.from_status ?? "",
-      to_status: event.to_status ?? "",
-      actor_type: event.actor_type,
-      actor_id: event.actor_id ?? "",
-      provider: event.provider ?? "",
-      provider_object_id: event.provider_object_id ?? "",
-      message: event.message ?? "",
-      payload_json: event.payload_json ?? "",
-      created_at: event.created_at,
-    };
-    const eventRow = events.rows.find((row) => !stringCell(row.event_id))?.__rowNumber ?? events.rows.length + 2;
-    const data = [
-      ...this.#patchData("articles", articles, matches[0]!, patch),
-      {
-        range: `'events'!A${eventRow}:${columnName(events.headers.length)}${eventRow}`,
-        values: [events.headers.map((header) => prepareSheetValue(header, eventValues[header] ?? ""))],
-      },
-    ];
-    await this.#sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId: this.#spreadsheetId,
-      requestBody: { valueInputOption: "RAW", data },
+    return this.#eventWriteMutex.runExclusive("events", async () => {
+      const [articles, events] = await Promise.all([
+        this.#readTable("articles"),
+        this.#readTable("events", true),
+      ]);
+      const matches = articles.rows.filter(
+        (row) => stringCell(row.article_id).toLowerCase() === articleId.trim().toLowerCase(),
+      );
+      if (matches.length !== 1) {
+        throw new Error(`Expected exactly one article ${articleId}; found ${matches.length}`);
+      }
+      const eventValues: Record<string, CellValue> = {
+        event_id: event.event_id,
+        article_id: event.article_id,
+        event_type: event.event_type,
+        from_status: event.from_status ?? "",
+        to_status: event.to_status ?? "",
+        actor_type: event.actor_type,
+        actor_id: event.actor_id ?? "",
+        provider: event.provider ?? "",
+        provider_object_id: event.provider_object_id ?? "",
+        message: event.message ?? "",
+        payload_json: event.payload_json ?? "",
+        created_at: event.created_at,
+      };
+      const [articleSheetId, eventSheetId] = await Promise.all([
+        this.#sheetId("articles"),
+        this.#sheetId("events"),
+      ]);
+      const requests = [
+        ...this.#patchRequests(articleSheetId, "articles", articles, matches[0]!, patch),
+        appendCellsRequest(eventSheetId, events.headers, eventValues),
+      ];
+      await this.#sheets.spreadsheets.batchUpdate({
+        spreadsheetId: this.#spreadsheetId,
+        requestBody: { requests },
+      });
+      const updated = await this.findArticle(articleId);
+      if (!updated) throw new Error(`Article disappeared after atomic approval: ${articleId}`);
+      return updated;
     });
-    const updated = await this.findArticle(articleId);
-    if (!updated) throw new Error(`Article disappeared after atomic approval: ${articleId}`);
-    return updated;
   }
 
   async appendArticle(values: Record<string, CellValue>): Promise<void> {
@@ -188,6 +193,47 @@ export class GoogleSheetsStore {
       .filter((row) => !statuses || statuses.includes(stringCell(row.status)));
   }
 
+  async findKeyword(keywordId: string): Promise<SheetRecord | undefined> {
+    const normalized = keywordId.trim().toLowerCase();
+    return (await this.listKeywords()).find(
+      (keyword) => stringCell(keyword.keyword_id).toLowerCase() === normalized,
+    );
+  }
+
+  async appendKeyword(values: Record<string, CellValue>): Promise<void> {
+    await this.#appendRecord("keywords", values);
+  }
+
+  async appendKeywordAndEvent(
+    keyword: Record<string, CellValue>,
+    event: AuditEvent,
+  ): Promise<void> {
+    await this.#eventWriteMutex.runExclusive("events", async () => {
+      const [keywords, events] = await Promise.all([
+        this.#readTable("keywords", true),
+        this.#readTable("events", true),
+      ]);
+      const keywordId = stringCell(keyword.keyword_id);
+      if (keywords.rows.some((row) => stringCell(row.keyword_id).toLowerCase() === keywordId.toLowerCase())) {
+        throw new Error(`Keyword already exists: ${keywordId}`);
+      }
+      const eventValues = auditEventValues(event);
+      const [keywordSheetId, eventSheetId] = await Promise.all([
+        this.#sheetId("keywords"),
+        this.#sheetId("events"),
+      ]);
+      await this.#sheets.spreadsheets.batchUpdate({
+        spreadsheetId: this.#spreadsheetId,
+        requestBody: {
+          requests: [
+            appendCellsRequest(keywordSheetId, keywords.headers, keyword),
+            appendCellsRequest(eventSheetId, events.headers, eventValues),
+          ],
+        },
+      });
+    });
+  }
+
   async patchKeyword(keywordId: string, patch: Record<string, CellValue>): Promise<void> {
     const table = await this.#readTable("keywords");
     const matches = table.rows.filter(
@@ -197,6 +243,45 @@ export class GoogleSheetsStore {
       throw new Error(`Expected exactly one keyword ${keywordId}; found ${matches.length}`);
     }
     await this.#patchRow("keywords", table, matches[0]!, patch);
+  }
+
+  async patchKeywordAndAppendEvent(
+    keywordId: string,
+    patch: Record<string, CellValue>,
+    event: AuditEvent,
+  ): Promise<void> {
+    await this.#eventWriteMutex.runExclusive("events", async () => {
+      const [keywords, events] = await Promise.all([
+        this.#readTable("keywords"),
+        this.#readTable("events", true),
+      ]);
+      const matches = keywords.rows.filter(
+        (row) => stringCell(row.keyword_id).toLowerCase() === keywordId.trim().toLowerCase(),
+      );
+      if (matches.length !== 1) {
+        throw new Error(`Expected exactly one keyword ${keywordId}; found ${matches.length}`);
+      }
+      const [keywordSheetId, eventSheetId] = await Promise.all([
+        this.#sheetId("keywords"),
+        this.#sheetId("events"),
+      ]);
+      const requests = this.#patchRequests(
+        keywordSheetId,
+        "keywords",
+        keywords,
+        matches[0]!,
+        patch,
+      );
+      if (!events.rows.some((row) => stringCell(row.event_id) === event.event_id)) {
+        const eventValues = auditEventValues(event);
+        requests.push(appendCellsRequest(eventSheetId, events.headers, eventValues));
+      }
+      if (requests.length === 0) return;
+      await this.#sheets.spreadsheets.batchUpdate({
+        spreadsheetId: this.#spreadsheetId,
+        requestBody: { requests },
+      });
+    });
   }
 
   async getSettings(): Promise<Map<string, CellValue>> {
@@ -217,19 +302,8 @@ export class GoogleSheetsStore {
   }
 
   async appendEvent(event: AuditEvent): Promise<void> {
-    await this.#appendRecord("events", {
-      event_id: event.event_id,
-      article_id: event.article_id,
-      event_type: event.event_type,
-      from_status: event.from_status ?? "",
-      to_status: event.to_status ?? "",
-      actor_type: event.actor_type,
-      actor_id: event.actor_id ?? "",
-      provider: event.provider ?? "",
-      provider_object_id: event.provider_object_id ?? "",
-      message: event.message ?? "",
-      payload_json: event.payload_json ?? "",
-      created_at: event.created_at,
+    await this.#eventWriteMutex.runExclusive("events", async () => {
+      await this.#appendRecord("events", auditEventValues(event));
     });
   }
 
@@ -291,6 +365,51 @@ export class GoogleSheetsStore {
     });
   }
 
+  #patchRequests(
+    sheetId: number,
+    sheet: SheetName,
+    table: SheetTable,
+    row: SheetRecord,
+    patch: Record<string, CellValue>,
+  ): sheets_v4.Schema$Request[] {
+    return Object.entries(patch).map(([header, value]) => {
+      const columnIndex = table.headerIndex.get(header);
+      if (columnIndex === undefined) throw new Error(`${sheet}: unknown column ${header}`);
+      return {
+        updateCells: {
+          range: {
+            sheetId,
+            startRowIndex: Number(row.__rowNumber) - 1,
+            endRowIndex: Number(row.__rowNumber),
+            startColumnIndex: columnIndex,
+            endColumnIndex: columnIndex + 1,
+          },
+          rows: [{ values: [cellData(header, value)] }],
+          fields: "userEnteredValue",
+        },
+      };
+    });
+  }
+
+  async #sheetId(sheet: SheetName): Promise<number> {
+    const cached = this.#sheetIdCache.get(sheet);
+    if (cached !== undefined) return cached;
+    const response = await this.#sheets.spreadsheets.get({
+      spreadsheetId: this.#spreadsheetId,
+      fields: "sheets.properties(sheetId,title)",
+    });
+    for (const item of response.data.sheets ?? []) {
+      const title = item.properties?.title;
+      const sheetId = item.properties?.sheetId;
+      if (title && sheetId !== undefined && sheetId !== null && title in REQUIRED_HEADERS) {
+        this.#sheetIdCache.set(title as SheetName, sheetId);
+      }
+    }
+    const resolved = this.#sheetIdCache.get(sheet);
+    if (resolved === undefined) throw new Error(`Sheet not found: ${sheet}`);
+    return resolved;
+  }
+
   async #appendRecord(sheet: SheetName, values: Record<string, CellValue>): Promise<void> {
     const headers = (await this.#readTable(sheet, true)).headers;
     await this.#sheets.spreadsheets.values.append({
@@ -303,6 +422,48 @@ export class GoogleSheetsStore {
       },
     });
   }
+}
+
+function auditEventValues(event: AuditEvent): Record<string, CellValue> {
+  return {
+    event_id: event.event_id,
+    article_id: event.article_id,
+    event_type: event.event_type,
+    from_status: event.from_status ?? "",
+    to_status: event.to_status ?? "",
+    actor_type: event.actor_type,
+    actor_id: event.actor_id ?? "",
+    provider: event.provider ?? "",
+    provider_object_id: event.provider_object_id ?? "",
+    message: event.message ?? "",
+    payload_json: event.payload_json ?? "",
+    created_at: event.created_at,
+  };
+}
+
+function appendCellsRequest(
+  sheetId: number,
+  headers: string[],
+  values: Record<string, CellValue>,
+): sheets_v4.Schema$Request {
+  return {
+    appendCells: {
+      sheetId,
+      rows: [
+        {
+          values: headers.map((header) => cellData(header, values[header] ?? "")),
+        },
+      ],
+      fields: "userEnteredValue",
+    },
+  };
+}
+
+function cellData(header: string, value: CellValue): sheets_v4.Schema$CellData {
+  const prepared = prepareSheetValue(header, value);
+  if (typeof prepared === "boolean") return { userEnteredValue: { boolValue: prepared } };
+  if (typeof prepared === "number") return { userEnteredValue: { numberValue: prepared } };
+  return { userEnteredValue: { stringValue: prepared === null ? "" : String(prepared) } };
 }
 
 function validateHeaders(sheet: SheetName, headers: string[]): void {
@@ -365,8 +526,8 @@ const DATE_HEADERS = new Set([
 export function prepareSheetValue(header: string, value: CellValue): CellValue {
   if (value === null) return "";
   if (typeof value !== "string" || !DATE_HEADERS.has(header) || !value.trim()) return value;
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return value;
+  const parsed = dateCell(value, "Europe/Belgrade");
+  if (!parsed) return value;
   return dateToGoogleSerial(parsed, "Europe/Belgrade");
 }
 

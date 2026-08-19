@@ -4,16 +4,18 @@ Long-running TypeScript service that treats the [Playroom SEO spreadsheet](https
 
 ```text
 keywords → OpenAI generation/research → articles → Telegram review
-         → /seo_approve → hash-bound approval → Ghost draft → publish → verify
+/generate ────────────────┘         → /seo_approve → Ghost publish → verify
 ```
 
-The service is safe by default. It will not write to Ghost unless all of these are true:
+The service is safe by default. It will not write to Ghost in any environment unless all of these are true:
 
 - `DRY_RUN=false` in the server environment;
 - `ALLOW_GHOST_PUBLISH=true` in the server environment;
-- `publication_enabled=true` in the Sheet;
-- `security_ready=true` in the Sheet;
-- `technical_seo_ready=true` in the Sheet.
+- `publication_enabled=true` in the Sheet.
+
+Production additionally requires both `security_ready=true` and
+`technical_seo_ready=true`. Staging is the acceptance environment and does not
+pretend those production attestations are complete.
 
 ## Implemented
 
@@ -32,11 +34,15 @@ The service is safe by default. It will not write to Ghost unless all of these a
 
 - `/seo_help`
 - `/seo_chat_id`
+- `/generate KEYWORD` (uses the Sheet `default_locale`)
+- `/generate --locale en KEYWORD`
 - `/seo_status ARTICLE-ID`
 - `/seo_approve ARTICLE-ID`
 - `/seo_cancel ARTICLE-ID reason`
 
-`ARTICLE-ID` can be omitted when the command is sent as a reply to a review card. Bot commands from private chats or any group other than the configured review group are rejected.
+`ARTICLE-ID` can be omitted when the command is sent as a reply to a review card. Generation, status, approval, and cancellation commands from private chats or any group other than the configured review group are rejected. `/seo_help` is public help, and `/seo_chat_id` intentionally works before a group is bound.
+
+`/generate` creates one durable manual request and immediately returns its `keyword_id`. The generated article still enters `needs_review`; it never bypasses QA or Telegram approval. Manual generation requires both `ALLOW_TELEGRAM_GENERATION=true` in the server environment and `telegram_generation_enabled=true` in the Sheet. Scheduled generation remains independently controlled by `generation_enabled`. The manual queue is bounded by `telegram_generation_queue_limit` (default: 3); a failed request is paused without an automatic retry and reported back to the review group.
 
 ## Configuration
 
@@ -79,4 +85,5 @@ Run exactly one replica initially. Telegram long polling and the current in-proc
 
 The current `/internal/` Ghost is not truly private: public Ghost pages, sitemap, and RSS are reachable even though `robots.txt` disallows crawling. Keep `technical_seo_ready=false` until canonical, hreflang, RU routing, and exposure decisions are resolved.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the implementation and launch backlog.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the implementation and launch backlog, and
+[docs/OPERATOR_GUIDE_RU.md](docs/OPERATOR_GUIDE_RU.md) for the owner workflow and client handoff.

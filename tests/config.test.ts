@@ -13,6 +13,7 @@ describe("loadConfig", () => {
     const config = loadConfig(validEnv);
     expect(config.dryRun).toBe(true);
     expect(config.allowGhostPublish).toBe(false);
+    expect(config.allowTelegramGeneration).toBe(false);
     expect(config.targetEnvironment).toBe("staging");
   });
 
@@ -23,12 +24,15 @@ describe("loadConfig", () => {
 
   it("rejects misspelled safety booleans instead of failing open", () => {
     expect(() => loadConfig({ ...validEnv, DRY_RUN: "flase" })).toThrow("DRY_RUN");
+    expect(() => loadConfig({ ...validEnv, ALLOW_TELEGRAM_GENERATION: "flase" })).toThrow(
+      "ALLOW_TELEGRAM_GENERATION",
+    );
   });
 
   it("treats blank optional values as absent", () => {
     const config = loadConfig({
       ...validEnv,
-      TELEGRAM_REVIEW_CHAT_ID: "",
+      TELEGRAM_REVIEW_CHAT_ID: "   ",
       OPENAI_API_KEY: "",
     });
     expect(config.telegramReviewChatId).toBeUndefined();

@@ -40,13 +40,7 @@ export class PublicationService {
   }
 
   #publishingIsEnabled(settings: Map<string, unknown>): boolean {
-    return (
-      !this.config.dryRun &&
-      this.config.allowGhostPublish &&
-      booleanCell(asCell(settings.get("publication_enabled"))) &&
-      booleanCell(asCell(settings.get("security_ready"))) &&
-      booleanCell(asCell(settings.get("technical_seo_ready")))
-    );
+    return publicationIsEnabled(this.config, settings);
   }
 
   async #process(articleId: string, timeZone: string): Promise<void> {
@@ -120,7 +114,10 @@ export class PublicationService {
     } else {
       const collision = await this.ghost.findPostBySlug(expectedSlug);
       if (collision) throw new Error(`Ghost slug already exists without matching ghost_post_id: ${expectedSlug}`);
-      post = await this.ghost.createPost(await buildGhostPayload(article, "draft"));
+      const draftPayload = await buildGhostPayload(article, "draft");
+      const currentUser = await this.ghost.readCurrentUser();
+      if (currentUser) draftPayload.authors = [{ id: currentUser.id }];
+      post = await this.ghost.createPost(draftPayload);
       await this.store.patchArticle(article.article_id, {
         ghost_post_id: post.id,
         ghost_updated_at: post.updated_at,
@@ -129,6 +126,9 @@ export class PublicationService {
       });
     }
 
+    const fresh = await this.ghost.readPost(post.id);
+    if (!fresh) throw new Error(`Ghost post disappeared before publish: ${post.id}`);
+    const publishPayload = await buildGhostPayload(article, "published");
     const currentSheetArticle = await this.store.findArticle(article.article_id);
     if (
       !currentSheetArticle ||
@@ -137,10 +137,8 @@ export class PublicationService {
     ) {
       throw new Error("Publication claim was changed before Ghost publish");
     }
-    const fresh = await this.ghost.readPost(post.id);
-    if (!fresh) throw new Error(`Ghost post disappeared before publish: ${post.id}`);
     return this.ghost.updatePost(post.id, {
-      ...(await buildGhostPayload(article, "published")),
+      ...publishPayload,
       updated_at: fresh.updated_at,
     });
   }
@@ -312,6 +310,26 @@ export class PublicationService {
       created_at: new Date().toISOString(),
     });
   }
+}
+
+export function publicationIsEnabled(
+  config: Pick<AppConfig, "dryRun" | "allowGhostPublish" | "targetEnvironment">,
+  settings: Map<string, unknown>,
+): boolean {
+  const baseGate =
+    !config.dryRun &&
+    config.allowGhostPublish &&
+    booleanCell(asCell(settings.get("publication_enabled")));
+  if (!baseGate) return false;
+
+  // Staging is the acceptance environment: publishing there is explicitly
+  // enabled by the server and Sheet gates above. Production additionally
+  // requires the security and technical SEO readiness attestations.
+  if (config.targetEnvironment === "staging") return true;
+  return (
+    booleanCell(asCell(settings.get("security_ready"))) &&
+    booleanCell(asCell(settings.get("technical_seo_ready")))
+  );
 }
 
 function parseScheduledDate(article: Article, timeZone: string): Date | undefined {

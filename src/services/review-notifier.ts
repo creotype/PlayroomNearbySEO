@@ -1,10 +1,10 @@
 import type { Logger } from "pino";
 import type { AppConfig } from "../config.js";
-import { articleContentHash, stringCell } from "../domain/article.js";
+import { articleContentHash, stringCell, type SheetRecord } from "../domain/article.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { SeoBot } from "../telegram/bot.js";
 import { reviewKeyboard } from "../telegram/bot.js";
-import { articleCard } from "../telegram/messages.js";
+import { articleCard, escapeHtml } from "../telegram/messages.js";
 
 export class ReviewNotifier {
   constructor(
@@ -55,5 +55,70 @@ export class ReviewNotifier {
         );
       }
     }
+    await this.#notifyGenerationFailures(chatId);
   }
+
+  async #notifyGenerationFailures(chatId: number): Promise<void> {
+    const keywords = (await this.store.listKeywords(["paused"])).filter((keyword) =>
+      stringCell(keyword.source).startsWith("telegram_manual:"),
+    );
+    for (const keyword of keywords) {
+      const articleId = stringCell(keyword.article_id);
+      if (!articleId) continue;
+      const events = await this.store.listEvents(articleId);
+      const failure = [...events]
+        .reverse()
+        .find((event) => ["generation_failed", "generation_blocked"].includes(stringCell(event.event_type)));
+      if (!failure) continue;
+      const notificationEventId = `evt-generation-notified-${stringCell(failure.event_id)}`;
+      if (events.some((event) => stringCell(event.event_id) === notificationEventId)) continue;
+      try {
+        const message = await this.bot.api.sendMessage(
+          chatId,
+          generationFailureMessage(keyword, failure, this.config.spreadsheetId),
+          { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+        );
+        const now = new Date().toISOString();
+        await this.store.appendEvent({
+          event_id: notificationEventId,
+          article_id: articleId,
+          event_type: "generation_failure_notified",
+          from_status: "paused",
+          to_status: "paused",
+          actor_type: "system",
+          actor_id: "review-notifier",
+          provider: "telegram",
+          provider_object_id: String(message.message_id),
+          message: `Generation failure notification sent for ${stringCell(keyword.keyword_id)}`,
+          payload_json: JSON.stringify({ failure_event_id: stringCell(failure.event_id) }),
+          created_at: now,
+        });
+      } catch (error) {
+        this.logger.error(
+          { keywordId: stringCell(keyword.keyword_id), err: error instanceof Error ? error.message : String(error) },
+          "Generation failure notification failed",
+        );
+      }
+    }
+  }
+}
+
+function generationFailureMessage(
+  keyword: SheetRecord,
+  failure: SheetRecord,
+  spreadsheetId: string,
+): string {
+  const row = keyword.__rowNumber;
+  const sheetUrl = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(spreadsheetId)}/edit#gid=910000002&range=A${row}:T${row}`;
+  const reason =
+    stringCell(failure.event_type) === "generation_blocked"
+      ? "Изменились разрешённые настройки локали или внутренних ссылок."
+      : "Генератор вернул ошибку; автоматический повтор не запускался.";
+  return [
+    `⚠️ <b>Генерация остановлена · ${escapeHtml(stringCell(keyword.keyword_id))}</b>`,
+    escapeHtml(stringCell(keyword.primary_keyword)),
+    reason,
+    "",
+    `<a href="${sheetUrl}">Открыть заявку в Google Sheets</a>`,
+  ].join("\n");
 }

@@ -9,7 +9,10 @@ const booleanFromEnv = z.preprocess((value) => {
 }, z.boolean());
 
 const optionalString = (schema: z.ZodString) =>
-  z.preprocess((value) => (value === "" ? undefined : value), schema.optional());
+  z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    schema.optional(),
+  );
 
 const integerFromEnv = z.coerce.number().int().positive();
 
@@ -32,6 +35,7 @@ const envSchema = z
     POLL_INTERVAL_MS: integerFromEnv.min(5_000).default(15_000),
     DRY_RUN: booleanFromEnv.default(true),
     ALLOW_GHOST_PUBLISH: booleanFromEnv.default(false),
+    ALLOW_TELEGRAM_GENERATION: booleanFromEnv.default(false),
   })
   .superRefine((value, context) => {
     if (!value.GOOGLE_APPLICATION_CREDENTIALS && !value.GOOGLE_SERVICE_ACCOUNT_JSON) {
@@ -61,6 +65,7 @@ export type AppConfig = {
   pollIntervalMs: number;
   dryRun: boolean;
   allowGhostPublish: boolean;
+  allowTelegramGeneration: boolean;
 };
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -97,5 +102,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     pollIntervalMs: value.POLL_INTERVAL_MS,
     dryRun: value.DRY_RUN,
     allowGhostPublish: value.ALLOW_GHOST_PUBLISH,
+    allowTelegramGeneration: value.ALLOW_TELEGRAM_GENERATION,
   };
 }

@@ -53,12 +53,12 @@ export class ApprovalService {
 
       const quality = await this.qualityGate.evaluate(article);
       if (!quality.passed) {
-        const updated = await this.store.patchArticle(article.article_id, {
+        const now = new Date().toISOString();
+        const updated = await this.store.patchArticleAndAppendEvent(article.article_id, {
           qa_status: "failed",
           qa_blockers: quality.blockers.join(","),
-          updated_at: new Date().toISOString(),
-        });
-        await this.store.appendEvent({
+          updated_at: now,
+        }, {
           event_id: randomUUID(),
           article_id: article.article_id,
           event_type: "approval_blocked",
@@ -70,7 +70,7 @@ export class ApprovalService {
           provider_object_id: commandId,
           message: "Approval blocked by QA",
           payload_json: JSON.stringify({ blockers: quality.blockers, score: quality.score }),
-          created_at: new Date().toISOString(),
+          created_at: now,
         });
         return { outcome: "blocked", article: updated, quality };
       }
@@ -124,12 +124,11 @@ export class ApprovalService {
       if (article.status === "published") throw new Error("Published articles cannot be cancelled");
       if (article.status !== "cancelled") assertTransition(article.status, "cancelled");
       const now = new Date().toISOString();
-      const updated = await this.store.patchArticle(article.article_id, {
+      return this.store.patchArticleAndAppendEvent(article.article_id, {
         status: "cancelled",
         feedback: reason,
         updated_at: now,
-      });
-      await this.store.appendEvent({
+      }, {
         event_id: randomUUID(),
         article_id: article.article_id,
         event_type: "cancelled",
@@ -143,7 +142,6 @@ export class ApprovalService {
         payload_json: JSON.stringify({ username: actor.username ?? null }),
         created_at: now,
       });
-      return updated;
     });
   }
 

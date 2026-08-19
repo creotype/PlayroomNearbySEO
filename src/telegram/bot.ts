@@ -4,6 +4,11 @@ import type { AppConfig } from "../config.js";
 import type { Article } from "../domain/article.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { ApprovalResult, ApprovalService, TelegramActor } from "../services/approval-service.js";
+import type {
+  GenerationService,
+  ManualGenerationBlockReason,
+  ManualGenerationResult,
+} from "../services/generation-service.js";
 import { articleStatusMessage, escapeHtml } from "./messages.js";
 
 export type SeoBot = Bot<Context>;
@@ -12,15 +17,17 @@ export function createTelegramBot(options: {
   config: AppConfig;
   store: GoogleSheetsStore;
   approvals: ApprovalService;
+  generation: GenerationService;
   logger: Logger;
 }): SeoBot {
-  const { config, store, approvals, logger } = options;
+  const { config, store, approvals, generation, logger } = options;
   const bot = new Bot(config.telegramBotToken);
 
   bot.command("seo_help", async (ctx) => {
     await ctx.reply(
       [
         "<b>Playroom SEO bot</b>",
+        "/generate [--locale sr|en] KEYWORD — создать статью",
         "/seo_approve ARTICLE-ID — согласовать",
         "/seo_status ARTICLE-ID — актуальный статус",
         "/seo_cancel ARTICLE-ID причина — отменить",
@@ -38,6 +45,32 @@ export function createTelegramBot(options: {
       return;
     }
     await ctx.reply(`Chat ID: <code>${ctx.chat.id}</code>`, { parse_mode: "HTML" });
+  });
+
+  bot.command("generate", async (ctx) => {
+    if (!(await authorizeReviewChat(ctx, config, store))) return;
+    const parsed = parseGenerateCommand(commandArgs(ctx));
+    if (parsed.outcome === "invalid") {
+      await ctx.reply(generateUsage(parsed.message));
+      return;
+    }
+    const actor = actorFromContext(ctx);
+    try {
+      const result = await generation.requestManualGeneration({
+        keyword: parsed.keyword,
+        ...(parsed.locale ? { locale: parsed.locale } : {}),
+        actorId: actor.id,
+        actorName: actor.displayName,
+        providerObjectId: actor.providerObjectId,
+      });
+      await replyGenerationResult(ctx, result);
+    } catch (error) {
+      logger.error(
+        { updateId: ctx.update.update_id, err: error instanceof Error ? error.message : String(error) },
+        "Manual generation request failed",
+      );
+      await ctx.reply("⚠️ Не удалось поставить статью в очередь. Попробуйте ещё раз позже.");
+    }
   });
 
   bot.command("seo_status", async (ctx) => {
@@ -108,6 +141,41 @@ export function createTelegramBot(options: {
     );
   });
   return bot;
+}
+
+export const telegramCommandMenu = [
+  { command: "generate", description: "Создать новую SEO-статью" },
+  { command: "seo_status", description: "Показать статус статьи" },
+  { command: "seo_approve", description: "Согласовать статью" },
+  { command: "seo_cancel", description: "Отменить статью с причиной" },
+  { command: "seo_help", description: "Показать справку" },
+  { command: "seo_chat_id", description: "Показать ID review-группы" },
+] as const;
+
+export type ParsedGenerateCommand =
+  | { outcome: "valid"; keyword: string; locale?: string }
+  | { outcome: "invalid"; message: string };
+
+export function parseGenerateCommand(raw: string): ParsedGenerateCommand {
+  const normalized = raw.normalize("NFKC").replace(/\s+/gu, " ").trim();
+  if (!normalized) return { outcome: "invalid", message: "Укажите ключевую фразу." };
+
+  let keyword = normalized;
+  let locale: string | undefined;
+  if (normalized.startsWith("--")) {
+    const match = normalized.match(/^--locale(?:=|\s+)([a-z]{2})(?:\s*[|:]\s*|\s+)(.+)$/iu);
+    if (!match) return { outcome: "invalid", message: "Не удалось разобрать параметр locale." };
+    locale = match[1]?.toLowerCase();
+    keyword = match[2] ?? "";
+  } else if (/^(sr|en|ru)$/iu.test(normalized)) {
+    return { outcome: "invalid", message: "После locale укажите ключевую фразу через --locale." };
+  }
+
+  keyword = keyword.replace(/\s+/gu, " ").trim();
+  if (keyword.length < 2 || keyword.length > 200 || /[\u0000-\u001F\u007F]/u.test(keyword)) {
+    return { outcome: "invalid", message: "Ключ должен содержать от 2 до 200 символов." };
+  }
+  return { outcome: "valid", keyword, ...(locale ? { locale } : {}) };
 }
 
 export function reviewKeyboard(articleId: string): InlineKeyboard {
@@ -200,4 +268,64 @@ async function replyApprovalResult(ctx: Context, result: ApprovalResult): Promis
     `⛔ Текущий статус <code>${escapeHtml(result.article.status)}</code>; требуется <code>needs_review</code>.`,
     { parse_mode: "HTML" },
   );
+}
+
+async function replyGenerationResult(ctx: Context, result: ManualGenerationResult): Promise<void> {
+  if (result.outcome === "blocked") {
+    await ctx.reply(manualGenerationBlockedMessage(result.reason, result.locale));
+    return;
+  }
+  if (result.outcome === "already_generated") {
+    await ctx.reply(
+      [
+        `ℹ️ По этому ключу уже создана статья <code>${escapeHtml(result.articleId)}</code>.`,
+        `Проверить: <code>/seo_status ${escapeHtml(result.articleId)}</code>`,
+      ].join("\n"),
+      { parse_mode: "HTML" },
+    );
+    return;
+  }
+  if (result.outcome === "previous_failed") {
+    await ctx.reply(
+      `⚠️ Предыдущая генерация <code>${escapeHtml(result.keywordId)}</code> завершилась ошибкой. Проверьте строку keywords; автоматический повтор не запущен.`,
+      { parse_mode: "HTML" },
+    );
+    return;
+  }
+  if (result.outcome === "already_queued") {
+    await ctx.reply(`ℹ️ Такой запрос уже в очереди: <code>${escapeHtml(result.keywordId)}</code>.`, {
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  await ctx.reply(
+    [
+      `🧠 Принял запрос «${escapeHtml(result.keyword)}» · ${escapeHtml(result.locale.toUpperCase())}`,
+      `Keyword ID: <code>${escapeHtml(result.keywordId)}</code>`,
+      "Карточка появится в этой группе после генерации и QA.",
+    ].join("\n"),
+    { parse_mode: "HTML" },
+  );
+}
+
+function manualGenerationBlockedMessage(reason: ManualGenerationBlockReason, locale?: string): string {
+  if (reason === "generator_not_configured") return "⛔ Генератор пока не настроен.";
+  if (reason === "manual_generation_disabled") return "⛔ Ручная генерация сейчас выключена администратором.";
+  if (reason === "invalid_keyword") return generateUsage("Ключ должен содержать от 2 до 200 символов.");
+  if (reason === "ru_disabled") return "⛔ RU-генерация выключена до готовности русского раздела сайта.";
+  if (reason === "no_internal_links") {
+    return `⛔ Для ${String(locale ?? "этой локали").toUpperCase()} нет разрешённых внутренних ссылок.`;
+  }
+  if (reason === "queue_full") return "⛔ Очередь ручной генерации заполнена. Дождитесь ближайшей карточки.";
+  return `⛔ Локаль ${String(locale ?? "").toUpperCase() || "не настроена"} недоступна.`;
+}
+
+function generateUsage(message: string): string {
+  return [
+    message,
+    "",
+    "Примеры:",
+    "/generate igraonice za decu Beograd",
+    "/generate --locale en kids playrooms Belgrade",
+  ].join("\n");
 }

@@ -10,6 +10,13 @@ export type GhostPost = {
   published_at?: string | null;
 };
 
+export type GhostUser = {
+  id: string;
+  name: string;
+  status: string;
+  roles?: Array<{ name: string }>;
+};
+
 export type GhostPostInput = {
   title: string;
   slug: string;
@@ -22,9 +29,14 @@ export type GhostPostInput = {
   feature_image?: string;
   feature_image_alt?: string;
   published_at?: string;
+  authors?: Array<{ id: string }>;
 };
 
-type GhostEnvelope = { posts?: GhostPost[]; errors?: Array<{ message?: string; type?: string }> };
+type GhostEnvelope = {
+  posts?: GhostPost[];
+  users?: GhostUser[];
+  errors?: Array<{ message?: string; type?: string; context?: string }>;
+};
 
 export class GhostAdminClient {
   readonly #baseUrl: string;
@@ -46,6 +58,15 @@ export class GhostAdminClient {
       "site/",
     );
     return response.site;
+  }
+
+  async readCurrentUser(): Promise<GhostUser | undefined> {
+    const response = await this.#request<GhostEnvelope>(
+      "users/me/?include=roles",
+      undefined,
+      [404],
+    );
+    return response.users?.[0];
   }
 
   async findPostBySlug(slug: string): Promise<GhostPost | undefined> {
@@ -114,7 +135,10 @@ export class GhostAdminClient {
       parsed = undefined;
     }
     if (!response.ok) {
-      const reason = parsed?.errors?.map((error) => error.message).filter(Boolean).join("; ");
+      const reason = parsed?.errors
+        ?.map((error) => [error.message, error.context].filter(Boolean).join(" — "))
+        .filter(Boolean)
+        .join("; ");
       throw new Error(`Ghost API ${response.status}: ${reason || "request failed"}`);
     }
     return (parsed ?? JSON.parse(raw)) as T;

@@ -12,7 +12,7 @@ import { PublicationService } from "./services/publication-service.js";
 import { QualityGate } from "./services/quality-gate.js";
 import { ReviewNotifier } from "./services/review-notifier.js";
 import { Scheduler } from "./services/scheduler.js";
-import { createTelegramBot, type SeoBot } from "./telegram/bot.js";
+import { createTelegramBot, telegramCommandMenu, type SeoBot } from "./telegram/bot.js";
 
 export type RunningApp = {
   shutdown: (signal?: string) => Promise<void>;
@@ -33,11 +33,12 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
     ? new OpenAiArticleGenerator(config.openAiApiKey, config.openAiModel)
     : undefined;
   const generation = new GenerationService(store, generator, config, logger);
-  const bot = createTelegramBot({ config, store, approvals, logger });
+  const bot = createTelegramBot({ config, store, approvals, generation, logger });
   const publication = new PublicationService(store, ghost, config, logger, workflowMutex);
   const notifier = new ReviewNotifier(store, bot, config, logger);
   const scheduler = new Scheduler(config.pollIntervalMs, logger);
-  scheduler.add("generator", () => generation.runOnce());
+  scheduler.add("manual-generator", () => generation.runManualOnce());
+  scheduler.add("scheduled-generator", () => generation.runOnce());
   scheduler.add("review-notifier", () => notifier.runOnce());
   scheduler.add("publisher", () => publication.runOnce());
 
@@ -86,9 +87,9 @@ async function runStartupChecks(options: {
 }): Promise<void> {
   const { readiness, store, ghost, bot, logger, config } = options;
   const checks = await Promise.allSettled([
-    store.verifySchema(),
+    verifySheets(store, config),
     ghost.readSite(),
-    bot.api.getMe(),
+    verifyTelegram(bot, logger),
   ]);
   const names = ["google_sheets", "ghost", "telegram"] as const;
   checks.forEach((result, index) => {
@@ -111,6 +112,27 @@ async function runStartupChecks(options: {
     { dryRun: config.dryRun, ghostPublishingAllowed: config.allowGhostPublish, generatorConfigured: Boolean(config.openAiApiKey) },
     "Startup checks passed",
   );
+}
+
+async function verifySheets(store: GoogleSheetsStore, config: AppConfig): Promise<void> {
+  await store.verifySchema();
+  if (!config.allowTelegramGeneration) return;
+  const settings = await store.getSettings();
+  if (!settings.has("telegram_generation_enabled")) {
+    throw new Error("settings.telegram_generation_enabled is required when Telegram generation is enabled");
+  }
+}
+
+async function verifyTelegram(bot: SeoBot, logger: Logger): Promise<void> {
+  await bot.api.getMe();
+  try {
+    await bot.api.setMyCommands([...telegramCommandMenu]);
+  } catch (error) {
+    logger.warn(
+      { err: error instanceof Error ? error.message : String(error) },
+      "Telegram command menu update failed; command handlers remain available",
+    );
+  }
 }
 
 async function closeServer(server: Server): Promise<void> {
