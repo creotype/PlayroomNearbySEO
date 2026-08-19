@@ -37,10 +37,11 @@ pretend those production attestations are complete.
 - `/generate KEYWORD` (uses the Sheet `default_locale`)
 - `/generate --locale en KEYWORD`
 - `/seo_status ARTICLE-ID`
+- `/seo_regenerate ARTICLE-ID [editor feedback]`
 - `/seo_approve ARTICLE-ID`
 - `/seo_cancel ARTICLE-ID reason`
 
-`ARTICLE-ID` can be omitted when the command is sent as a reply to a review card. Generation, status, approval, and cancellation commands from private chats or any group other than the configured review group are rejected. `/seo_help` is public help, and `/seo_chat_id` intentionally works before a group is bound.
+`ARTICLE-ID` can be omitted when the command is sent as a reply to a review card. Regeneration replaces the same review row only after OpenAI succeeds, keeps the old draft on failure, increments `revision_count`, and never reopens an approved or published article. Generation, regeneration, status, approval, and cancellation commands from private chats or any group other than the configured review group are rejected. `/seo_help` is public help, and `/seo_chat_id` intentionally works before a group is bound.
 
 `/generate` creates one durable manual request and immediately returns its `keyword_id`. The generated article still enters `needs_review`; it never bypasses QA or Telegram approval. Manual generation requires both `ALLOW_TELEGRAM_GENERATION=true` in the server environment and `telegram_generation_enabled=true` in the Sheet. Scheduled generation remains independently controlled by `generation_enabled`. The manual queue is bounded by `telegram_generation_queue_limit` (default: 3); a failed request is paused without an automatic retry and reported back to the review group.
 

@@ -8,12 +8,18 @@ import {
   numberCell,
   parseListCell,
   stringCell,
+  type Article,
   type CellValue,
   type SheetRecord,
 } from "../domain/article.js";
-import type { OpenAiArticleGenerator } from "../generation/openai-generator.js";
+import {
+  isSemanticGeneratedQaBlocker,
+  type GeneratedQaBlockerCode,
+} from "../domain/quality.js";
+import type { GeneratedArticle, OpenAiArticleGenerator } from "../generation/openai-generator.js";
 import { KeyedMutex } from "../lib/keyed-mutex.js";
 import type { AuditEvent, GoogleSheetsStore } from "../sheets/google-sheets.js";
+import { QualityGate } from "./quality-gate.js";
 
 const MANUAL_SOURCE_PREFIX = "telegram_manual:";
 const CLAIMED_STATUS = "assigned";
@@ -49,6 +55,30 @@ export type ManualGenerationResult =
       locale?: string;
     };
 
+export type RegenerationRequest = {
+  articleId: string;
+  feedback?: string;
+  actorId: number | string;
+  actorName: string;
+  providerObjectId: string;
+  actorType?: "telegram_user" | "system";
+  provider?: "telegram" | "system";
+};
+
+export type RegenerationResult =
+  | { outcome: "regenerated" | "already_regenerated"; article: Article }
+  | {
+      outcome: "blocked";
+      reason:
+        | "generator_not_configured"
+        | "manual_generation_disabled"
+        | "invalid_status"
+        | "locale_disabled"
+        | "ru_disabled"
+        | "no_internal_links";
+      article?: Article;
+    };
+
 export class GenerationService {
   #running = false;
   readonly #requestMutex = new KeyedMutex();
@@ -58,6 +88,8 @@ export class GenerationService {
     private readonly generator: OpenAiArticleGenerator | undefined,
     private readonly config: AppConfig,
     private readonly logger: Logger,
+    private readonly qualityGate: QualityGate = new QualityGate(store, config),
+    private readonly workflowMutex: KeyedMutex = new KeyedMutex(),
   ) {}
 
   /** Scheduled queue. The Sheet generation_enabled flag is an absolute gate. */
@@ -204,6 +236,136 @@ export class GenerationService {
     });
   }
 
+  async regenerateArticle(request: RegenerationRequest): Promise<RegenerationResult> {
+    if (!this.generator) return { outcome: "blocked", reason: "generator_not_configured" };
+
+    return this.workflowMutex.runExclusive(request.articleId, async () => {
+      const article = await this.store.findArticle(request.articleId);
+      if (!article) throw new Error(`Article not found: ${request.articleId}`);
+
+      const provider = request.provider ?? "telegram";
+      const commandId = providerCommandId(provider, request.providerObjectId);
+      const events = await this.store.listEvents(article.article_id);
+      if (
+        events.some(
+          (event) =>
+            stringCell(event.event_type) === "regenerated" &&
+            stringCell(event.provider_object_id) === commandId,
+        )
+      ) {
+        return { outcome: "already_regenerated", article };
+      }
+      if (article.status !== "needs_review" && article.status !== "failed_qa") {
+        return { outcome: "blocked", reason: "invalid_status", article };
+      }
+
+      const settings = await this.store.getSettings();
+      if (!manualGenerationIsEnabled(this.config, settings)) {
+        return { outcome: "blocked", reason: "manual_generation_disabled", article };
+      }
+      const [guardrails, links] = await Promise.all([
+        this.store.listGuardrails(),
+        this.store.listLinks(),
+      ]);
+      const locale = stringCell(article.locale).toLowerCase();
+      const enabledLocales = new Set(
+        parseListCell(settings.get("enabled_locales")).map((value) => value.toLowerCase()),
+      );
+      if (locale === "ru" && !booleanCell(settings.get("ru_enabled"))) {
+        return { outcome: "blocked", reason: "ru_disabled", article };
+      }
+      if (!locale || !enabledLocales.has(locale)) {
+        return { outcome: "blocked", reason: "locale_disabled", article };
+      }
+      const allowedLinks = links.filter(
+        (link) =>
+          stringCell(link.environment) === this.config.targetEnvironment &&
+          stringCell(link.status) === "active" &&
+          booleanCell(link.allow_internal_link) &&
+          ["all", locale].includes(stringCell(link.locale)),
+      );
+      if (allowedLinks.length === 0) {
+        return { outcome: "blocked", reason: "no_internal_links", article };
+      }
+      const currentQuality = await this.qualityGate.evaluate({
+        ...article,
+        manual_required: false,
+      });
+      const generated = await this.generator!.generate({
+        keyword: {
+          ...article,
+          topic_angle: stringCell(article.topic) || stringCell(article.primary_keyword),
+          research_notes: stringCell(request.feedback),
+        },
+        guardrails,
+        allowedLinks,
+        targetWords: numberCell(settings.get("default_article_length_words")) || 1_200,
+        revision: {
+          article,
+          ...(stringCell(request.feedback) ? { feedback: stringCell(request.feedback) } : {}),
+          deterministicBlockers: currentQuality.blockers,
+        },
+      });
+
+      const now = new Date().toISOString();
+      const generatedFields = generatedArticleFields(generated);
+      const candidate = {
+        ...article,
+        ...generatedFields,
+        status: "needs_review",
+        qa_status: "pass",
+        qa_blockers: "",
+        manual_required: false,
+        updated_at: now,
+      } as Article;
+      const quality = await this.#evaluateGeneratedCandidate(candidate, generated.qa_blockers);
+      const revisionCount = numberCell(article.revision_count) + 1;
+      const updated = await this.store.patchArticleAndAppendEvent(
+        article.article_id,
+        {
+          ...generatedFields,
+          status: "needs_review",
+          qa_status: quality.blockers.length === 0 ? "pass" : "fail",
+          qa_blockers: quality.blockers.join(","),
+          manual_required: quality.manualRequired,
+          revision_count: revisionCount,
+          content_hash: "",
+          approved_by: "",
+          approved_at: "",
+          ghost_post_id: "",
+          ghost_updated_at: "",
+          ghost_draft_url: "",
+          public_url: "",
+          published_at: "",
+          last_error: "",
+          ...(stringCell(request.feedback) ? { feedback: stringCell(request.feedback) } : {}),
+          updated_at: now,
+        },
+        {
+          event_id: stableEventId("regenerated", request.providerObjectId),
+          article_id: article.article_id,
+          event_type: "regenerated",
+          from_status: article.status,
+          to_status: "needs_review",
+          actor_type: request.actorType ?? "telegram_user",
+          actor_id: String(request.actorId),
+          provider,
+          provider_object_id: commandId,
+          message: `Regenerated by ${request.actorName}`,
+          payload_json: JSON.stringify({
+            previous_hash: articleContentHash(article),
+            revision_count: revisionCount,
+            feedback: stringCell(request.feedback) || null,
+            model: this.config.openAiModel,
+            qa_blockers: quality.blockers,
+          }),
+          created_at: now,
+        },
+      );
+      return { outcome: "regenerated", article: updated };
+    });
+  }
+
   async #runQueue(queue: "manual" | "scheduled"): Promise<void> {
     if (this.#running || !this.generator) return;
     this.#running = true;
@@ -325,6 +487,7 @@ export class GenerationService {
     }
 
     const now = new Date().toISOString();
+    const generatedFields = generatedArticleFields(generated);
     const values: Record<string, CellValue> = {
       article_id: articleId,
       keyword_id: keywordId,
@@ -336,24 +499,28 @@ export class GenerationService {
       search_intent: stringCell(keyword.search_intent),
       article_type: stringCell(keyword.article_type),
       topic: stringCell(keyword.topic_angle) || stringCell(keyword.primary_keyword),
-      title: generated.title,
-      slug: generated.slug,
-      excerpt: generated.excerpt,
-      seo_title: generated.seo_title,
-      meta_description: generated.meta_description,
-      body_markdown: generated.body_markdown,
-      tags: generated.tags.join(","),
-      source_urls: generated.source_urls.join("\n"),
-      internal_links: generated.internal_links.join("\n"),
+      ...generatedFields,
       scheduled_publish_at: keyword.planned_publish_at ?? "",
       quality_score: generated.quality_score,
-      qa_status: generated.qa_blockers.length === 0 ? "passed" : "failed",
-      qa_blockers: generated.qa_blockers.join(","),
+      qa_status: "pass",
+      qa_blockers: "",
       manual_required: false,
       revision_count: 0,
       created_at: now,
       updated_at: now,
     };
+    try {
+      const quality = await this.#evaluateGeneratedCandidate(
+        { ...values, __rowNumber: 0 } as Article,
+        generated.qa_blockers,
+      );
+      values.qa_status = quality.blockers.length === 0 ? "pass" : "fail";
+      values.qa_blockers = quality.blockers.join(",");
+      values.manual_required = quality.manualRequired;
+    } catch (error) {
+      await this.#failKeyword(keyword, error);
+      return;
+    }
     values.content_hash = articleContentHash({ ...values, __rowNumber: 0 } as SheetRecord);
 
     try {
@@ -522,6 +689,41 @@ export class GenerationService {
       return false;
     }
   }
+
+  async #evaluateGeneratedCandidate(
+    candidate: Article,
+    modelBlockers: GeneratedQaBlockerCode[],
+  ): Promise<{ blockers: string[]; manualRequired: boolean }> {
+    const deterministic = await this.qualityGate.evaluate({
+      ...candidate,
+      qa_status: "pass",
+      qa_blockers: "",
+      manual_required: false,
+    });
+    return {
+      blockers: [...new Set([...deterministic.blockers, ...modelBlockers])].sort(),
+      manualRequired: modelBlockers.some(isSemanticGeneratedQaBlocker),
+    };
+  }
+}
+
+function generatedArticleFields(generated: GeneratedArticle): Record<string, CellValue> {
+  return {
+    title: generated.title,
+    slug: generated.slug,
+    excerpt: generated.excerpt,
+    seo_title: generated.seo_title,
+    meta_description: generated.meta_description,
+    body_markdown: generated.body_markdown,
+    tags: generated.tags.join(","),
+    source_urls: generated.source_urls.join("\n"),
+    internal_links: generated.internal_links.join("\n"),
+    quality_score: generated.quality_score,
+  };
+}
+
+function providerCommandId(provider: "telegram" | "system", providerObjectId: string): string {
+  return `${provider}:${providerObjectId}`;
 }
 
 function requestedEvent(

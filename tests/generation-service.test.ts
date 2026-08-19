@@ -3,12 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config.js";
 import type { CellValue, SheetRecord } from "../src/domain/article.js";
 import type { OpenAiArticleGenerator } from "../src/generation/openai-generator.js";
+import { KeyedMutex } from "../src/lib/keyed-mutex.js";
 import type { GoogleSheetsStore } from "../src/sheets/google-sheets.js";
 import {
   GenerationService,
   manualGenerationIsEnabled,
   manualRequestIds,
 } from "../src/services/generation-service.js";
+import { QualityGate } from "../src/services/quality-gate.js";
 
 const config: AppConfig = {
   nodeEnv: "test",
@@ -29,6 +31,11 @@ const config: AppConfig = {
 };
 
 const logger = { error: vi.fn(), warn: vi.fn() } as unknown as Logger;
+const allowedInternalUrl = "https://example.com/rs";
+
+function validGeneratedBody(): string {
+  return `${Array.from({ length: 510 }, () => "savet").join(" ")}\n\n[Playroom vodič](${allowedInternalUrl})`;
+}
 
 function settings(overrides: Record<string, CellValue> = {}): Map<string, CellValue> {
   return new Map<string, CellValue>([
@@ -48,6 +55,10 @@ function setup(options: {
   keywords?: SheetRecord[];
   articles?: SheetRecord[];
   generatorError?: Error;
+  qaBlockers?: string[];
+  generatedOverrides?: Record<string, unknown>;
+  links?: SheetRecord[];
+  workflowMutex?: KeyedMutex;
 } = {}) {
   const keywordRows = options.keywords ?? [];
   const articleRows = options.articles ?? [];
@@ -60,34 +71,36 @@ function setup(options: {
       excerpt: "Praktičan vodič za roditelje koji biraju igraonicu u Beogradu.",
       seo_title: "Kako izabrati igraonicu u Beogradu",
       meta_description: "Praktični saveti za izbor igraonice u Beogradu, sa pitanjima o uslovima, programu i organizaciji proslave.",
-      body_markdown: "Dovoljno dugačak test tekst",
+      body_markdown: validGeneratedBody(),
       tags: ["rs"],
       source_urls: ["https://example.com/source"],
-      internal_links: ["https://example.com/rs"],
+      internal_links: [allowedInternalUrl],
       quality_score: 9,
-      qa_blockers: [],
+      qa_blockers: options.qaBlockers ?? [],
+      ...options.generatedOverrides,
     };
   });
   const store = {
     getSettings: async () => options.settings ?? settings(),
-    listLinks: async () => [
-      {
-        __rowNumber: 2,
-        environment: "staging",
-        locale: "sr",
-        url: "https://example.com/rs",
-        status: "active",
-        allow_internal_link: true,
-      },
-      {
-        __rowNumber: 3,
-        environment: "staging",
-        locale: "en",
-        url: "https://example.com/en",
-        status: "active",
-        allow_internal_link: true,
-      },
-    ],
+    listLinks: async () =>
+      options.links ?? [
+        {
+          __rowNumber: 2,
+          environment: "staging",
+          locale: "sr",
+          url: "https://example.com/rs",
+          status: "active",
+          allow_internal_link: true,
+        },
+        {
+          __rowNumber: 3,
+          environment: "staging",
+          locale: "en",
+          url: "https://example.com/en",
+          status: "active",
+          allow_internal_link: true,
+        },
+      ],
     listGuardrails: async () => [],
     listKeywords: async (statuses?: readonly string[]) =>
       keywordRows.filter((row) => !statuses || statuses.includes(String(row.status))),
@@ -125,16 +138,32 @@ function setup(options: {
     appendArticle: async (values: Record<string, CellValue>) => {
       articleRows.push({ __rowNumber: articleRows.length + 2, ...values });
     },
+    patchArticleAndAppendEvent: async (
+      articleId: string,
+      patch: Record<string, CellValue>,
+      event: Record<string, CellValue>,
+    ) => {
+      const article = articleRows.find((row) => row.article_id === articleId);
+      if (!article) throw new Error(`Missing article ${articleId}`);
+      Object.assign(article, patch);
+      if (!events.some((existing) => existing.event_id === event.event_id)) {
+        events.push({ __rowNumber: events.length + 2, ...event });
+      }
+      return article;
+    },
     listEvents: async (articleId: string) => events.filter((event) => event.article_id === articleId),
     appendEvent: async (event: Record<string, CellValue>) => {
       events.push({ __rowNumber: events.length + 2, ...event });
     },
   };
+  const typedStore = store as unknown as GoogleSheetsStore;
   const service = new GenerationService(
-    store as unknown as GoogleSheetsStore,
+    typedStore,
     { generate } as unknown as OpenAiArticleGenerator,
     config,
     logger,
+    new QualityGate(typedStore, config),
+    options.workflowMutex,
   );
   return { service, keywordRows, articleRows, events, generate };
 }
@@ -266,7 +295,39 @@ describe("manual generation worker", () => {
     expect(manual.status).toBe("used");
     expect(scheduled.status).toBe("ready");
     expect(test.articleRows).toHaveLength(1);
-    expect(test.articleRows[0]).toMatchObject({ article_id: ids.articleId, status: "needs_review" });
+    expect(test.articleRows[0]).toMatchObject({
+      article_id: ids.articleId,
+      status: "needs_review",
+      qa_status: "pass",
+      manual_required: false,
+    });
+  });
+
+  it("requires explicit human clearance when model QA reports a semantic defect", async () => {
+    const test = setup({ qaBlockers: ["missing_authoritative_source"] });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    expect(test.articleRows[0]).toMatchObject({
+      qa_status: "fail",
+      qa_blockers: "missing_authoritative_source",
+      manual_required: true,
+    });
+  });
+
+  it("runs fresh deterministic QA before appending an initially generated article", async () => {
+    const malformedBody = `${Array.from({ length: 510 }, () => "savet").join(" ")}\n\n[Playroom].(${allowedInternalUrl})\n[Izvor](https://example.org/story)`;
+    const test = setup({
+      generatedOverrides: {
+        body_markdown: malformedBody,
+        source_urls: ["https://example.org/story?utm_source=openai"],
+      },
+    });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    expect(String(test.articleRows[0]?.qa_blockers)).toContain("malformed_markdown_link");
+    expect(String(test.articleRows[0]?.qa_blockers)).toContain("external_url_in_body");
+    expect(String(test.articleRows[0]?.qa_blockers)).toContain("tracking_parameters_in_source_url");
+    expect(test.articleRows[0]?.qa_status).toBe("fail");
   });
 
   it("moves a failed request to paused without a retry loop", async () => {
@@ -326,5 +387,199 @@ describe("manual generation worker", () => {
     expect(test.generate).not.toHaveBeenCalled();
     expect(test.keywordRows[0]?.status).toBe("paused");
     expect(test.events.some((event) => event.event_type === "generation_blocked")).toBe(true);
+  });
+});
+
+const regenerationRequest = {
+  articleId: "SEO-REV-1",
+  feedback: "Ispravi izvore i linkove",
+  actorId: 42,
+  actorName: "Owner",
+  providerObjectId: "message:-5484259760:500",
+};
+
+function reviewArticle(overrides: Record<string, CellValue> = {}): SheetRecord {
+  return {
+    __rowNumber: 2,
+    article_id: regenerationRequest.articleId,
+    keyword_id: "KW-REV-1",
+    locale: "sr",
+    status: "needs_review",
+    primary_keyword: "igraonice za decu Beograd",
+    search_intent: "informational",
+    article_type: "guide",
+    topic: "igraonice za decu Beograd",
+    title: "Stari naslov igraonice Beograd",
+    slug: "stari-naslov-igraonice-beograd",
+    excerpt: "Stari opis članka koji će biti bezbedno zamenjen tek posle uspešne generacije.",
+    seo_title: "Stari naslov igraonice u Beogradu",
+    meta_description:
+      "Stari kompletan opis igraonica u Beogradu sa praktičnim pitanjima za roditelje i staratelje.",
+    body_markdown: validGeneratedBody(),
+    tags: "rs",
+    source_urls: "https://example.com/source",
+    internal_links: allowedInternalUrl,
+    quality_score: 8,
+    qa_status: "fail",
+    qa_blockers: "missing_authoritative_source",
+    manual_required: true,
+    revision_count: 0,
+    content_hash: "old-hash",
+    telegram_message_id: 12,
+    approved_by: "should-clear",
+    approved_at: "should-clear",
+    ghost_post_id: "should-clear",
+    public_url: "should-clear",
+    ...overrides,
+  };
+}
+
+describe("article regeneration", () => {
+  it("replaces the same row only after successful generation and records one atomic revision", async () => {
+    const original = reviewArticle();
+    const test = setup({ articles: [original] });
+
+    const result = await test.service.regenerateArticle(regenerationRequest);
+
+    expect(result.outcome).toBe("regenerated");
+    expect(test.articleRows).toHaveLength(1);
+    expect(test.articleRows[0]).toMatchObject({
+      article_id: regenerationRequest.articleId,
+      title: "Kako izabrati igraonicu u Beogradu",
+      status: "needs_review",
+      qa_status: "pass",
+      qa_blockers: "",
+      manual_required: false,
+      revision_count: 1,
+      content_hash: "",
+      telegram_message_id: 12,
+      approved_by: "",
+      approved_at: "",
+      ghost_post_id: "",
+      public_url: "",
+    });
+    expect(test.events).toContainEqual(
+      expect.objectContaining({
+        event_type: "regenerated",
+        article_id: regenerationRequest.articleId,
+        provider_object_id: `telegram:${regenerationRequest.providerObjectId}`,
+      }),
+    );
+  });
+
+  it("is idempotent for a repeated Telegram delivery", async () => {
+    const test = setup({ articles: [reviewArticle()] });
+    expect((await test.service.regenerateArticle(regenerationRequest)).outcome).toBe("regenerated");
+    expect((await test.service.regenerateArticle(regenerationRequest)).outcome).toBe(
+      "already_regenerated",
+    );
+    expect(test.generate).toHaveBeenCalledTimes(1);
+    expect(test.events.filter((event) => event.event_type === "regenerated")).toHaveLength(1);
+    expect(test.articleRows).toHaveLength(1);
+  });
+
+  it("records an explicit system actor for an administrative repair", async () => {
+    const test = setup({ articles: [reviewArticle()] });
+
+    await test.service.regenerateArticle({
+      ...regenerationRequest,
+      actorId: "qa-repair",
+      actorName: "QA repair",
+      actorType: "system",
+      provider: "system",
+      providerObjectId: "repair-v2",
+    });
+
+    expect(test.events).toContainEqual(
+      expect.objectContaining({
+        event_type: "regenerated",
+        actor_type: "system",
+        actor_id: "qa-repair",
+        provider: "system",
+        provider_object_id: "system:repair-v2",
+      }),
+    );
+  });
+
+  it("uses the shared article mutex before reading or replacing the draft", async () => {
+    const mutex = new KeyedMutex();
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let entered!: () => void;
+    const lockEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const lock = mutex.runExclusive(regenerationRequest.articleId, async () => {
+      entered();
+      await hold;
+    });
+    await lockEntered;
+    const test = setup({ articles: [reviewArticle()], workflowMutex: mutex });
+
+    const regeneration = test.service.regenerateArticle(regenerationRequest);
+    await Promise.resolve();
+    expect(test.generate).not.toHaveBeenCalled();
+
+    release();
+    await lock;
+    await regeneration;
+    expect(test.generate).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves the old draft when OpenAI fails", async () => {
+    const original = reviewArticle();
+    const oldBody = String(original.body_markdown);
+    const test = setup({ articles: [original], generatorError: new Error("upstream failed") });
+
+    await expect(test.service.regenerateArticle(regenerationRequest)).rejects.toThrow("upstream failed");
+
+    expect(test.articleRows[0]?.body_markdown).toBe(oldBody);
+    expect(test.articleRows[0]?.revision_count).toBe(0);
+    expect(test.events).toHaveLength(0);
+  });
+
+  it("refuses approved and later workflow states before calling OpenAI", async () => {
+    const test = setup({ articles: [reviewArticle({ status: "approved" })] });
+    await expect(test.service.regenerateArticle(regenerationRequest)).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "invalid_status",
+      article: { status: "approved" },
+    });
+    expect(test.generate).not.toHaveBeenCalled();
+    expect(test.articleRows[0]?.body_markdown).toBe(validGeneratedBody());
+  });
+
+  it("rechecks locale and active internal-link gates before spending an OpenAI call", async () => {
+    const localeOff = setup({
+      articles: [reviewArticle()],
+      settings: settings({ enabled_locales: "en" }),
+    });
+    await expect(localeOff.service.regenerateArticle(regenerationRequest)).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "locale_disabled",
+    });
+    expect(localeOff.generate).not.toHaveBeenCalled();
+
+    const linksOff = setup({ articles: [reviewArticle()], links: [] });
+    await expect(linksOff.service.regenerateArticle(regenerationRequest)).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "no_internal_links",
+    });
+    expect(linksOff.generate).not.toHaveBeenCalled();
+  });
+
+  it("keeps semantic model blockers as an explicit human gate", async () => {
+    const test = setup({
+      articles: [reviewArticle()],
+      qaBlockers: ["missing_authoritative_source"],
+    });
+    await test.service.regenerateArticle(regenerationRequest);
+    expect(test.articleRows[0]).toMatchObject({
+      qa_status: "fail",
+      qa_blockers: "missing_authoritative_source",
+      manual_required: true,
+    });
   });
 });

@@ -55,7 +55,7 @@ export class ApprovalService {
       if (!quality.passed) {
         const now = new Date().toISOString();
         const updated = await this.store.patchArticleAndAppendEvent(article.article_id, {
-          qa_status: "failed",
+          qa_status: "fail",
           qa_blockers: quality.blockers.join(","),
           updated_at: now,
         }, {
@@ -99,6 +99,8 @@ export class ApprovalService {
         article.article_id,
         {
           status: "approved",
+          qa_status: "pass",
+          qa_blockers: "",
           content_hash: currentHash,
           approved_by: `telegram:${actor.id}`,
           approved_at: now,

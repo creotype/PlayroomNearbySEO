@@ -45,6 +45,7 @@ export class QualityGate {
 
     const sources = parseListCell(article.source_urls);
     if (sources.length === 0 || sources.some((url) => !isHttpUrl(url))) blockers.add("missing_source_url");
+    if (sources.some(hasTrackingParameters)) blockers.add("tracking_parameters_in_source_url");
 
     const requestedInternalLinks = parseListCell(article.internal_links);
     if (requestedInternalLinks.length === 0) blockers.add("missing_internal_link");
@@ -57,8 +58,20 @@ export class QualityGate {
       if (!allowedLinks.has(normalizeUrl(url))) blockers.add("invalid_internal_link");
     }
 
-    if (stringCell(article.qa_status) !== "passed") blockers.add("qa_not_passed");
-    for (const blocker of parseListCell(article.qa_blockers)) blockers.add(blocker);
+    const bodyUrls = extractHttpUrls(article.body_markdown);
+    if (bodyUrls.some((url) => !allowedLinks.has(normalizeUrl(url)))) {
+      blockers.add("external_url_in_body");
+    }
+    const markdownLinks = new Set(extractMarkdownLinkUrls(article.body_markdown).map(normalizeUrl));
+    for (const url of requestedInternalLinks) {
+      if (!markdownLinks.has(normalizeUrl(url))) blockers.add("internal_link_not_in_body");
+    }
+    if (/\]\s*\.\s*\(\s*https?:\/\//iu.test(article.body_markdown)) {
+      blockers.add("malformed_markdown_link");
+    }
+
+    if (meta && !/[.!?…]$/u.test(meta)) blockers.add("meta_description_incomplete");
+
     if (booleanCell(article.manual_required)) blockers.add("manual_required");
     if (score < minScore) blockers.add("quality_score_below_threshold");
 
@@ -92,4 +105,25 @@ function normalizeUrl(value: string): string {
   } catch {
     return value.trim();
   }
+}
+
+function hasTrackingParameters(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return [...url.searchParams.keys()].some((key) =>
+      /^(?:utm_.+|gclid|dclid|fbclid|msclkid|mc_cid|mc_eid)$/iu.test(key),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function extractHttpUrls(markdown: string): string[] {
+  return [...markdown.matchAll(/https?:\/\/[^\s<>)\]}]+/giu)].map((match) => match[0]);
+}
+
+function extractMarkdownLinkUrls(markdown: string): string[] {
+  return [...markdown.matchAll(/\[[^\]\n]+\]\(\s*(https?:\/\/[^\s)]+)\s*\)/giu)].map(
+    (match) => match[1]!,
+  );
 }

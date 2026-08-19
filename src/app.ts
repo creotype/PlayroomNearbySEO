@@ -32,7 +32,14 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
   const generator = config.openAiApiKey
     ? new OpenAiArticleGenerator(config.openAiApiKey, config.openAiModel)
     : undefined;
-  const generation = new GenerationService(store, generator, config, logger);
+  const generation = new GenerationService(
+    store,
+    generator,
+    config,
+    logger,
+    qualityGate,
+    workflowMutex,
+  );
   const bot = createTelegramBot({ config, store, approvals, generation, logger });
   const publication = new PublicationService(store, ghost, config, logger, workflowMutex);
   const notifier = new ReviewNotifier(store, bot, config, logger);

@@ -1,10 +1,16 @@
 import type { Logger } from "pino";
 import { describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config.js";
+import type { Article } from "../src/domain/article.js";
 import type { GoogleSheetsStore } from "../src/sheets/google-sheets.js";
 import type { ApprovalService } from "../src/services/approval-service.js";
 import type { GenerationService } from "../src/services/generation-service.js";
-import { createTelegramBot, parseGenerateCommand, telegramCommandMenu } from "../src/telegram/bot.js";
+import {
+  createTelegramBot,
+  parseGenerateCommand,
+  reviewKeyboard,
+  telegramCommandMenu,
+} from "../src/telegram/bot.js";
 
 describe("/generate command parser", () => {
   it("uses the Sheet default locale when no locale is supplied", () => {
@@ -37,6 +43,7 @@ describe("/generate command parser", () => {
 
   it("registers generate in the Telegram command menu", () => {
     expect(telegramCommandMenu.some((command) => command.command === "generate")).toBe(true);
+    expect(telegramCommandMenu.some((command) => command.command === "seo_regenerate")).toBe(true);
   });
 });
 
@@ -53,12 +60,34 @@ function botHarness() {
     locale: "sr",
     keyword: "igraonice za decu Beograd",
   }));
-  const store = { getSettings: async () => new Map() } as unknown as GoogleSheetsStore;
+  const article = {
+    __rowNumber: 2,
+    article_id: "SEO-TG-1",
+    locale: "sr",
+    status: "needs_review",
+    title: "Igraonice za decu u Beogradu",
+    slug: "igraonice-za-decu-u-beogradu",
+    body_markdown: "draft",
+    qa_status: "pass",
+    qa_blockers: "",
+    manual_required: false,
+    revision_count: 1,
+    telegram_message_id: 12,
+  } as Article;
+  const regenerateArticle = vi.fn(async () => ({
+    outcome: "regenerated" as const,
+    article,
+  }));
+  const store = {
+    getSettings: async () => new Map(),
+    findArticle: async (articleId: string) => articleId === article.article_id ? article : undefined,
+    findArticleByTelegramMessageId: async (messageId: number) => messageId === 12 ? article : undefined,
+  } as unknown as GoogleSheetsStore;
   const bot = createTelegramBot({
     config,
     store,
     approvals: {} as ApprovalService,
-    generation: { requestManualGeneration } as unknown as GenerationService,
+    generation: { requestManualGeneration, regenerateArticle } as unknown as GenerationService,
     logger: { error: vi.fn() } as unknown as Logger,
   });
   bot.botInfo = {
@@ -90,7 +119,7 @@ function botHarness() {
         : true,
     } as never;
   });
-  return { bot, requestManualGeneration, apiCalls };
+  return { bot, requestManualGeneration, regenerateArticle, article, apiCalls };
 }
 
 function generateUpdate(chatId: number, chatType: "private" | "supergroup" = "supergroup") {
@@ -130,5 +159,76 @@ describe("/generate Telegram handler", () => {
     await test.bot.handleUpdate(update);
     expect(test.requestManualGeneration).not.toHaveBeenCalled();
     expect(test.apiCalls.some((call) => call.method === "sendMessage")).toBe(true);
+  });
+});
+
+function regenerateUpdate() {
+  return {
+    update_id: 2,
+    message: {
+      message_id: 78,
+      date: 1,
+      chat: { id: -5484259760, type: "supergroup" as const, title: "Review" },
+      from: { id: 42, is_bot: false, first_name: "Owner" },
+      text: "/seo_regenerate SEO-TG-1 ispravi izvore",
+      entities: [{ offset: 0, length: 15, type: "bot_command" as const }],
+    },
+  };
+}
+
+function regenerateCallbackUpdate() {
+  return {
+    update_id: 3,
+    callback_query: {
+      id: "callback-1",
+      chat_instance: "review",
+      from: { id: 42, is_bot: false, first_name: "Owner" },
+      data: "seo:regenerate:SEO-TG-1",
+      message: {
+        message_id: 12,
+        date: 1,
+        chat: { id: -5484259760, type: "supergroup" as const, title: "Review" },
+        text: "SEO draft",
+      },
+    },
+  };
+}
+
+describe("/seo_regenerate Telegram flow", () => {
+  it("regenerates an explicit article with editor feedback", async () => {
+    const test = botHarness();
+    await test.bot.handleUpdate(regenerateUpdate());
+    expect(test.regenerateArticle).toHaveBeenCalledWith({
+      articleId: "SEO-TG-1",
+      feedback: "ispravi izvore",
+      actorId: 42,
+      actorName: "Owner",
+      providerObjectId: "message:-5484259760:78",
+    });
+    expect(test.apiCalls.some((call) => call.method === "sendMessage")).toBe(true);
+  });
+
+  it("shows AI repair and fresh-approval actions for a failed QA card", () => {
+    const test = botHarness();
+    const failed = { ...test.article, qa_status: "fail", manual_required: true } as Article;
+    const buttons = reviewKeyboard(failed).inline_keyboard.flat();
+    expect(buttons).toContainEqual(
+      expect.objectContaining({ text: "🔄 Исправить ИИ", callback_data: "seo:regenerate:SEO-TG-1" }),
+    );
+    expect(buttons).toContainEqual(
+      expect.objectContaining({ text: "✅ Согласовать", callback_data: "seo:approve:SEO-TG-1" }),
+    );
+  });
+
+  it("acknowledges the callback before invoking the long regeneration flow", async () => {
+    const test = botHarness();
+    await test.bot.handleUpdate(regenerateCallbackUpdate());
+    expect(test.apiCalls[0]?.method).toBe("answerCallbackQuery");
+    expect(test.regenerateArticle).toHaveBeenCalledWith({
+      articleId: "SEO-TG-1",
+      actorId: 42,
+      actorName: "Owner",
+      providerObjectId: "callback:callback-1",
+    });
   });
 });

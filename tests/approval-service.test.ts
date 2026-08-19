@@ -29,7 +29,7 @@ function article(): Article {
     source_urls: "https://example.com/source",
     internal_links: "https://example.com/rs/blog",
     quality_score: 9,
-    qa_status: "passed",
+    qa_status: "pass",
     qa_blockers: "",
     manual_required: false,
   };
@@ -77,6 +77,8 @@ describe("ApprovalService", () => {
     const result = await test.service.approve("SEO-1", actor);
     expect(result.outcome).toBe("approved");
     expect(test.current().status).toBe("approved");
+    expect(test.current().qa_status).toBe("pass");
+    expect(test.current().qa_blockers).toBe("");
     expect(test.current().content_hash).toBe(expectedHash);
     expect(test.events).toHaveLength(1);
     expect(JSON.parse(String(test.events[0]?.payload_json))).toMatchObject({ hash: expectedHash });
@@ -87,7 +89,7 @@ describe("ApprovalService", () => {
     const result = await test.service.approve("SEO-1", actor);
     expect(result.outcome).toBe("blocked");
     expect(test.current().status).toBe("needs_review");
-    expect(test.current().qa_status).toBe("failed");
+    expect(test.current().qa_status).toBe("fail");
     expect(test.current().qa_blockers).toBe("missing_source_url");
   });
 });

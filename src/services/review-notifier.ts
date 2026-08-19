@@ -30,7 +30,7 @@ export class ReviewNotifier {
             chatId,
             existingMessageId,
             articleCard(article, this.config.spreadsheetId),
-            { parse_mode: "HTML", reply_markup: reviewKeyboard(article.article_id), link_preview_options: { is_disabled: true } },
+            { parse_mode: "HTML", reply_markup: reviewKeyboard(article), link_preview_options: { is_disabled: true } },
           );
           await this.store.patchArticle(article.article_id, {
             content_hash: currentHash,
@@ -41,7 +41,7 @@ export class ReviewNotifier {
         const message = await this.bot.api.sendMessage(
           chatId,
           articleCard(article, this.config.spreadsheetId),
-          { parse_mode: "HTML", reply_markup: reviewKeyboard(article.article_id), link_preview_options: { is_disabled: true } },
+          { parse_mode: "HTML", reply_markup: reviewKeyboard(article), link_preview_options: { is_disabled: true } },
         );
         await this.store.patchArticle(article.article_id, {
           telegram_message_id: message.message_id,
