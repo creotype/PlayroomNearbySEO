@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+node_modules
+dist
+coverage
+*.log
+*.json.key
+*service-account*.json
+credentials*.json
