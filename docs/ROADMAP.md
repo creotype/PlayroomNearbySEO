@@ -7,6 +7,8 @@
 - [x] Add editor/system field separation, validation, filters, conditional formatting, and safe starter values.
 - [x] Validate Telegram bot and Ghost Admin credentials without content mutation.
 - [x] Implement Sheets, Telegram, Ghost, generation, QA, audit, and scheduler modules.
+- [x] Make argument-free `/generate` reserve the topmost `ready` keyword by physical row order, using that row's locale and content settings.
+- [x] Mark the reserved keyword `used` after generation even when QA fails; pause it only on a technical generation failure.
 - [x] Enforce dry-run and hash-bound human approval.
 - [ ] Create a Google Cloud service account, share its email onto the Sheet, and mount its JSON credential on the server.
 - [ ] Capture the Telegram review-group ID and store the non-secret ID in `settings.telegram_chat_id`.
@@ -20,7 +22,8 @@
 - [ ] Populate `link_inventory` with production/staging URLs that have `status=active` and `allow_internal_link=true`.
 - [ ] Restrict spreadsheet editor access to named collaborators.
 - [ ] Run service startup probes with `DRY_RUN=true`.
-- [ ] Generate one disposable staging article from a `ready` keyword.
+- [ ] Put two disposable keywords in `ready`, confirm `/generate` rejects arguments and dequeues the physically topmost row regardless of numeric `priority`.
+- [ ] Confirm generated keywords become `used` on both QA pass and QA failure, while a technical generation failure becomes `paused` without automatic retry.
 - [ ] Verify Telegram card, manual Sheet edit, repeated QA, and `/seo_approve` idempotency.
 - [ ] Allow Ghost writes while keeping public publishing disabled; create one draft and verify the ID/update lock.
 - [ ] Perform one explicitly approved end-to-end staging publication and canonical check.

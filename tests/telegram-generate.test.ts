@@ -13,33 +13,22 @@ import {
 } from "../src/telegram/bot.js";
 
 describe("/generate command parser", () => {
-  it("uses the Sheet default locale when no locale is supplied", () => {
-    expect(parseGenerateCommand("  igraonice   za decu Beograd ")).toEqual({
-      outcome: "valid",
-      keyword: "igraonice za decu Beograd",
-    });
+  it("accepts the command with no arguments", () => {
+    expect(parseGenerateCommand("")).toEqual({ outcome: "valid" });
+    expect(parseGenerateCommand("   ")).toEqual({ outcome: "valid" });
   });
 
   it.each([
-    ["--locale en kids playrooms Belgrade", "en", "kids playrooms Belgrade"],
-    ["--locale=en kids playrooms Belgrade", "en", "kids playrooms Belgrade"],
-  ])("parses an explicit locale from %s", (raw, locale, keyword) => {
-    expect(parseGenerateCommand(raw)).toEqual({ outcome: "valid", locale, keyword });
-  });
-
-  it.each(["", "   ", "--locale sr", "--unknown value", "x", "sr", "en", "ru"])(
-    "rejects an incomplete request: %j",
+    "igraonice za decu Beograd",
+    "--locale sr",
+    "--locale en kids playrooms Belgrade",
+    "sr",
+  ])(
+    "rejects every argument because the keyword must come from the Sheet queue: %j",
     (raw) => {
       expect(parseGenerateCommand(raw).outcome).toBe("invalid");
     },
   );
-
-  it("does not treat a keyword starting with a locale token as an implicit option", () => {
-    expect(parseGenerateCommand("en kids club Belgrade")).toEqual({
-      outcome: "valid",
-      keyword: "en kids club Belgrade",
-    });
-  });
 
   it("registers generate in the Telegram command menu", () => {
     expect(telegramCommandMenu.some((command) => command.command === "generate")).toBe(true);
@@ -122,7 +111,12 @@ function botHarness() {
   return { bot, requestManualGeneration, regenerateArticle, article, apiCalls };
 }
 
-function generateUpdate(chatId: number, chatType: "private" | "supergroup" = "supergroup") {
+function generateUpdate(
+  chatId: number,
+  chatType: "private" | "supergroup" = "supergroup",
+  args = "",
+) {
+  const text = `/generate${args ? ` ${args}` : ""}`;
   return {
     update_id: 1,
     message: {
@@ -132,7 +126,7 @@ function generateUpdate(chatId: number, chatType: "private" | "supergroup" = "su
         ? { id: chatId, type: "private" as const, first_name: "Owner" }
         : { id: chatId, type: "supergroup" as const, title: "Review" },
       from: { id: 42, is_bot: false, first_name: "Owner" },
-      text: "/generate igraonice za decu Beograd",
+      text,
       entities: [{ offset: 0, length: 9, type: "bot_command" as const }],
     },
   };
@@ -143,12 +137,19 @@ describe("/generate Telegram handler", () => {
     const test = botHarness();
     await test.bot.handleUpdate(generateUpdate(-5484259760));
     expect(test.requestManualGeneration).toHaveBeenCalledWith({
-      keyword: "igraonice za decu Beograd",
       actorId: 42,
       actorName: "Owner",
       providerObjectId: "message:-5484259760:77",
     });
     expect(test.apiCalls.some((call) => call.method === "sendMessage")).toBe(true);
+  });
+
+  it("rejects command arguments without claiming a queued keyword", async () => {
+    const test = botHarness();
+    await test.bot.handleUpdate(generateUpdate(-5484259760, "supergroup", "custom keyword"));
+    expect(test.requestManualGeneration).not.toHaveBeenCalled();
+    const reply = test.apiCalls.find((call) => call.method === "sendMessage");
+    expect(JSON.stringify(reply?.payload)).toContain("/generate");
   });
 
   it.each([

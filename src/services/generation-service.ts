@@ -21,21 +21,20 @@ import { KeyedMutex } from "../lib/keyed-mutex.js";
 import type { AuditEvent, GoogleSheetsStore } from "../sheets/google-sheets.js";
 import { QualityGate } from "./quality-gate.js";
 
-const MANUAL_SOURCE_PREFIX = "telegram_manual:";
 const CLAIMED_STATUS = "assigned";
 
 export type ManualGenerationBlockReason =
   | "generator_not_configured"
   | "manual_generation_disabled"
-  | "invalid_keyword"
+  | "no_ready_keywords"
+  | "invalid_keyword_row"
+  | "request_conflict"
   | "locale_disabled"
   | "ru_disabled"
   | "no_internal_links"
   | "queue_full";
 
 export type ManualGenerationRequest = {
-  keyword: string;
-  locale?: string;
   actorId: number;
   actorName: string;
   providerObjectId: string;
@@ -104,134 +103,95 @@ export class GenerationService {
 
   async requestManualGeneration(request: ManualGenerationRequest): Promise<ManualGenerationResult> {
     if (!this.generator) return { outcome: "blocked", reason: "generator_not_configured" };
-
-    const keyword = normalizeManualKeyword(request.keyword);
-    if (
-      keyword.length < 2 ||
-      keyword.length > 200 ||
-      /[\u0000-\u001F\u007F]/u.test(keyword)
-    ) {
-      return { outcome: "blocked", reason: "invalid_keyword" };
-    }
-
     const settings = await this.store.getSettings();
     if (!manualGenerationIsEnabled(this.config, settings)) {
       return { outcome: "blocked", reason: "manual_generation_disabled" };
     }
-
-    const locale = (stringCell(request.locale) || stringCell(settings.get("default_locale"))).toLowerCase();
-    const enabledLocales = new Set(
-      parseListCell(settings.get("enabled_locales")).map((value) => value.toLowerCase()),
-    );
-    if (locale === "ru" && !booleanCell(settings.get("ru_enabled"))) {
-      return { outcome: "blocked", reason: "ru_disabled", locale };
-    }
-    if (!locale || !enabledLocales.has(locale)) {
-      return { outcome: "blocked", reason: "locale_disabled", ...(locale ? { locale } : {}) };
-    }
-
-    const links = await this.store.listLinks();
-    const hasInternalLink = links.some(
-      (link) =>
-        stringCell(link.environment) === this.config.targetEnvironment &&
-        stringCell(link.status) === "active" &&
-        booleanCell(link.allow_internal_link) &&
-        ["all", locale].includes(stringCell(link.locale)),
-    );
-    if (!hasInternalLink) return { outcome: "blocked", reason: "no_internal_links", locale };
-
-    const ids = manualRequestIds(request.providerObjectId);
-    return this.#requestMutex.runExclusive("manual-generation-request", async () => {
-      const exact = await this.store.findKeyword(ids.keywordId);
-      if (exact) {
-        const articleId = stringCell(exact.article_id) || ids.articleId;
-        await this.#ensureRequestedEvent(exact, request, keyword, locale, articleId);
-        return resultForExistingKeyword(exact, ids.keywordId, articleId, locale, keyword);
-      }
-
-      const keywordKey = normalizeManualKeyword(keyword).toLowerCase();
+    const articleId = manualRequestArticleId(request.providerObjectId);
+    return this.#requestMutex.runExclusive("keyword-claim", async () => {
       const allKeywords = await this.store.listKeywords();
-      const duplicateCandidates = allKeywords.filter(
-        (candidate) =>
-          stringCell(candidate.source).startsWith(MANUAL_SOURCE_PREFIX) &&
-          stringCell(candidate.locale).toLowerCase() === locale &&
-          normalizeManualKeyword(stringCell(candidate.primary_keyword)).toLowerCase() === keywordKey &&
-          ["ready", CLAIMED_STATUS, "generating", "used"].includes(stringCell(candidate.status)),
+      const existing = allKeywords.find(
+        (candidate) => stringCell(candidate.article_id).toLowerCase() === articleId.toLowerCase(),
       );
-      let duplicate: SheetRecord | undefined;
-      for (const candidate of duplicateCandidates) {
-        if (await this.#hasValidManualRequest(candidate)) {
-          duplicate = candidate;
-          break;
+      if (existing) {
+        if (!(await this.#hasValidManualRequest(existing))) {
+          return { outcome: "blocked", reason: "request_conflict" };
         }
-      }
-      if (duplicate) {
-        const duplicateKeywordId = stringCell(duplicate.keyword_id);
-        const duplicateArticleId = stringCell(duplicate.article_id) || ids.articleId;
-        return resultForExistingKeyword(
-          duplicate,
-          duplicateKeywordId,
-          duplicateArticleId,
-          locale,
-          keyword,
-        );
+        return resultForExistingKeyword(existing);
       }
 
       const queueLimit = Math.max(1, numberCell(settings.get("telegram_generation_queue_limit")) || 3);
       const activeManualRequests = allKeywords.filter(
-        (candidate) =>
-          stringCell(candidate.source).startsWith(MANUAL_SOURCE_PREFIX) &&
-          ["ready", CLAIMED_STATUS, "generating"].includes(stringCell(candidate.status)),
+        (candidate) => [CLAIMED_STATUS, "generating"].includes(stringCell(candidate.status)),
       );
       const authorizedActiveRequests = (
         await Promise.all(activeManualRequests.map((candidate) => this.#hasValidManualRequest(candidate)))
       ).filter(Boolean).length;
       if (authorizedActiveRequests >= queueLimit) {
-        return { outcome: "blocked", reason: "queue_full", locale };
+        return { outcome: "blocked", reason: "queue_full" };
       }
 
+      const keyword = allKeywords
+        .filter((candidate) => stringCell(candidate.status) === "ready")
+        .sort((left, right) => left.__rowNumber - right.__rowNumber)[0];
+      if (!keyword) return { outcome: "blocked", reason: "no_ready_keywords" };
+
+      const keywordId = stringCell(keyword.keyword_id);
+      const normalizedKeyword = normalizeManualKeyword(stringCell(keyword.primary_keyword));
+      const locale = stringCell(keyword.locale).toLowerCase();
+      if (
+        !keywordId ||
+        Boolean(stringCell(keyword.article_id)) ||
+        normalizedKeyword.length < 2 ||
+        normalizedKeyword.length > 200 ||
+        /[\u0000-\u001F\u007F]/u.test(normalizedKeyword)
+      ) {
+        return { outcome: "blocked", reason: "invalid_keyword_row", ...(locale ? { locale } : {}) };
+      }
+      const enabledLocales = new Set(
+        parseListCell(settings.get("enabled_locales")).map((value) => value.toLowerCase()),
+      );
+      if (locale === "ru" && !booleanCell(settings.get("ru_enabled"))) {
+        return { outcome: "blocked", reason: "ru_disabled", locale };
+      }
+      if (!locale || !enabledLocales.has(locale)) {
+        return { outcome: "blocked", reason: "locale_disabled", ...(locale ? { locale } : {}) };
+      }
+      const links = await this.store.listLinks();
+      const hasInternalLink = links.some(
+        (link) =>
+          stringCell(link.environment) === this.config.targetEnvironment &&
+          stringCell(link.status) === "active" &&
+          booleanCell(link.allow_internal_link) &&
+          ["all", locale].includes(stringCell(link.locale)),
+      );
+      if (!hasInternalLink) return { outcome: "blocked", reason: "no_internal_links", locale };
+
       const now = new Date().toISOString();
-      const source = `${MANUAL_SOURCE_PREFIX}${request.providerObjectId}`;
-      const keywordValues: Record<string, CellValue> = {
-        keyword_id: ids.keywordId,
-        locale,
-        primary_keyword: keyword,
-        secondary_keywords: "",
-        cluster: "telegram_manual",
-        geo_target: "Belgrade, Serbia",
-        search_intent: "informational",
-        article_type: "guide",
-        priority: 100,
-        status: CLAIMED_STATUS,
-        topic_angle: keyword,
-        research_notes: `Requested in Telegram by ${request.actorName || request.actorId}`,
-        planned_publish_at: "",
-        used_at: "",
-        article_id: ids.articleId,
-        source,
-        search_volume: "",
-        difficulty: "",
-        created_at: now,
-        updated_at: now,
-      };
-      await this.store.appendKeywordAndEvent(
-        keywordValues,
+      await this.store.patchKeywordAndAppendEvent(
+        keywordId,
+        {
+          status: CLAIMED_STATUS,
+          article_id: articleId,
+          updated_at: now,
+        },
         requestedEvent(
           request,
-          ids.keywordId,
-          ids.articleId,
-          keyword,
+          keywordId,
+          articleId,
+          normalizedKeyword,
           locale,
+          keyword.__rowNumber,
           now,
           this.config.telegramBotToken,
         ),
       );
       return {
         outcome: "queued",
-        keywordId: ids.keywordId,
-        articleId: ids.articleId,
+        keywordId,
+        articleId,
         locale,
-        keyword,
+        keyword: normalizedKeyword,
       };
     });
   }
@@ -377,39 +337,48 @@ export class GenerationService {
         return;
       }
 
-      const statuses =
-        queue === "manual"
-          ? ["ready", CLAIMED_STATUS, "generating"]
+      const keyword = await this.#requestMutex.runExclusive("keyword-claim", async () => {
+        const statuses = queue === "manual"
+          ? [CLAIMED_STATUS, "generating"]
           : ["ready", CLAIMED_STATUS, "generating"];
-      const keywords = (await this.store.listKeywords(statuses))
-        .filter((candidate) => {
-          const isManual = stringCell(candidate.source).startsWith(MANUAL_SOURCE_PREFIX);
-          return queue === "manual" ? isManual : !isManual;
-        })
-        .filter((candidate) =>
-          [CLAIMED_STATUS, "generating"].includes(stringCell(candidate.status))
-            ? true
-            : isDue(candidate, stringCell(settings.get("timezone")) || "Europe/Belgrade"),
-        )
-        .sort((left, right) => {
-          const recoveryOrder =
-            Number([CLAIMED_STATUS, "generating"].includes(stringCell(right.status))) -
-            Number([CLAIMED_STATUS, "generating"].includes(stringCell(left.status)));
-          return recoveryOrder || numberCell(right.priority) - numberCell(left.priority);
-        });
-      let keyword = keywords[0];
-      if (!keyword) return;
+        const candidates = await this.store.listKeywords(statuses);
+        const manualFlags = await Promise.all(
+          candidates.map((candidate) => this.#hasManualRequestEvent(candidate)),
+        );
+        const keywords = candidates
+          .filter((_candidate, index) => queue === "manual" ? manualFlags[index] : !manualFlags[index])
+          .filter((candidate) =>
+            [CLAIMED_STATUS, "generating"].includes(stringCell(candidate.status))
+              ? true
+              : isDue(candidate, stringCell(settings.get("timezone")) || "Europe/Belgrade"),
+          )
+          .sort((left, right) => {
+            const recoveryOrder =
+              Number([CLAIMED_STATUS, "generating"].includes(stringCell(right.status))) -
+              Number([CLAIMED_STATUS, "generating"].includes(stringCell(left.status)));
+            if (recoveryOrder) return recoveryOrder;
+            if (queue === "scheduled") {
+              const numericPriority = numberCell(right.priority) - numberCell(left.priority);
+              if (numericPriority) return numericPriority;
+            }
+            return left.__rowNumber - right.__rowNumber;
+          });
+        let selected = keywords[0];
+        if (!selected) return undefined;
 
-      if (stringCell(keyword.status) !== CLAIMED_STATUS || !stringCell(keyword.article_id)) {
-        const articleId = stringCell(keyword.article_id) || createArticleId();
-        const claimedAt = new Date().toISOString();
-        await this.store.patchKeyword(stringCell(keyword.keyword_id), {
-          status: CLAIMED_STATUS,
-          article_id: articleId,
-          updated_at: claimedAt,
-        });
-        keyword = { ...keyword, status: CLAIMED_STATUS, article_id: articleId, updated_at: claimedAt };
-      }
+        if (stringCell(selected.status) !== CLAIMED_STATUS || !stringCell(selected.article_id)) {
+          const articleId = stringCell(selected.article_id) || createArticleId();
+          const claimedAt = new Date().toISOString();
+          await this.store.patchKeyword(stringCell(selected.keyword_id), {
+            status: CLAIMED_STATUS,
+            article_id: articleId,
+            updated_at: claimedAt,
+          });
+          selected = { ...selected, status: CLAIMED_STATUS, article_id: articleId, updated_at: claimedAt };
+        }
+        return selected;
+      });
+      if (!keyword) return;
       if (queue === "manual") {
         const blockReason = await this.#manualExecutionBlockReason(keyword, settings);
         if (blockReason) {
@@ -623,54 +592,33 @@ export class GenerationService {
     );
   }
 
-  async #ensureRequestedEvent(
-    keyword: SheetRecord,
-    request: ManualGenerationRequest,
-    normalizedKeyword: string,
-    locale: string,
-    articleId: string,
-  ): Promise<void> {
-    if (await this.#hasValidManualRequest(keyword)) return;
-    const event = requestedEvent(
-      request,
-      stringCell(keyword.keyword_id),
-      articleId,
-      normalizedKeyword,
-      locale,
-      new Date().toISOString(),
-      this.config.telegramBotToken,
-    );
-    await this.store.appendEvent(event);
+  async #hasManualRequestEvent(keyword: SheetRecord): Promise<boolean> {
+    return Boolean(await this.#manualRequestEvent(keyword));
   }
 
   async #hasValidManualRequest(keyword: SheetRecord): Promise<boolean> {
-    const source = stringCell(keyword.source);
-    const providerObjectId = source.startsWith(MANUAL_SOURCE_PREFIX)
-      ? source.slice(MANUAL_SOURCE_PREFIX.length)
-      : "";
     const keywordId = stringCell(keyword.keyword_id);
     const articleId = stringCell(keyword.article_id);
     const locale = stringCell(keyword.locale).toLowerCase();
     const normalizedKeyword = normalizeManualKeyword(stringCell(keyword.primary_keyword));
-    if (!providerObjectId || !keywordId || !articleId || !locale || !normalizedKeyword) return false;
+    if (!keywordId || !articleId || !locale || !normalizedKeyword) return false;
 
-    const events = await this.store.listEvents(articleId);
-    const event = events.find(
-      (candidate) =>
-        stringCell(candidate.event_id) === stableEventId("generation_requested", providerObjectId) &&
-        stringCell(candidate.event_type) === "generation_requested" &&
-        stringCell(candidate.actor_type) === "telegram_user" &&
-        stringCell(candidate.provider) === "telegram" &&
-        stringCell(candidate.provider_object_id) === providerObjectId,
-    );
+    const event = await this.#manualRequestEvent(keyword);
     if (!event) return false;
+    const providerObjectId = stringCell(event.provider_object_id);
 
     try {
       const payload = JSON.parse(stringCell(event.payload_json)) as Record<string, unknown>;
+      const isSheetQueueRequest = payload.request_kind === "sheet_queue";
+      const claimedRow = isSheetQueueRequest && Number.isInteger(payload.row_number)
+        ? Number(payload.row_number)
+        : undefined;
       if (
         payload.keyword_id !== keywordId ||
+        (isSheetQueueRequest && payload.article_id !== articleId) ||
         payload.locale !== locale ||
         payload.keyword !== normalizedKeyword ||
+        (isSheetQueueRequest && (!claimedRow || claimedRow < 2)) ||
         typeof payload.signature !== "string"
       ) {
         return false;
@@ -683,11 +631,25 @@ export class GenerationService {
         locale,
         normalizedKeyword,
         stringCell(event.actor_id),
+        claimedRow,
       );
       return signaturesEqual(payload.signature, expected);
     } catch {
       return false;
     }
+  }
+
+  async #manualRequestEvent(keyword: SheetRecord): Promise<SheetRecord | undefined> {
+    const articleId = stringCell(keyword.article_id);
+    if (!articleId) return undefined;
+    const events = await this.store.listEvents(articleId);
+    return events.find(
+      (candidate) =>
+        stringCell(candidate.event_type) === "generation_requested" &&
+        stringCell(candidate.actor_type) === "telegram_user" &&
+        stringCell(candidate.provider) === "telegram" &&
+        Boolean(stringCell(candidate.provider_object_id)),
+    );
   }
 
   async #evaluateGeneratedCandidate(
@@ -732,6 +694,7 @@ function requestedEvent(
   articleId: string,
   keyword: string,
   locale: string,
+  keywordRow: number,
   createdAt: string,
   signingSecret: string,
 ): AuditEvent {
@@ -744,19 +707,28 @@ function requestedEvent(
     locale,
     keyword,
     actorId,
+    keywordRow,
   );
   return {
     event_id: stableEventId("generation_requested", request.providerObjectId),
     article_id: articleId,
     event_type: "generation_requested",
-    from_status: "",
+    from_status: "ready",
     to_status: CLAIMED_STATUS,
     actor_type: "telegram_user",
     actor_id: actorId,
     provider: "telegram",
     provider_object_id: request.providerObjectId,
-    message: `Manual generation requested for ${keyword}`,
-    payload_json: JSON.stringify({ keyword_id: keywordId, locale, keyword, signature }),
+    message: `Next-keyword generation requested for ${keyword}`,
+    payload_json: JSON.stringify({
+      request_kind: "sheet_queue",
+      keyword_id: keywordId,
+      article_id: articleId,
+      row_number: keywordRow,
+      locale,
+      keyword,
+      signature,
+    }),
     created_at: createdAt,
   };
 }
@@ -769,9 +741,12 @@ function manualRequestSignature(
   locale: string,
   keyword: string,
   actorId: string,
+  keywordRow?: number,
 ): string {
-  const payload = ["v1", providerObjectId, keywordId, articleId, locale, keyword, actorId].join("\n");
-  return createHmac("sha256", secret).update(payload).digest("hex");
+  const payload = keywordRow === undefined
+    ? ["v1", providerObjectId, keywordId, articleId, locale, keyword, actorId]
+    : ["v2", "sheet_queue", providerObjectId, keywordId, articleId, String(keywordRow), locale, keyword, actorId];
+  return createHmac("sha256", secret).update(payload.join("\n")).digest("hex");
 }
 
 function signaturesEqual(actual: string, expected: string): boolean {
@@ -792,21 +767,21 @@ export function normalizeManualKeyword(value: string): string {
   return value.normalize("NFKC").replace(/\s+/gu, " ").trim();
 }
 
-export function manualRequestIds(providerObjectId: string): { keywordId: string; articleId: string } {
+export function manualRequestArticleId(providerObjectId: string): string {
   const hash = createHash("sha256").update(providerObjectId).digest("hex").slice(0, 12).toUpperCase();
-  return { keywordId: `KW-TG-${hash}`, articleId: `SEO-TG-${hash}` };
+  return `SEO-TG-${hash}`;
 }
 
-function resultForExistingKeyword(
-  keyword: SheetRecord,
-  keywordId: string,
-  articleId: string,
-  locale: string,
-  normalizedKeyword: string,
-): Exclude<ManualGenerationResult, { outcome: "blocked" }> {
+function resultForExistingKeyword(keyword: SheetRecord): Exclude<ManualGenerationResult, { outcome: "blocked" }> {
   const status = stringCell(keyword.status);
   const outcome = status === "used" ? "already_generated" : status === "paused" ? "previous_failed" : "already_queued";
-  return { outcome, keywordId, articleId, locale, keyword: normalizedKeyword };
+  return {
+    outcome,
+    keywordId: stringCell(keyword.keyword_id),
+    articleId: stringCell(keyword.article_id),
+    locale: stringCell(keyword.locale).toLowerCase(),
+    keyword: normalizeManualKeyword(stringCell(keyword.primary_keyword)),
+  };
 }
 
 function isDue(keyword: SheetRecord, timeZone: string): boolean {

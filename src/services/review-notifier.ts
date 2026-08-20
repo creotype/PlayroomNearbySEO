@@ -59,13 +59,17 @@ export class ReviewNotifier {
   }
 
   async #notifyGenerationFailures(chatId: number): Promise<void> {
-    const keywords = (await this.store.listKeywords(["paused"])).filter((keyword) =>
-      stringCell(keyword.source).startsWith("telegram_manual:"),
-    );
+    const keywords = await this.store.listKeywords(["paused"]);
     for (const keyword of keywords) {
       const articleId = stringCell(keyword.article_id);
       if (!articleId) continue;
       const events = await this.store.listEvents(articleId);
+      const requestedFromTelegram = events.some(
+        (event) =>
+          stringCell(event.event_type) === "generation_requested" &&
+          stringCell(event.provider) === "telegram",
+      );
+      if (!requestedFromTelegram) continue;
       const failure = [...events]
         .reverse()
         .find((event) => ["generation_failed", "generation_blocked"].includes(stringCell(event.event_type)));

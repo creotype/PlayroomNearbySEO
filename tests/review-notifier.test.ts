@@ -15,6 +15,25 @@ describe("ReviewNotifier generation failures", () => {
     const events: SheetRecord[] = [
       {
         __rowNumber: 2,
+        event_id: "evt-requested",
+        article_id: "SEO-TG-1",
+        event_type: "generation_requested",
+        actor_type: "telegram_user",
+        actor_id: "42",
+        provider: "telegram",
+        provider_object_id: "message:-1:1",
+        payload_json: JSON.stringify({
+          request_kind: "sheet_queue",
+          keyword_id: "KW-TG-1",
+          article_id: "SEO-TG-1",
+          row_number: 7,
+          locale: "sr",
+          keyword: "igraonice Beograd",
+          signature: "a".repeat(64),
+        }),
+      },
+      {
+        __rowNumber: 3,
         event_id: "evt-failed",
         article_id: "SEO-TG-1",
         event_type: "generation_failed",
@@ -26,7 +45,7 @@ describe("ReviewNotifier generation failures", () => {
       article_id: "SEO-TG-1",
       primary_keyword: "igraonice Beograd",
       status: "paused",
-      source: "telegram_manual:message:-1:1",
+      source: "seo_research_import",
     } as SheetRecord;
     const appendEvent = vi.fn(async (event: Record<string, unknown>) => {
       events.push({ __rowNumber: events.length + 2, ...event } as SheetRecord);

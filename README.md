@@ -34,8 +34,7 @@ pretend those production attestations are complete.
 
 - `/seo_help`
 - `/seo_chat_id`
-- `/generate KEYWORD` (uses the Sheet `default_locale`)
-- `/generate --locale en KEYWORD`
+- `/generate`
 - `/seo_status ARTICLE-ID`
 - `/seo_regenerate ARTICLE-ID [editor feedback]`
 - `/seo_approve ARTICLE-ID`
@@ -43,7 +42,7 @@ pretend those production attestations are complete.
 
 `ARTICLE-ID` can be omitted when the command is sent as a reply to a review card. Regeneration replaces the same review row only after OpenAI succeeds, keeps the old draft on failure, increments `revision_count`, and never reopens an approved or published article. Generation, regeneration, status, approval, and cancellation commands from private chats or any group other than the configured review group are rejected. `/seo_help` is public help, and `/seo_chat_id` intentionally works before a group is bound.
 
-`/generate` creates one durable manual request and immediately returns its `keyword_id`. The generated article still enters `needs_review`; it never bypasses QA or Telegram approval. Manual generation requires both `ALLOW_TELEGRAM_GENERATION=true` in the server environment and `telegram_generation_enabled=true` in the Sheet. Scheduled generation remains independently controlled by `generation_enabled`. The manual queue is bounded by `telegram_generation_queue_limit` (default: 3); a failed request is paused without an automatic retry and reported back to the review group.
+`/generate` accepts no arguments. It reserves the physically topmost row on `keywords` whose status is `ready`; row order is the manual priority, so the numeric `priority` value is ignored for this dequeue. Keyword, locale, and content settings come from that existing row. After OpenAI returns an article, the keyword becomes `used` even if article QA fails; a technical generation failure instead moves it to `paused` without an automatic paid retry. The generated article still requires Telegram review and never bypasses QA or approval. Manual generation requires both `ALLOW_TELEGRAM_GENERATION=true` in the server environment and `telegram_generation_enabled=true` in the Sheet. Scheduled generation remains independently controlled by `generation_enabled`. The manual queue is bounded by `telegram_generation_queue_limit` (default: 3), and any arguments passed to `/generate` are rejected.
 
 ## Configuration
 

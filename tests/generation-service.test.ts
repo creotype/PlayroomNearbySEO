@@ -8,7 +8,6 @@ import type { GoogleSheetsStore } from "../src/sheets/google-sheets.js";
 import {
   GenerationService,
   manualGenerationIsEnabled,
-  manualRequestIds,
 } from "../src/services/generation-service.js";
 import { QualityGate } from "../src/services/quality-gate.js";
 
@@ -63,6 +62,18 @@ function setup(options: {
   const keywordRows = options.keywords ?? [];
   const articleRows = options.articles ?? [];
   const events: SheetRecord[] = [];
+  const patchKeywordAndAppendEvent = vi.fn(async (
+    keywordId: string,
+    patch: Record<string, CellValue>,
+    event: Record<string, CellValue>,
+  ) => {
+    const keyword = keywordRows.find((row) => row.keyword_id === keywordId);
+    if (!keyword) throw new Error(`Missing keyword ${keywordId}`);
+    Object.assign(keyword, patch);
+    if (!events.some((existing) => existing.event_id === event.event_id)) {
+      events.push({ __rowNumber: events.length + 2, ...event });
+    }
+  });
   const generate = vi.fn(async () => {
     if (options.generatorError) throw options.generatorError;
     return {
@@ -121,18 +132,7 @@ function setup(options: {
       if (!keyword) throw new Error(`Missing keyword ${keywordId}`);
       Object.assign(keyword, patch);
     },
-    patchKeywordAndAppendEvent: async (
-      keywordId: string,
-      patch: Record<string, CellValue>,
-      event: Record<string, CellValue>,
-    ) => {
-      const keyword = keywordRows.find((row) => row.keyword_id === keywordId);
-      if (!keyword) throw new Error(`Missing keyword ${keywordId}`);
-      Object.assign(keyword, patch);
-      if (!events.some((existing) => existing.event_id === event.event_id)) {
-        events.push({ __rowNumber: events.length + 2, ...event });
-      }
-    },
+    patchKeywordAndAppendEvent,
     findArticle: async (articleId: string) =>
       articleRows.find((row) => String(row.article_id).toLowerCase() === articleId.toLowerCase()),
     appendArticle: async (values: Record<string, CellValue>) => {
@@ -165,102 +165,221 @@ function setup(options: {
     new QualityGate(typedStore, config),
     options.workflowMutex,
   );
-  return { service, keywordRows, articleRows, events, generate };
+  return { service, keywordRows, articleRows, events, generate, patchKeywordAndAppendEvent };
 }
 
 const request = {
-  keyword: "igraonice za decu Beograd",
   actorId: 42,
   actorName: "Owner",
   providerObjectId: "message:-5484259760:100",
 };
 
+function readyKeyword(overrides: Record<string, CellValue> = {}): SheetRecord {
+  return {
+    __rowNumber: 2,
+    keyword_id: "KW-READY-1",
+    article_id: "",
+    locale: "sr",
+    primary_keyword: "igraonice za decu Beograd",
+    secondary_keywords: "",
+    cluster: "playrooms",
+    geo_target: "Belgrade, Serbia",
+    search_intent: "informational",
+    article_type: "guide",
+    priority: 10,
+    status: "ready",
+    topic_angle: "Kako izabrati igraonicu",
+    source: "keyword_research",
+    ...overrides,
+  } as SheetRecord;
+}
+
 describe("manual generation requests", () => {
-  it("queues one durable assigned request and reserves stable IDs", async () => {
-    const test = setup();
+  it("claims the physically topmost ready row, preserving its keyword identity and source", async () => {
+    const physicallyFirst = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-TOP",
+      primary_keyword: "prvi ključ u tabeli",
+      priority: 1,
+      planned_publish_at: "2099-12-31T12:00:00.000Z",
+      source: "seo_research_import",
+    });
+    const numericallyHigherPriority = readyKeyword({
+      __rowNumber: 9,
+      keyword_id: "KW-HIGH-PRIORITY",
+      primary_keyword: "kasniji ključ u tabeli",
+      priority: 999,
+      source: "another_import",
+    });
+    // Deliberately return the lower Sheet row second: selection must use __rowNumber,
+    // not array order and not the numeric priority column.
+    const test = setup({ keywords: [numericallyHigherPriority, physicallyFirst] });
     const result = await test.service.requestManualGeneration(request);
-    const ids = manualRequestIds(request.providerObjectId);
-    expect(result).toMatchObject({ outcome: "queued", ...ids, locale: "sr" });
-    expect(test.keywordRows).toHaveLength(1);
-    expect(test.keywordRows[0]).toMatchObject({
-      keyword_id: ids.keywordId,
-      article_id: ids.articleId,
+
+    expect(result).toMatchObject({
+      outcome: "queued",
+      keywordId: "KW-TOP",
       locale: "sr",
+      keyword: "prvi ključ u tabeli",
+    });
+    expect(result.outcome === "blocked" ? "" : result.articleId).toMatch(/^SEO-/);
+    expect(physicallyFirst).toMatchObject({
+      keyword_id: "KW-TOP",
       status: "assigned",
-      source: `telegram_manual:${request.providerObjectId}`,
+      source: "seo_research_import",
+    });
+    expect(String(physicallyFirst.article_id)).toMatch(/^SEO-/);
+    expect(numericallyHigherPriority).toMatchObject({
+      keyword_id: "KW-HIGH-PRIORITY",
+      status: "ready",
+      article_id: "",
+      source: "another_import",
     });
     expect(test.events).toHaveLength(1);
-    expect(test.events[0]?.event_type).toBe("generation_requested");
+    expect(test.events[0]).toMatchObject({
+      article_id: physicallyFirst.article_id,
+      event_type: "generation_requested",
+      to_status: "assigned",
+      actor_type: "telegram_user",
+      actor_id: "42",
+      provider: "telegram",
+      provider_object_id: request.providerObjectId,
+    });
+    expect(JSON.parse(String(test.events[0]?.payload_json))).toMatchObject({
+      request_kind: "sheet_queue",
+      keyword_id: "KW-TOP",
+      article_id: physicallyFirst.article_id,
+      row_number: 3,
+      locale: "sr",
+      keyword: "prvi ključ u tabeli",
+    });
+    expect(JSON.parse(String(test.events[0]?.payload_json)).signature).toMatch(/^[a-f0-9]{64}$/);
+    expect(test.patchKeywordAndAppendEvent).toHaveBeenCalledTimes(1);
   });
 
-  it("is idempotent for repeated and parallel Telegram delivery", async () => {
-    const test = setup();
+  it("is idempotent for repeated and parallel delivery of the same Telegram update", async () => {
+    const firstReady = readyKeyword();
+    const secondReady = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-READY-2",
+      primary_keyword: "drugi ključ",
+    });
+    const test = setup({ keywords: [firstReady, secondReady] });
     const [first, second] = await Promise.all([
       test.service.requestManualGeneration(request),
       test.service.requestManualGeneration(request),
     ]);
-    expect(first.outcome).toBe("queued");
-    expect(second.outcome).toBe("already_queued");
-    expect(test.keywordRows).toHaveLength(1);
+    expect([first.outcome, second.outcome].sort()).toEqual(["already_queued", "queued"]);
+    expect(first.outcome === "blocked" ? "" : first.keywordId).toBe("KW-READY-1");
+    expect(second.outcome === "blocked" ? "" : second.keywordId).toBe("KW-READY-1");
+    expect(firstReady.status).toBe("assigned");
+    expect(secondReady.status).toBe("ready");
     expect(test.events.filter((event) => event.event_type === "generation_requested")).toHaveLength(1);
   });
 
-  it("deduplicates the same normalized keyword from a new message", async () => {
-    const test = setup();
-    await test.service.requestManualGeneration(request);
-    const duplicate = await test.service.requestManualGeneration({
-      ...request,
-      keyword: "  IGRAONICE   ZA DECU beograd ",
-      providerObjectId: "message:-5484259760:101",
+  it("replays the original result after it becomes used without consuming the next row", async () => {
+    const firstReady = readyKeyword();
+    const secondReady = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-READY-2",
+      primary_keyword: "drugi ključ",
     });
-    expect(duplicate.outcome).toBe("already_queued");
-    expect(test.keywordRows).toHaveLength(1);
+    const test = setup({ keywords: [firstReady, secondReady] });
+
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    const replay = await test.service.requestManualGeneration(request);
+
+    expect(replay).toMatchObject({ outcome: "already_generated", keywordId: "KW-READY-1" });
+    expect(firstReady.status).toBe("used");
+    expect(secondReady.status).toBe("ready");
+    expect(test.generate).toHaveBeenCalledTimes(1);
   });
 
-  it("deduplicates concurrent different messages for the same normalized keyword", async () => {
-    const test = setup();
+  it("serializes different Telegram commands onto successive physical rows", async () => {
+    const firstReady = readyKeyword();
+    const secondReady = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-READY-2",
+      primary_keyword: "drugi ključ",
+    });
+    const test = setup({ keywords: [secondReady, firstReady] });
+
     const [first, second] = await Promise.all([
       test.service.requestManualGeneration(request),
       test.service.requestManualGeneration({
         ...request,
-        keyword: "IGRAONICE   ZA DECU BEOGRAD",
-        providerObjectId: "message:-5484259760:999",
+        providerObjectId: "message:-5484259760:101",
       }),
     ]);
-    expect([first.outcome, second.outcome].sort()).toEqual(["already_queued", "queued"]);
-    expect(test.keywordRows).toHaveLength(1);
+
+    expect(first).toMatchObject({ outcome: "queued", keywordId: "KW-READY-1" });
+    expect(second).toMatchObject({ outcome: "queued", keywordId: "KW-READY-2" });
+    expect(firstReady.status).toBe("assigned");
+    expect(secondReady.status).toBe("assigned");
+    expect(test.events.filter((event) => event.event_type === "generation_requested")).toHaveLength(2);
   });
 
-  it("uses an explicit enabled locale and rejects disabled RU", async () => {
-    const test = setup();
-    const english = await test.service.requestManualGeneration({
-      ...request,
-      locale: "en",
-      providerObjectId: "message:-5484259760:102",
+  it("reports an empty queue without creating a keyword or event", async () => {
+    const test = setup({
+      keywords: [
+        readyKeyword({ status: "paused" }),
+        readyKeyword({ __rowNumber: 3, keyword_id: "KW-USED", status: "used" }),
+        readyKeyword({ __rowNumber: 4, keyword_id: "KW-ASSIGNED", status: "assigned" }),
+      ],
     });
-    const russian = await test.service.requestManualGeneration({
-      ...request,
-      locale: "ru",
-      providerObjectId: "message:-5484259760:103",
+    await expect(test.service.requestManualGeneration(request)).resolves.toEqual({
+      outcome: "blocked",
+      reason: "no_ready_keywords",
     });
-    expect(english).toMatchObject({ outcome: "queued", locale: "en" });
-    expect(russian).toEqual({ outcome: "blocked", reason: "ru_disabled", locale: "ru" });
+    expect(test.events).toHaveLength(0);
+    expect(test.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
   });
 
   it("fails closed when either manual generation gate is off", async () => {
-    const sheetOff = setup({ settings: settings({ telegram_generation_enabled: false }) });
+    const sheetOff = setup({
+      keywords: [readyKeyword()],
+      settings: settings({ telegram_generation_enabled: false }),
+    });
     expect((await sheetOff.service.requestManualGeneration(request)).outcome).toBe("blocked");
-    expect(sheetOff.keywordRows).toHaveLength(0);
+    expect(sheetOff.keywordRows[0]?.status).toBe("ready");
     expect(manualGenerationIsEnabled({ allowTelegramGeneration: false }, settings())).toBe(false);
   });
 
+  it("checks the selected row locale and internal-link gates before claiming it", async () => {
+    const ruKeyword = readyKeyword({ locale: "ru" });
+    const ruOff = setup({ keywords: [ruKeyword] });
+    await expect(ruOff.service.requestManualGeneration(request)).resolves.toEqual({
+      outcome: "blocked",
+      reason: "ru_disabled",
+      locale: "ru",
+    });
+    expect(ruKeyword.status).toBe("ready");
+
+    const noLinkKeyword = readyKeyword();
+    const linksOff = setup({ keywords: [noLinkKeyword], links: [] });
+    await expect(linksOff.service.requestManualGeneration(request)).resolves.toEqual({
+      outcome: "blocked",
+      reason: "no_internal_links",
+      locale: "sr",
+    });
+    expect(noLinkKeyword.status).toBe("ready");
+  });
+
   it("caps the number of active manual requests", async () => {
-    const test = setup();
+    const test = setup({
+      keywords: Array.from({ length: 4 }, (_, index) =>
+        readyKeyword({
+          __rowNumber: index + 2,
+          keyword_id: `KW-READY-${index + 1}`,
+          primary_keyword: `queue keyword ${index + 1}`,
+        }),
+      ),
+    });
     for (let index = 0; index < 3; index += 1) {
       expect(
         await test.service.requestManualGeneration({
           ...request,
-          keyword: `pending keyword ${index}`,
           providerObjectId: `message:-5484259760:${index}`,
         }),
       ).toMatchObject({ outcome: "queued" });
@@ -269,42 +388,57 @@ describe("manual generation requests", () => {
       outcome: "blocked",
       reason: "queue_full",
     });
-    expect(test.keywordRows).toHaveLength(3);
+    expect(test.keywordRows.filter((row) => row.status === "assigned")).toHaveLength(3);
+    expect(test.keywordRows[3]?.status).toBe("ready");
   });
 });
 
 describe("manual generation worker", () => {
-  it("processes only assigned Telegram requests while scheduled generation is disabled", async () => {
-    const scheduled = {
-      __rowNumber: 2,
-      keyword_id: "KW-SCHEDULED",
-      article_id: "",
-      locale: "sr",
-      primary_keyword: "scheduled keyword",
-      status: "ready",
-      source: "manual_test",
-    } as SheetRecord;
-    const test = setup({ keywords: [scheduled] });
+  it("processes a row authorized by its durable signed request event, not by a source prefix", async () => {
+    const queuedKeyword = readyKeyword({ source: "seo_research_import" });
+    const untouched = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-NEXT",
+      primary_keyword: "sledeći ključ",
+      source: "seo_research_import",
+    });
+    const test = setup({ keywords: [queuedKeyword, untouched] });
     const queued = await test.service.requestManualGeneration(request);
     expect(queued.outcome).toBe("queued");
-    const ids = manualRequestIds(request.providerObjectId);
-    const manual = test.keywordRows.find((row) => row.keyword_id === ids.keywordId)!;
     await test.service.runManualOnce();
     await test.service.runOnce();
     expect(test.generate).toHaveBeenCalledTimes(1);
-    expect(manual.status).toBe("used");
-    expect(scheduled.status).toBe("ready");
+    expect(queuedKeyword.status).toBe("used");
+    expect(queuedKeyword.source).toBe("seo_research_import");
+    expect(untouched.status).toBe("ready");
     expect(test.articleRows).toHaveLength(1);
     expect(test.articleRows[0]).toMatchObject({
-      article_id: ids.articleId,
+      article_id: queuedKeyword.article_id,
+      keyword_id: "KW-READY-1",
       status: "needs_review",
       qa_status: "pass",
       manual_required: false,
     });
   });
 
+  it("keeps a signed request valid when the Sheet row moves after claiming", async () => {
+    const queuedKeyword = readyKeyword();
+    const test = setup({ keywords: [queuedKeyword] });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+
+    queuedKeyword.__rowNumber = 27;
+    await test.service.runManualOnce();
+
+    expect(test.generate).toHaveBeenCalledTimes(1);
+    expect(queuedKeyword.status).toBe("used");
+    expect(test.articleRows).toHaveLength(1);
+  });
+
   it("requires explicit human clearance when model QA reports a semantic defect", async () => {
-    const test = setup({ qaBlockers: ["missing_authoritative_source"] });
+    const test = setup({
+      keywords: [readyKeyword()],
+      qaBlockers: ["missing_authoritative_source"],
+    });
     expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
     await test.service.runManualOnce();
     expect(test.articleRows[0]).toMatchObject({
@@ -312,11 +446,13 @@ describe("manual generation worker", () => {
       qa_blockers: "missing_authoritative_source",
       manual_required: true,
     });
+    expect(test.keywordRows[0]?.status).toBe("used");
   });
 
   it("runs fresh deterministic QA before appending an initially generated article", async () => {
     const malformedBody = `${Array.from({ length: 510 }, () => "savet").join(" ")}\n\n[Playroom].(${allowedInternalUrl})\n[Izvor](https://example.org/story)`;
     const test = setup({
+      keywords: [readyKeyword()],
       generatedOverrides: {
         body_markdown: malformedBody,
         source_urls: ["https://example.org/story?utm_source=openai"],
@@ -331,40 +467,33 @@ describe("manual generation worker", () => {
   });
 
   it("moves a failed request to paused without a retry loop", async () => {
-    const ids = manualRequestIds(request.providerObjectId);
-    const test = setup({ generatorError: new Error("upstream failed") });
+    const keyword = readyKeyword();
+    const test = setup({ keywords: [keyword], generatorError: new Error("upstream failed") });
     expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
-    const manual = test.keywordRows.find((row) => row.keyword_id === ids.keywordId)!;
     await test.service.runManualOnce();
     await test.service.runManualOnce();
     expect(test.generate).toHaveBeenCalledTimes(1);
-    expect(manual.status).toBe("paused");
+    expect(keyword.status).toBe("paused");
     expect(test.articleRows).toHaveLength(0);
   });
 
-  it("rejects a Sheet-injected manual row without a signed Telegram request", async () => {
-    const manual = {
-      __rowNumber: 2,
-      keyword_id: "KW-LEGACY",
-      article_id: "",
-      locale: "sr",
-      primary_keyword: request.keyword,
+  it("does not treat a legacy source prefix as authorization without a durable request event", async () => {
+    const manual = readyKeyword({
+      keyword_id: "KW-INJECTED",
+      article_id: "SEO-INJECTED",
       status: "assigned",
       source: "telegram_manual:message:-5484259760:200",
-    } as SheetRecord;
+    });
     const test = setup({ keywords: [manual] });
     await test.service.runManualOnce();
-    expect(String(manual.article_id)).toMatch(/^SEO-/);
     expect(test.generate).not.toHaveBeenCalled();
-    expect(manual.status).toBe("paused");
-    expect(test.events).toContainEqual(
-      expect.objectContaining({ event_type: "generation_blocked", message: "invalid_manual_request" }),
-    );
+    expect(manual.status).toBe("assigned");
+    expect(test.events).toHaveLength(0);
     expect(test.articleRows).toHaveLength(0);
   });
 
   it("rejects a queued request if an editor tampers with its signed keyword", async () => {
-    const test = setup();
+    const test = setup({ keywords: [readyKeyword()] });
     expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
     test.keywordRows[0]!.primary_keyword = "tampered high-cost keyword";
     await test.service.runManualOnce();
@@ -375,12 +504,11 @@ describe("manual generation worker", () => {
 
   it("rechecks locale settings after enqueue and before model execution", async () => {
     const liveSettings = settings();
-    const test = setup({ settings: liveSettings });
-    const queued = await test.service.requestManualGeneration({
-      ...request,
-      locale: "en",
-      providerObjectId: "message:-5484259760:201",
+    const test = setup({
+      settings: liveSettings,
+      keywords: [readyKeyword({ locale: "en" })],
     });
+    const queued = await test.service.requestManualGeneration(request);
     expect(queued.outcome).toBe("queued");
     liveSettings.set("enabled_locales", "sr");
     await test.service.runManualOnce();
