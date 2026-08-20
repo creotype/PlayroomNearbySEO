@@ -37,18 +37,22 @@ describe("/generate command parser", () => {
 });
 
 const config = {
+  spreadsheetId: "sheet",
   telegramBotToken: "123456789:abcdefghijklmnopqrstuvwxyz",
   telegramReviewChatId: -5484259760,
+  targetEnvironment: "staging",
 } as AppConfig;
 
-function botHarness() {
-  const requestManualGeneration = vi.fn(async () => ({
-    outcome: "queued" as const,
-    keywordId: "KW-TG-1",
-    articleId: "SEO-TG-1",
-    locale: "sr",
-    keyword: "igraonice za decu Beograd",
-  }));
+const queuedGenerationResult = {
+  outcome: "queued" as const,
+  keywordId: "KW-TG-1",
+  articleId: "SEO-TG-1",
+  locale: "sr",
+  keyword: "igraonice za decu Beograd",
+};
+
+function botHarness(manualResult: Record<string, unknown> = queuedGenerationResult) {
+  const requestManualGeneration = vi.fn(async () => manualResult);
   const article = {
     __rowNumber: 2,
     article_id: "SEO-TG-1",
@@ -111,6 +115,12 @@ function botHarness() {
   return { bot, requestManualGeneration, regenerateArticle, article, apiCalls };
 }
 
+function sentMessagePayload(test: ReturnType<typeof botHarness>) {
+  return test.apiCalls.find((call) => call.method === "sendMessage")?.payload as
+    | { text?: string; parse_mode?: string; link_preview_options?: { is_disabled?: boolean } }
+    | undefined;
+}
+
 function generateUpdate(
   chatId: number,
   chatType: "private" | "supergroup" = "supergroup",
@@ -142,6 +152,149 @@ describe("/generate Telegram handler", () => {
       providerObjectId: "message:-5484259760:77",
     });
     expect(test.apiCalls.some((call) => call.method === "sendMessage")).toBe(true);
+  });
+
+  it("shows every invalid field and a deep link to the exact keyword row", async () => {
+    const test = botHarness({
+      outcome: "blocked",
+      reason: "invalid_keyword_row",
+      rowNumber: 7,
+      locale: "sr",
+      invalidFields: ["keyword_id", "primary_keyword", "article_id"],
+      articleId: "SEO-LEFTOVER",
+    });
+
+    await test.bot.handleUpdate(generateUpdate(-5484259760));
+
+    const payload = sentMessagePayload(test);
+    expect(payload?.parse_mode).toBe("HTML");
+    expect(payload?.text).toContain("строке 7");
+    expect(payload?.text).toContain("keyword_id");
+    expect(payload?.text).toContain("primary_keyword");
+    expect(payload?.text).toContain("article_id");
+    expect(payload?.text).toContain("SEO-LEFTOVER");
+    expect(payload?.text).toContain(
+      'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000002&range=A7:T7"',
+    );
+  });
+
+  it("shows every conflicting row when keyword_id is duplicated", async () => {
+    const test = botHarness({
+      outcome: "blocked",
+      reason: "duplicate_keyword_id",
+      keywordId: "KW-<DUPLICATE>&",
+      rowNumber: 4,
+      conflictingRows: [4, 9],
+    });
+
+    await test.bot.handleUpdate(generateUpdate(-5484259760));
+
+    const payload = sentMessagePayload(test);
+    expect(payload?.parse_mode).toBe("HTML");
+    expect(payload?.text).toContain("KW-&lt;DUPLICATE&gt;&amp;");
+    expect(payload?.text).not.toContain("KW-<DUPLICATE>&");
+    expect(payload?.text).toContain("keyword_id");
+    expect(payload?.text).toContain("4, 9");
+    expect(payload?.text).toContain(
+      'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000002&range=A4:T4"',
+    );
+  });
+
+  it("explains a concurrent Sheet edit without claiming or overwriting it", async () => {
+    const test = botHarness({
+      outcome: "blocked",
+      reason: "keyword_row_changed",
+      keywordId: "KW-EDIT-RACE",
+      rowNumber: 12,
+    });
+
+    await test.bot.handleUpdate(generateUpdate(-5484259760));
+
+    const payload = sentMessagePayload(test);
+    expect(payload?.parse_mode).toBe("HTML");
+    expect(payload?.text).toContain("ничего не перезаписал");
+    expect(payload?.text).toContain("status=ready");
+    expect(payload?.text).toContain(
+      'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000002&range=A12:T12"',
+    );
+  });
+
+  it("links to the keywords tab when there are no ready rows without rendering an undefined range", async () => {
+    const test = botHarness({ outcome: "blocked", reason: "no_ready_keywords" });
+
+    await test.bot.handleUpdate(generateUpdate(-5484259760));
+
+    const payload = sentMessagePayload(test);
+    expect(payload?.parse_mode).toBe("HTML");
+    expect(payload?.text).toContain("ready");
+    expect(payload?.text).toContain(
+      'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000002',
+    );
+    expect(payload?.text).not.toContain("undefined");
+  });
+
+  it("explains a disabled locale and links to its exact keyword row", async () => {
+    const test = botHarness({
+      outcome: "blocked",
+      reason: "locale_disabled",
+      keywordId: "KW-DE-OFF",
+      rowNumber: 8,
+      locale: "de",
+      allowedLocales: ["sr", "en"],
+    });
+
+    await test.bot.handleUpdate(generateUpdate(-5484259760));
+
+    const payload = sentMessagePayload(test);
+    expect(payload?.parse_mode).toBe("HTML");
+    expect(payload?.text).toContain("DE");
+    expect(payload?.text).toContain("SR");
+    expect(payload?.text).toContain("EN");
+    expect(payload?.text).toContain(
+      'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000002&range=A8:T8"',
+    );
+  });
+
+  it("points to link_inventory and the exact keyword row when internal links are missing", async () => {
+    const test = botHarness({
+      outcome: "blocked",
+      reason: "no_internal_links",
+      keywordId: "KW-NO-LINKS",
+      rowNumber: 12,
+      locale: "en",
+    });
+
+    await test.bot.handleUpdate(generateUpdate(-5484259760));
+
+    const payload = sentMessagePayload(test);
+    expect(payload?.parse_mode).toBe("HTML");
+    expect(payload?.text).toContain("EN");
+    expect(payload?.text).toContain("link_inventory");
+    expect(payload?.text).toContain("environment=staging");
+    expect(payload?.text).toContain(
+      'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000002&range=A12:T12"',
+    );
+  });
+
+  it("shows the queue occupancy and waiting keyword row when the manual queue is full", async () => {
+    const test = botHarness({
+      outcome: "blocked",
+      reason: "queue_full",
+      keywordId: "KW-WAITING",
+      rowNumber: 15,
+      queueLimit: 3,
+      activeCount: 3,
+    });
+
+    await test.bot.handleUpdate(generateUpdate(-5484259760));
+
+    const payload = sentMessagePayload(test);
+    expect(payload?.parse_mode).toBe("HTML");
+    expect(payload?.text).toMatch(/3(?:\/| из )3/);
+    expect(payload?.text).toContain("KW-WAITING");
+    expect(payload?.text).toContain(
+      'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000002&range=A15:T15"',
+    );
   });
 
   it("rejects command arguments without claiming a queued keyword", async () => {

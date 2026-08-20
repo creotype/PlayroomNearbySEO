@@ -1,6 +1,23 @@
 import type { Article } from "../domain/article.js";
 import { booleanCell, displayDateCell, numberCell, stringCell } from "../domain/article.js";
 
+const KEYWORDS_SHEET_GID = 910000002;
+const LINK_INVENTORY_SHEET_GID = 910000004;
+const SETTINGS_SHEET_GID = 910000005;
+
+export function keywordSheetUrl(spreadsheetId: string, rowNumber?: number): string {
+  const range = rowNumber ? `A${rowNumber}:T${rowNumber}` : "A2:T";
+  return sheetRangeUrl(spreadsheetId, KEYWORDS_SHEET_GID, range);
+}
+
+export function linkInventorySheetUrl(spreadsheetId: string): string {
+  return sheetRangeUrl(spreadsheetId, LINK_INVENTORY_SHEET_GID, "A2:N");
+}
+
+export function settingsSheetUrl(spreadsheetId: string): string {
+  return sheetRangeUrl(spreadsheetId, SETTINGS_SHEET_GID, "A2:F");
+}
+
 export function articleCard(article: Article, spreadsheetId: string): string {
   const row = article.__rowNumber;
   const sheetUrl = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(spreadsheetId)}/edit#gid=910000001&range=A${row}:AO${row}`;
@@ -48,4 +65,8 @@ export function escapeHtml(value: string): string {
     };
     return replacements[character] ?? character;
   });
+}
+
+function sheetRangeUrl(spreadsheetId: string, gid: number, range: string): string {
+  return `https://docs.google.com/spreadsheets/d/${encodeURIComponent(spreadsheetId)}/edit#gid=${gid}&range=${range}`;
 }

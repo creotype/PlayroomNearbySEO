@@ -186,10 +186,13 @@ export class GoogleSheetsStore {
     await this.#appendRecord("articles", values);
   }
 
-  async listKeywords(statuses?: readonly string[]): Promise<SheetRecord[]> {
+  async listKeywords(
+    statuses?: readonly string[],
+    options: { includeIncomplete?: boolean } = {},
+  ): Promise<SheetRecord[]> {
     const table = await this.#readTable("keywords");
     return table.rows
-      .filter((row) => Boolean(stringCell(row.keyword_id)))
+      .filter((row) => options.includeIncomplete || Boolean(stringCell(row.keyword_id)))
       .filter((row) => !statuses || statuses.includes(stringCell(row.status)));
   }
 
@@ -249,8 +252,9 @@ export class GoogleSheetsStore {
     keywordId: string,
     patch: Record<string, CellValue>,
     event: AuditEvent,
-  ): Promise<void> {
-    await this.#eventWriteMutex.runExclusive("events", async () => {
+    expected?: Record<string, CellValue>,
+  ): Promise<boolean> {
+    return this.#eventWriteMutex.runExclusive("events", async () => {
       const [keywords, events] = await Promise.all([
         this.#readTable("keywords"),
         this.#readTable("events", true),
@@ -259,7 +263,14 @@ export class GoogleSheetsStore {
         (row) => stringCell(row.keyword_id).toLowerCase() === keywordId.trim().toLowerCase(),
       );
       if (matches.length !== 1) {
+        if (expected) return false;
         throw new Error(`Expected exactly one keyword ${keywordId}; found ${matches.length}`);
+      }
+      if (
+        expected &&
+        Object.entries(expected).some(([field, value]) => stringCell(matches[0]![field]) !== stringCell(value))
+      ) {
+        return false;
       }
       const [keywordSheetId, eventSheetId] = await Promise.all([
         this.#sheetId("keywords"),
@@ -276,11 +287,12 @@ export class GoogleSheetsStore {
         const eventValues = auditEventValues(event);
         requests.push(appendCellsRequest(eventSheetId, events.headers, eventValues));
       }
-      if (requests.length === 0) return;
+      if (requests.length === 0) return true;
       await this.#sheets.spreadsheets.batchUpdate({
         spreadsheetId: this.#spreadsheetId,
         requestBody: { requests },
       });
+      return true;
     });
   }
 

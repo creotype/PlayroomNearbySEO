@@ -4,7 +4,7 @@ import { articleContentHash, stringCell, type SheetRecord } from "../domain/arti
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { SeoBot } from "../telegram/bot.js";
 import { reviewKeyboard } from "../telegram/bot.js";
-import { articleCard, escapeHtml } from "../telegram/messages.js";
+import { articleCard, escapeHtml, keywordSheetUrl } from "../telegram/messages.js";
 
 export class ReviewNotifier {
   constructor(
@@ -113,11 +113,8 @@ function generationFailureMessage(
   spreadsheetId: string,
 ): string {
   const row = keyword.__rowNumber;
-  const sheetUrl = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(spreadsheetId)}/edit#gid=910000002&range=A${row}:T${row}`;
-  const reason =
-    stringCell(failure.event_type) === "generation_blocked"
-      ? "Изменились разрешённые настройки локали или внутренних ссылок."
-      : "Генератор вернул ошибку; автоматический повтор не запускался.";
+  const sheetUrl = keywordSheetUrl(spreadsheetId, row);
+  const reason = generationFailureReason(failure);
   return [
     `⚠️ <b>Генерация остановлена · ${escapeHtml(stringCell(keyword.keyword_id))}</b>`,
     escapeHtml(stringCell(keyword.primary_keyword)),
@@ -125,4 +122,29 @@ function generationFailureMessage(
     "",
     `<a href="${sheetUrl}">Открыть заявку в Google Sheets</a>`,
   ].join("\n");
+}
+
+function generationFailureReason(failure: SheetRecord): string {
+  const retry = "После исправления очистите article_id, верните status=ready и повторите /generate.";
+  if (stringCell(failure.event_type) !== "generation_blocked") {
+    return `Генератор вернул техническую ошибку. ${retry}`;
+  }
+  try {
+    const payload = JSON.parse(stringCell(failure.payload_json)) as Record<string, unknown>;
+    if (payload.reason === "ru_disabled") {
+      return `Локаль RU выключили после постановки в очередь. Исправьте locale или обратитесь к администратору. ${retry}`;
+    }
+    if (payload.reason === "locale_disabled") {
+      return `Локаль ключа выключили после постановки в очередь. Исправьте locale или settings.enabled_locales. ${retry}`;
+    }
+    if (payload.reason === "no_internal_links") {
+      return `Для локали больше нет разрешённой внутренней ссылки. Проверьте link_inventory. ${retry}`;
+    }
+    if (payload.reason === "invalid_manual_request") {
+      return "Системные поля ключа изменились после /generate. Проверьте строку, очистите article_id и верните status=ready для нового запуска.";
+    }
+  } catch {
+    // Fall through to a safe operator-facing explanation.
+  }
+  return `Настройки или системные поля ключа изменились после постановки в очередь. ${retry}`;
 }

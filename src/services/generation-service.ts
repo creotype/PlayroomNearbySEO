@@ -28,11 +28,15 @@ export type ManualGenerationBlockReason =
   | "manual_generation_disabled"
   | "no_ready_keywords"
   | "invalid_keyword_row"
+  | "duplicate_keyword_id"
+  | "keyword_row_changed"
   | "request_conflict"
   | "locale_disabled"
   | "ru_disabled"
   | "no_internal_links"
   | "queue_full";
+
+export type InvalidKeywordField = "keyword_id" | "locale" | "primary_keyword" | "article_id";
 
 export type ManualGenerationRequest = {
   actorId: number;
@@ -47,11 +51,20 @@ export type ManualGenerationResult =
       articleId: string;
       locale: string;
       keyword: string;
+      rowNumber: number;
     }
   | {
       outcome: "blocked";
       reason: ManualGenerationBlockReason;
       locale?: string;
+      rowNumber?: number;
+      keywordId?: string;
+      invalidFields?: InvalidKeywordField[];
+      conflictingRows?: number[];
+      articleId?: string;
+      allowedLocales?: string[];
+      queueLimit?: number;
+      activeCount?: number;
     };
 
 export type RegenerationRequest = {
@@ -109,26 +122,17 @@ export class GenerationService {
     }
     const articleId = manualRequestArticleId(request.providerObjectId);
     return this.#requestMutex.runExclusive("keyword-claim", async () => {
-      const allKeywords = await this.store.listKeywords();
+      const allKeywords = await this.store.listKeywords(undefined, { includeIncomplete: true });
       const existing = allKeywords.find(
         (candidate) => stringCell(candidate.article_id).toLowerCase() === articleId.toLowerCase(),
       );
       if (existing) {
         if (!(await this.#hasValidManualRequest(existing))) {
-          return { outcome: "blocked", reason: "request_conflict" };
+          return blockedForKeyword("request_conflict", existing, {
+            ...(stringCell(existing.article_id) ? { articleId: stringCell(existing.article_id) } : {}),
+          });
         }
         return resultForExistingKeyword(existing);
-      }
-
-      const queueLimit = Math.max(1, numberCell(settings.get("telegram_generation_queue_limit")) || 3);
-      const activeManualRequests = allKeywords.filter(
-        (candidate) => [CLAIMED_STATUS, "generating"].includes(stringCell(candidate.status)),
-      );
-      const authorizedActiveRequests = (
-        await Promise.all(activeManualRequests.map((candidate) => this.#hasValidManualRequest(candidate)))
-      ).filter(Boolean).length;
-      if (authorizedActiveRequests >= queueLimit) {
-        return { outcome: "blocked", reason: "queue_full" };
       }
 
       const keyword = allKeywords
@@ -139,36 +143,62 @@ export class GenerationService {
       const keywordId = stringCell(keyword.keyword_id);
       const normalizedKeyword = normalizeManualKeyword(stringCell(keyword.primary_keyword));
       const locale = stringCell(keyword.locale).toLowerCase();
+      const invalidFields: InvalidKeywordField[] = [];
+      if (!keywordId) invalidFields.push("keyword_id");
+      if (!locale) invalidFields.push("locale");
       if (
-        !keywordId ||
-        Boolean(stringCell(keyword.article_id)) ||
         normalizedKeyword.length < 2 ||
         normalizedKeyword.length > 200 ||
         /[\u0000-\u001F\u007F]/u.test(normalizedKeyword)
       ) {
-        return { outcome: "blocked", reason: "invalid_keyword_row", ...(locale ? { locale } : {}) };
+        invalidFields.push("primary_keyword");
       }
-      const enabledLocales = new Set(
-        parseListCell(settings.get("enabled_locales")).map((value) => value.toLowerCase()),
-      );
+      if (stringCell(keyword.article_id)) invalidFields.push("article_id");
+      if (invalidFields.length > 0) {
+        return blockedForKeyword("invalid_keyword_row", keyword, {
+          invalidFields,
+          ...(stringCell(keyword.article_id) ? { articleId: stringCell(keyword.article_id) } : {}),
+        });
+      }
+
+      const conflictingRows = allKeywords
+        .filter((candidate) => stringCell(candidate.keyword_id).toLowerCase() === keywordId.toLowerCase())
+        .map((candidate) => candidate.__rowNumber)
+        .sort((left, right) => left - right);
+      if (conflictingRows.length > 1) {
+        return blockedForKeyword("duplicate_keyword_id", keyword, { conflictingRows });
+      }
+      const allowedLocales = parseListCell(settings.get("enabled_locales")).map((value) => value.toLowerCase());
+      const enabledLocales = new Set(allowedLocales);
       if (locale === "ru" && !booleanCell(settings.get("ru_enabled"))) {
-        return { outcome: "blocked", reason: "ru_disabled", locale };
+        return blockedForKeyword("ru_disabled", keyword, { allowedLocales });
       }
       if (!locale || !enabledLocales.has(locale)) {
-        return { outcome: "blocked", reason: "locale_disabled", ...(locale ? { locale } : {}) };
+        return blockedForKeyword("locale_disabled", keyword, { allowedLocales });
+      }
+
+      const queueLimit = Math.max(1, numberCell(settings.get("telegram_generation_queue_limit")) || 3);
+      const activeManualRequests = allKeywords.filter(
+        (candidate) => [CLAIMED_STATUS, "generating"].includes(stringCell(candidate.status)),
+      );
+      const activeCount = (
+        await Promise.all(activeManualRequests.map((candidate) => this.#hasValidManualRequest(candidate)))
+      ).filter(Boolean).length;
+      if (activeCount >= queueLimit) {
+        return blockedForKeyword("queue_full", keyword, { activeCount, queueLimit });
       }
       const links = await this.store.listLinks();
       const hasInternalLink = links.some(
         (link) =>
-          stringCell(link.environment) === this.config.targetEnvironment &&
-          stringCell(link.status) === "active" &&
+          stringCell(link.environment).toLowerCase() === this.config.targetEnvironment.toLowerCase() &&
+          stringCell(link.status).toLowerCase() === "active" &&
           booleanCell(link.allow_internal_link) &&
-          ["all", locale].includes(stringCell(link.locale)),
+          ["all", locale].includes(stringCell(link.locale).toLowerCase()),
       );
-      if (!hasInternalLink) return { outcome: "blocked", reason: "no_internal_links", locale };
+      if (!hasInternalLink) return blockedForKeyword("no_internal_links", keyword);
 
       const now = new Date().toISOString();
-      await this.store.patchKeywordAndAppendEvent(
+      const claimed = await this.store.patchKeywordAndAppendEvent(
         keywordId,
         {
           status: CLAIMED_STATUS,
@@ -185,13 +215,23 @@ export class GenerationService {
           now,
           this.config.telegramBotToken,
         ),
+        {
+          status: "ready",
+          article_id: "",
+          locale: keyword.locale ?? "",
+          primary_keyword: keyword.primary_keyword ?? "",
+        },
       );
+      if (claimed === false) {
+        return blockedForKeyword("keyword_row_changed", keyword);
+      }
       return {
         outcome: "queued",
         keywordId,
         articleId,
         locale,
         keyword: normalizedKeyword,
+        rowNumber: keyword.__rowNumber,
       };
     });
   }
@@ -406,10 +446,10 @@ export class GenerationService {
     const links = await this.store.listLinks();
     const hasInternalLink = links.some(
       (link) =>
-        stringCell(link.environment) === this.config.targetEnvironment &&
-        stringCell(link.status) === "active" &&
+        stringCell(link.environment).toLowerCase() === this.config.targetEnvironment.toLowerCase() &&
+        stringCell(link.status).toLowerCase() === "active" &&
         booleanCell(link.allow_internal_link) &&
-        ["all", locale].includes(stringCell(link.locale)),
+        ["all", locale].includes(stringCell(link.locale).toLowerCase()),
     );
     return hasInternalLink ? undefined : "no_internal_links";
   }
@@ -772,6 +812,28 @@ export function manualRequestArticleId(providerObjectId: string): string {
   return `SEO-TG-${hash}`;
 }
 
+type ManualGenerationBlockedResult = Extract<ManualGenerationResult, { outcome: "blocked" }>;
+
+function blockedForKeyword(
+  reason: ManualGenerationBlockReason,
+  keyword: SheetRecord,
+  details: Omit<
+    ManualGenerationBlockedResult,
+    "outcome" | "reason" | "rowNumber" | "keywordId" | "locale"
+  > = {},
+): ManualGenerationBlockedResult {
+  const keywordId = stringCell(keyword.keyword_id);
+  const locale = stringCell(keyword.locale).toLowerCase();
+  return {
+    outcome: "blocked",
+    reason,
+    rowNumber: keyword.__rowNumber,
+    ...(keywordId ? { keywordId } : {}),
+    ...(locale ? { locale } : {}),
+    ...details,
+  };
+}
+
 function resultForExistingKeyword(keyword: SheetRecord): Exclude<ManualGenerationResult, { outcome: "blocked" }> {
   const status = stringCell(keyword.status);
   const outcome = status === "used" ? "already_generated" : status === "paused" ? "previous_failed" : "already_queued";
@@ -781,6 +843,7 @@ function resultForExistingKeyword(keyword: SheetRecord): Exclude<ManualGeneratio
     articleId: stringCell(keyword.article_id),
     locale: stringCell(keyword.locale).toLowerCase(),
     keyword: normalizeManualKeyword(stringCell(keyword.primary_keyword)),
+    rowNumber: keyword.__rowNumber,
   };
 }
 

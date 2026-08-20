@@ -6,11 +6,17 @@ import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { ApprovalResult, ApprovalService, TelegramActor } from "../services/approval-service.js";
 import type {
   GenerationService,
-  ManualGenerationBlockReason,
+  InvalidKeywordField,
   ManualGenerationResult,
   RegenerationResult,
 } from "../services/generation-service.js";
-import { articleStatusMessage, escapeHtml } from "./messages.js";
+import {
+  articleStatusMessage,
+  escapeHtml,
+  keywordSheetUrl,
+  linkInventorySheetUrl,
+  settingsSheetUrl,
+} from "./messages.js";
 
 export type SeoBot = Bot<Context>;
 
@@ -63,7 +69,7 @@ export function createTelegramBot(options: {
         actorName: actor.displayName,
         providerObjectId: actor.providerObjectId,
       });
-      await replyGenerationResult(ctx, result);
+      await replyGenerationResult(ctx, result, config);
     } catch (error) {
       logger.error(
         { updateId: ctx.update.update_id, err: error instanceof Error ? error.message : String(error) },
@@ -322,9 +328,16 @@ async function replyApprovalResult(ctx: Context, result: ApprovalResult): Promis
   );
 }
 
-async function replyGenerationResult(ctx: Context, result: ManualGenerationResult): Promise<void> {
+async function replyGenerationResult(
+  ctx: Context,
+  result: ManualGenerationResult,
+  config: Pick<AppConfig, "spreadsheetId" | "targetEnvironment">,
+): Promise<void> {
   if (result.outcome === "blocked") {
-    await ctx.reply(manualGenerationBlockedMessage(result.reason, result.locale));
+    await ctx.reply(manualGenerationBlockedMessage(result, config), {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+    });
     return;
   }
   if (result.outcome === "already_generated") {
@@ -338,16 +351,24 @@ async function replyGenerationResult(ctx: Context, result: ManualGenerationResul
     return;
   }
   if (result.outcome === "previous_failed") {
+    const sheetUrl = keywordSheetUrl(config.spreadsheetId, result.rowNumber);
     await ctx.reply(
-      `⚠️ Предыдущая генерация <code>${escapeHtml(result.keywordId)}</code> завершилась ошибкой. Проверьте строку keywords; автоматический повтор не запущен.`,
-      { parse_mode: "HTML" },
+      [
+        `⚠️ Предыдущая генерация <code>${escapeHtml(result.keywordId)}</code> завершилась ошибкой.`,
+        "Исправьте данные при необходимости, очистите <code>article_id</code>, верните <code>status=ready</code> и снова отправьте <code>/generate</code>.",
+        "",
+        `<a href="${sheetUrl}">Открыть строку в Google Sheets</a>`,
+      ].join("\n"),
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
     );
     return;
   }
   if (result.outcome === "already_queued") {
-    await ctx.reply(`ℹ️ Такой запрос уже в очереди: <code>${escapeHtml(result.keywordId)}</code>.`, {
-      parse_mode: "HTML",
-    });
+    const sheetUrl = keywordSheetUrl(config.spreadsheetId, result.rowNumber);
+    await ctx.reply(
+      `ℹ️ Такой запрос уже в очереди: <code>${escapeHtml(result.keywordId)}</code>.\n<a href="${sheetUrl}">Открыть строку</a>`,
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+    );
     return;
   }
   await ctx.reply(
@@ -403,24 +424,145 @@ async function replyRegenerationResult(ctx: Context, result: RegenerationResult)
   );
 }
 
-function manualGenerationBlockedMessage(reason: ManualGenerationBlockReason, locale?: string): string {
-  if (reason === "generator_not_configured") return "⛔ Генератор пока не настроен.";
-  if (reason === "manual_generation_disabled") return "⛔ Ручная генерация сейчас выключена администратором.";
-  if (reason === "no_ready_keywords") {
-    return "📭 В keywords нет ключевиков со статусом ready. Переведите нужную строку в ready.";
+function manualGenerationBlockedMessage(
+  result: Extract<ManualGenerationResult, { outcome: "blocked" }>,
+  config: Pick<AppConfig, "spreadsheetId" | "targetEnvironment">,
+): string {
+  const queueUrl = keywordSheetUrl(config.spreadsheetId);
+  const rowUrl = keywordSheetUrl(config.spreadsheetId, result.rowNumber);
+  const settingsUrl = settingsSheetUrl(config.spreadsheetId);
+  const linkInventoryUrl = linkInventorySheetUrl(config.spreadsheetId);
+  const rowTitle = result.rowNumber ? `Строка ${result.rowNumber}` : "Верхняя ready-строка";
+  const retry = "Исправьте строку, оставьте <code>status=ready</code> и снова отправьте <code>/generate</code>.";
+  const openRow = result.rowNumber
+    ? `<a href="${rowUrl}">Исправить строку ${result.rowNumber} в Google Sheets</a>`
+    : `<a href="${queueUrl}">Открыть keywords в Google Sheets</a>`;
+
+  if (result.reason === "generator_not_configured") {
+    return "⛔ <b>Генератор не настроен на сервере.</b> Это не ошибка ключевика — передайте сообщение техническому администратору.";
   }
-  if (reason === "invalid_keyword_row") {
-    return "⛔ Верхняя ready-строка заполнена некорректно. Проверьте keyword_id, locale, primary_keyword и article_id.";
+  if (result.reason === "manual_generation_disabled") {
+    return [
+      "⛔ <b>Ручная генерация выключена.</b>",
+      "Проверьте <code>settings.telegram_generation_enabled</code>. Если там <code>TRUE</code>, нужен технический администратор для серверного переключателя.",
+      "",
+      `<a href="${settingsUrl}">Открыть settings</a>`,
+    ].join("\n");
   }
-  if (reason === "request_conflict") {
-    return "⛔ Эта Telegram-команда конфликтует с существующей заявкой. Проверьте events и article_id.";
+  if (result.reason === "no_ready_keywords") {
+    return [
+      "📭 <b>В очереди нет готовых ключевиков.</b>",
+      "В <code>keywords</code> нет строк с точным <code>status=ready</code>.",
+      "Заполните <code>keyword_id</code>, <code>locale</code> и <code>primary_keyword</code>, оставьте <code>article_id</code> пустым и поставьте <code>ready</code>.",
+      "",
+      `<a href="${queueUrl}">Открыть очередь keywords</a>`,
+    ].join("\n");
   }
-  if (reason === "ru_disabled") return "⛔ RU-генерация выключена до готовности русского раздела сайта.";
-  if (reason === "no_internal_links") {
-    return `⛔ Для ${String(locale ?? "этой локали").toUpperCase()} нет разрешённых внутренних ссылок.`;
+  if (result.reason === "invalid_keyword_row") {
+    const invalidHeader = result.rowNumber
+      ? `/generate остановлен на строке ${result.rowNumber}.`
+      : "/generate остановлен на верхней ready-строке.";
+    const issues = (result.invalidFields ?? []).map((field) => invalidKeywordFieldMessage(
+      field,
+      result.rowNumber,
+      result.articleId,
+    ));
+    return [
+      `⛔ <b>${invalidHeader}</b>`,
+      "Бот не пропустил сломанный верхний ключ, чтобы не нарушить порядок очереди.",
+      ...issues.map((issue) => `• ${issue}`),
+      retry,
+      "",
+      openRow,
+    ].join("\n");
   }
-  if (reason === "queue_full") return "⛔ Очередь ручной генерации заполнена. Дождитесь ближайшей карточки.";
-  return `⛔ Локаль ${String(locale ?? "").toUpperCase() || "не настроена"} недоступна.`;
+  if (result.reason === "duplicate_keyword_id") {
+    const rows = (result.conflictingRows ?? []).join(", ") || "не определены";
+    const rowLinks = (result.conflictingRows ?? [])
+      .map((row) => `<a href="${keywordSheetUrl(config.spreadsheetId, row)}">Строка ${row}</a>`)
+      .join(" · ");
+    return [
+      `⛔ <b>Дублирующийся keyword_id · ${rowTitle}.</b>`,
+      `<code>${escapeHtml(result.keywordId ?? "пусто")}</code> встречается в строках: <code>${escapeHtml(rows)}</code>.`,
+      "Задайте каждой строке уникальный <code>keyword_id</code> и повторите <code>/generate</code>.",
+      "",
+      rowLinks || openRow,
+    ].join("\n");
+  }
+  if (result.reason === "keyword_row_changed") {
+    return [
+      `↻ <b>${rowTitle} изменилась во время запуска.</b>`,
+      "Бот ничего не перезаписал. Проверьте, что <code>status=ready</code>, <code>article_id</code> пустой, а <code>locale</code> и <code>primary_keyword</code> заполнены, затем повторите <code>/generate</code>.",
+      "",
+      openRow,
+    ].join("\n");
+  }
+  if (result.reason === "request_conflict") {
+    return [
+      `⛔ <b>Конфликт системной заявки · ${rowTitle}.</b>`,
+      `Текущий <code>article_id</code>: <code>${escapeHtml(result.articleId ?? "пусто")}</code>. Подпись Telegram-заявки не совпадает с данными строки.`,
+      "Не редактируйте <code>events</code> вручную; откройте строку и передайте её техническому администратору.",
+      "",
+      openRow,
+    ].join("\n");
+  }
+  if (result.reason === "ru_disabled") {
+    return [
+      `⛔ <b>${rowTitle}: указана RU, но русский раздел выключен.</b>`,
+      "Исправьте <code>locale</code> или, если русский раздел уже готов, попросите администратора включить <code>settings.ru_enabled</code>.",
+      "",
+      openRow,
+      `<a href="${settingsUrl}">Открыть settings</a>`,
+    ].join("\n");
+  }
+  if (result.reason === "locale_disabled") {
+    const allowed = (result.allowedLocales ?? []).map((locale) => locale.toUpperCase()).join(", ") || "не настроены";
+    return [
+      `⛔ <b>${rowTitle}: локаль недоступна.</b>`,
+      `Сейчас в <code>settings.enabled_locales</code> разрешены: <code>${escapeHtml(allowed)}</code>.`,
+      `Исправьте <code>locale=${escapeHtml((result.locale ?? "пусто").toUpperCase())}</code> либо согласуйте включение локали с администратором.`,
+      "",
+      openRow,
+      `<a href="${settingsUrl}">Открыть settings</a>`,
+    ].join("\n");
+  }
+  if (result.reason === "no_internal_links") {
+    const environment = config.targetEnvironment || "текущее окружение";
+    return [
+      `⛔ <b>Для ${(result.locale ?? "локали").toUpperCase()} нет разрешённой внутренней ссылки.</b>`,
+      `В <code>link_inventory</code> нужна строка: <code>environment=${escapeHtml(environment)}</code>, нужная locale или <code>all</code>, <code>status=active</code>, <code>allow_internal_link=TRUE</code>.`,
+      "",
+      openRow,
+      `<a href="${linkInventoryUrl}">Открыть link_inventory</a>`,
+    ].join("\n");
+  }
+  return [
+    `⏳ <b>Очередь заполнена: ${result.activeCount ?? "?"}/${result.queueLimit ?? "?"} заявок уже в работе.</b>`,
+    result.keywordId
+      ? `Следующим ожидает <code>${escapeHtml(result.keywordId)}</code>${result.rowNumber ? ` · Строка ${result.rowNumber}` : ""}.`
+      : "Следующий ready-ключ ждёт свободного места.",
+    "Дождитесь ближайшей карточки. Если <code>assigned</code> или <code>generating</code> висит слишком долго, передайте строку администратору — не возвращайте её в <code>ready</code> вслепую.",
+    "",
+    result.rowNumber ? openRow : `<a href="${queueUrl}">Открыть очередь keywords</a>`,
+  ].join("\n");
+}
+
+function invalidKeywordFieldMessage(
+  field: InvalidKeywordField,
+  rowNumber?: number,
+  articleId?: string,
+): string {
+  const row = rowNumber ?? "?";
+  if (field === "keyword_id") {
+    return `<code>A${row} keyword_id</code> пустой. Заполните уникальный ID, например <code>KW-SR-011</code>.`;
+  }
+  if (field === "locale") {
+    return `<code>B${row} locale</code> пустая. Укажите включённую локаль, обычно <code>sr</code> или <code>en</code>.`;
+  }
+  if (field === "primary_keyword") {
+    return `<code>C${row} primary_keyword</code> должен содержать 2–200 обычных символов без невидимых управляющих знаков.`;
+  }
+  return `<code>O${row} article_id</code> должен быть пустым при <code>status=ready</code>; сейчас: <code>${escapeHtml(articleId ?? "заполнен")}</code>. Если статья уже создавалась, восстановите правильный status вместо создания дубля.`;
 }
 
 function generateUsage(message: string): string {

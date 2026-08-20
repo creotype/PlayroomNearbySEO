@@ -58,21 +58,38 @@ function setup(options: {
   generatedOverrides?: Record<string, unknown>;
   links?: SheetRecord[];
   workflowMutex?: KeyedMutex;
+  beforeKeywordClaim?: (keyword: SheetRecord) => void;
 } = {}) {
   const keywordRows = options.keywords ?? [];
   const articleRows = options.articles ?? [];
   const events: SheetRecord[] = [];
+  const listKeywords = vi.fn(async (
+    statuses?: readonly string[],
+    listOptions: { includeIncomplete?: boolean } = {},
+  ) =>
+    keywordRows
+      .filter((row) => listOptions.includeIncomplete || Boolean(String(row.keyword_id ?? "").trim()))
+      .filter((row) => !statuses || statuses.includes(String(row.status))));
   const patchKeywordAndAppendEvent = vi.fn(async (
     keywordId: string,
     patch: Record<string, CellValue>,
     event: Record<string, CellValue>,
+    expected?: Record<string, CellValue>,
   ) => {
     const keyword = keywordRows.find((row) => row.keyword_id === keywordId);
     if (!keyword) throw new Error(`Missing keyword ${keywordId}`);
+    options.beforeKeywordClaim?.(keyword);
+    if (
+      expected &&
+      Object.entries(expected).some(([field, value]) => String(keyword[field] ?? "").trim() !== String(value ?? "").trim())
+    ) {
+      return false;
+    }
     Object.assign(keyword, patch);
     if (!events.some((existing) => existing.event_id === event.event_id)) {
       events.push({ __rowNumber: events.length + 2, ...event });
     }
+    return true;
   });
   const generate = vi.fn(async () => {
     if (options.generatorError) throw options.generatorError;
@@ -113,8 +130,7 @@ function setup(options: {
         },
       ],
     listGuardrails: async () => [],
-    listKeywords: async (statuses?: readonly string[]) =>
-      keywordRows.filter((row) => !statuses || statuses.includes(String(row.status))),
+    listKeywords,
     findKeyword: async (keywordId: string) =>
       keywordRows.find((row) => String(row.keyword_id).toLowerCase() === keywordId.toLowerCase()),
     appendKeyword: async (values: Record<string, CellValue>) => {
@@ -165,7 +181,15 @@ function setup(options: {
     new QualityGate(typedStore, config),
     options.workflowMutex,
   );
-  return { service, keywordRows, articleRows, events, generate, patchKeywordAndAppendEvent };
+  return {
+    service,
+    keywordRows,
+    articleRows,
+    events,
+    generate,
+    listKeywords,
+    patchKeywordAndAppendEvent,
+  };
 }
 
 const request = {
@@ -257,6 +281,124 @@ describe("manual generation requests", () => {
     expect(test.patchKeywordAndAppendEvent).toHaveBeenCalledTimes(1);
   });
 
+  it("reports a missing keyword_id on the physically topmost ready row instead of skipping it", async () => {
+    const brokenTopRow = readyKeyword({
+      __rowNumber: 4,
+      keyword_id: "",
+      primary_keyword: "ključ bez identifikatora",
+    });
+    const validLowerRow = readyKeyword({
+      __rowNumber: 8,
+      keyword_id: "KW-VALID-LOWER",
+      primary_keyword: "validan ključ niže u tabeli",
+    });
+    const test = setup({ keywords: [validLowerRow, brokenTopRow] });
+
+    await expect(test.service.requestManualGeneration(request)).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "invalid_keyword_row",
+      rowNumber: 4,
+      locale: "sr",
+      invalidFields: ["keyword_id"],
+    });
+    expect(test.listKeywords).toHaveBeenCalledWith(undefined, { includeIncomplete: true });
+    expect(brokenTopRow.status).toBe("ready");
+    expect(validLowerRow.status).toBe("ready");
+    expect(test.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
+    expect(test.events).toHaveLength(0);
+  });
+
+  it("returns every invalid field from one ready row so the operator can fix it in one pass", async () => {
+    const broken = readyKeyword({
+      __rowNumber: 6,
+      keyword_id: "",
+      primary_keyword: "x",
+      article_id: "SEO-LEFTOVER",
+    });
+    const test = setup({ keywords: [broken] });
+
+    const result = await test.service.requestManualGeneration(request);
+
+    expect(result).toMatchObject({
+      outcome: "blocked",
+      reason: "invalid_keyword_row",
+      rowNumber: 6,
+      locale: "sr",
+      articleId: "SEO-LEFTOVER",
+    });
+    expect(result.outcome === "blocked" ? result.invalidFields : []).toHaveLength(3);
+    expect(result.outcome === "blocked" ? result.invalidFields : []).toEqual(
+      expect.arrayContaining(["keyword_id", "primary_keyword", "article_id"]),
+    );
+    expect(test.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
+  });
+
+  it("reports every row that shares the selected keyword_id without claiming any of them", async () => {
+    const selected = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-DUPLICATE",
+      primary_keyword: "prvi duplikat",
+    });
+    const duplicate = readyKeyword({
+      __rowNumber: 9,
+      keyword_id: "kw-duplicate",
+      primary_keyword: "drugi duplikat",
+    });
+    const test = setup({ keywords: [duplicate, selected] });
+
+    await expect(test.service.requestManualGeneration(request)).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "duplicate_keyword_id",
+      keywordId: "KW-DUPLICATE",
+      rowNumber: 3,
+      conflictingRows: [3, 9],
+    });
+    expect(selected.status).toBe("ready");
+    expect(duplicate.status).toBe("ready");
+    expect(test.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
+    expect(test.events).toHaveLength(0);
+  });
+
+  it("identifies a leftover article_id on a ready row", async () => {
+    const keyword = readyKeyword({
+      __rowNumber: 10,
+      keyword_id: "KW-ARTICLE-CONFLICT",
+      article_id: "SEO-EXISTING",
+    });
+    const test = setup({ keywords: [keyword] });
+
+    await expect(test.service.requestManualGeneration(request)).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "invalid_keyword_row",
+      keywordId: "KW-ARTICLE-CONFLICT",
+      rowNumber: 10,
+      locale: "sr",
+      articleId: "SEO-EXISTING",
+      invalidFields: ["article_id"],
+    });
+    expect(keyword.status).toBe("ready");
+    expect(test.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite an operator edit made between selection and claim", async () => {
+    const keyword = readyKeyword({ __rowNumber: 12, keyword_id: "KW-EDIT-RACE" });
+    const test = setup({
+      keywords: [keyword],
+      beforeKeywordClaim: (current) => {
+        current.status = "paused";
+      },
+    });
+
+    await expect(test.service.requestManualGeneration(request)).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "keyword_row_changed",
+      keywordId: "KW-EDIT-RACE",
+      rowNumber: 12,
+    });
+    expect(keyword).toMatchObject({ status: "paused", article_id: "" });
+    expect(test.events).toHaveLength(0);
+  });
+
   it("is idempotent for repeated and parallel delivery of the same Telegram update", async () => {
     const firstReady = readyKeyword();
     const secondReady = readyKeyword({
@@ -346,24 +488,92 @@ describe("manual generation requests", () => {
     expect(manualGenerationIsEnabled({ allowTelegramGeneration: false }, settings())).toBe(false);
   });
 
-  it("checks the selected row locale and internal-link gates before claiming it", async () => {
-    const ruKeyword = readyKeyword({ locale: "ru" });
-    const ruOff = setup({ keywords: [ruKeyword] });
-    await expect(ruOff.service.requestManualGeneration(request)).resolves.toEqual({
+  it("reports the selected row and allowed locales when its locale is disabled", async () => {
+    const keyword = readyKeyword({
+      __rowNumber: 8,
+      keyword_id: "KW-DE-OFF",
+      locale: "de",
+    });
+    const test = setup({ keywords: [keyword] });
+
+    await expect(test.service.requestManualGeneration(request)).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "locale_disabled",
+      keywordId: "KW-DE-OFF",
+      rowNumber: 8,
+      locale: "de",
+      allowedLocales: ["sr", "en"],
+    });
+    expect(keyword.status).toBe("ready");
+    expect(test.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
+  });
+
+  it("reports the selected RU row when Russian generation is disabled", async () => {
+    const ruKeyword = readyKeyword({
+      __rowNumber: 11,
+      keyword_id: "KW-RU-OFF",
+      locale: "ru",
+    });
+    const ruOff = setup({
+      keywords: [ruKeyword],
+      settings: settings({ enabled_locales: "sr,en,ru", ru_enabled: false }),
+    });
+    await expect(ruOff.service.requestManualGeneration(request)).resolves.toMatchObject({
       outcome: "blocked",
       reason: "ru_disabled",
+      keywordId: "KW-RU-OFF",
+      rowNumber: 11,
       locale: "ru",
     });
     expect(ruKeyword.status).toBe("ready");
+    expect(ruOff.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
+  });
 
-    const noLinkKeyword = readyKeyword();
+  it("reports the selected row and locale when its internal-link inventory is empty", async () => {
+    const noLinkKeyword = readyKeyword({
+      __rowNumber: 12,
+      keyword_id: "KW-NO-LINKS",
+      locale: "en",
+    });
     const linksOff = setup({ keywords: [noLinkKeyword], links: [] });
-    await expect(linksOff.service.requestManualGeneration(request)).resolves.toEqual({
+    await expect(linksOff.service.requestManualGeneration(request)).resolves.toMatchObject({
       outcome: "blocked",
       reason: "no_internal_links",
-      locale: "sr",
+      keywordId: "KW-NO-LINKS",
+      rowNumber: 12,
+      locale: "en",
     });
     expect(noLinkKeyword.status).toBe("ready");
+    expect(linksOff.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
+  });
+
+  it("returns the existing keyword row when a Telegram delivery conflicts with its signed request", async () => {
+    const claimedKeyword = readyKeyword({
+      __rowNumber: 13,
+      keyword_id: "KW-CONFLICT",
+    });
+    const nextKeyword = readyKeyword({
+      __rowNumber: 14,
+      keyword_id: "KW-NEXT-AFTER-CONFLICT",
+      primary_keyword: "sledeći ključ posle konflikta",
+    });
+    const test = setup({ keywords: [claimedKeyword, nextKeyword] });
+    const first = await test.service.requestManualGeneration(request);
+    expect(first).toMatchObject({ outcome: "queued", keywordId: "KW-CONFLICT" });
+    const articleId = first.outcome === "blocked" ? "" : first.articleId;
+    test.events[0]!.payload_json = JSON.stringify({ request_kind: "sheet_queue", signature: "tampered" });
+
+    await expect(test.service.requestManualGeneration(request)).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "request_conflict",
+      keywordId: "KW-CONFLICT",
+      rowNumber: 13,
+      locale: "sr",
+      articleId,
+    });
+    expect(claimedKeyword.status).toBe("assigned");
+    expect(nextKeyword.status).toBe("ready");
+    expect(test.patchKeywordAndAppendEvent).toHaveBeenCalledTimes(1);
   });
 
   it("caps the number of active manual requests", async () => {
@@ -387,6 +597,10 @@ describe("manual generation requests", () => {
     expect(await test.service.requestManualGeneration(request)).toMatchObject({
       outcome: "blocked",
       reason: "queue_full",
+      keywordId: "KW-READY-4",
+      rowNumber: 5,
+      queueLimit: 3,
+      activeCount: 3,
     });
     expect(test.keywordRows.filter((row) => row.status === "assigned")).toHaveLength(3);
     expect(test.keywordRows[3]?.status).toBe("ready");

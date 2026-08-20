@@ -36,7 +36,8 @@ describe("ReviewNotifier generation failures", () => {
         __rowNumber: 3,
         event_id: "evt-failed",
         article_id: "SEO-TG-1",
-        event_type: "generation_failed",
+        event_type: "generation_blocked",
+        payload_json: JSON.stringify({ keyword_id: "KW-TG-1", reason: "no_internal_links" }),
       },
     ];
     const keyword = {
@@ -66,7 +67,12 @@ describe("ReviewNotifier generation failures", () => {
     await notifier.runOnce();
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(String(sendMessage.mock.calls[0]?.[1])).toContain("Генерация остановлена");
+    const notification = String(sendMessage.mock.calls[0]?.[1]);
+    expect(notification).toContain("Генерация остановлена");
+    expect(notification).toContain("link_inventory");
+    expect(notification).toContain("очистите article_id");
+    expect(notification).toContain("status=ready");
+    expect(notification).toContain("/generate");
     expect(appendEvent).toHaveBeenCalledTimes(1);
     expect(events.some((event) => event.event_type === "generation_failure_notified")).toBe(true);
   });
