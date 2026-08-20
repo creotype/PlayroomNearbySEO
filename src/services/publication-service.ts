@@ -368,9 +368,14 @@ function asCell(value: unknown): string | number | boolean | null | undefined {
       : undefined;
 }
 
-async function verifyPublicPage(url: string): Promise<{ ok: boolean; status?: number; message: string }> {
+export type PublicPageVerification = { ok: boolean; status?: number; message: string };
+
+export async function verifyPublicPage(url: string): Promise<PublicPageVerification> {
   try {
-    const response = await fetch(url, { redirect: "follow" });
+    const response = await fetch(url, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(10_000),
+    });
     if (!response.ok) return { ok: false, status: response.status, message: `Public URL returned ${response.status}` };
     const html = await response.text();
     const canonical = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)/i)?.[1];

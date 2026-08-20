@@ -4,6 +4,7 @@ import { articleContentHash, stringCell, type SheetRecord } from "../domain/arti
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { SeoBot } from "../telegram/bot.js";
 import { articleCard, articleSheetUrl, escapeHtml, keywordSheetUrl } from "../telegram/messages.js";
+import { verifyPublicPage, type PublicPageVerification } from "./publication-service.js";
 
 export class ReviewNotifier {
   readonly #clearedReviewMarkup = new Set<number>();
@@ -13,6 +14,7 @@ export class ReviewNotifier {
     private readonly bot: SeoBot,
     private readonly config: AppConfig,
     private readonly logger: Logger,
+    private readonly publicPageVerifier: (url: string) => Promise<PublicPageVerification> = verifyPublicPage,
   ) {}
 
   async runOnce(): Promise<void> {
@@ -168,11 +170,18 @@ export class ReviewNotifier {
         if (!outcomeEventId) continue;
         const notificationEventId = `evt-publication-notified-${outcomeEventId}`;
         if (events.some((event) => stringCell(event.event_id) === notificationEventId)) continue;
+        const recordedPublicUrl = expectedEventType === "published"
+          ? trustedPublishedPublicUrl(article, outcome, frontendBaseUrl)
+          : undefined;
+        const liveVerification = recordedPublicUrl
+          ? await this.publicPageVerifier(recordedPublicUrl)
+          : undefined;
         const notification = publicationOutcomeMessage(
           article,
           outcome,
           this.config.spreadsheetId,
           frontendBaseUrl,
+          liveVerification,
         );
         const message = await this.bot.api.sendMessage(
           chatId,
@@ -212,14 +221,14 @@ function publicationOutcomeMessage(
   outcome: SheetRecord,
   spreadsheetId: string,
   frontendBaseUrl: string,
+  liveVerification?: PublicPageVerification,
 ): { text: string; publicUrl?: string | undefined } {
   const sheetUrl = articleSheetUrl(spreadsheetId, article.__rowNumber);
   if (stringCell(outcome.event_type) === "published") {
     const payload = publicationEventPayload(outcome);
     const articleUrl = publicUrlForFrontend(stringCell(article.public_url), frontendBaseUrl);
-    const eventUrl = publicUrlForFrontend(payload.publicUrl ?? "", frontendBaseUrl);
-    const publicUrl = articleUrl && eventUrl && articleUrl === eventUrl ? articleUrl : undefined;
-    if (payload.verificationOk && publicUrl) {
+    const publicUrl = trustedPublishedPublicUrl(article, outcome, frontendBaseUrl);
+    if (publicUrl && liveVerification?.ok) {
       return {
         text: [
           `✅ <b>${escapeHtml(stringCell(article.article_id))} опубликована в Ghost.</b>`,
@@ -228,7 +237,11 @@ function publicationOutcomeMessage(
         publicUrl,
       };
     }
-    const verificationMessage = payload.verificationMessage || stringCell(article.last_error);
+    const verificationMessage = publicUrl
+      ? liveVerification?.message || payload.verificationMessage || stringCell(article.last_error)
+      : payload.verificationOk
+        ? "Публичный адрес не записан, не совпадает с таблицей или ведёт на неожиданный сайт."
+        : payload.verificationMessage || stringCell(article.last_error);
     return {
       text: [
         `⚠️ <b>${escapeHtml(stringCell(article.article_id))} отправлена в Ghost, но публичная страница не прошла проверку.</b>`,
@@ -263,6 +276,18 @@ function publicationOutcomeMessage(
       `<a href="${sheetUrl}">Открыть статью в Google Sheets</a>`,
     ].join("\n"),
   };
+}
+
+function trustedPublishedPublicUrl(
+  article: SheetRecord,
+  outcome: SheetRecord,
+  frontendBaseUrl: string,
+): string | undefined {
+  const payload = publicationEventPayload(outcome);
+  if (!payload.verificationOk) return undefined;
+  const articleUrl = publicUrlForFrontend(stringCell(article.public_url), frontendBaseUrl);
+  const eventUrl = publicUrlForFrontend(payload.publicUrl ?? "", frontendBaseUrl);
+  return articleUrl && eventUrl && articleUrl === eventUrl ? articleUrl : undefined;
 }
 
 function publicationEventPayload(event: SheetRecord): {

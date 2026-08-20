@@ -79,6 +79,11 @@ function publicationNotifierHarness(options: {
   article?: SheetRecord;
   events?: SheetRecord[];
   sendMessage?: ReturnType<typeof vi.fn>;
+  publicPageVerifier?: (url: string) => Promise<{
+    ok: boolean;
+    status?: number;
+    message: string;
+  }>;
 }) {
   const article = options.article ?? publicationArticle();
   const events = [...(options.events ?? [telegramApprovalEvent(), publicationEvent("published")])];
@@ -104,8 +109,13 @@ function publicationNotifierHarness(options: {
   } as unknown as GoogleSheetsStore;
   const bot = { api: { sendMessage } } as unknown as SeoBot;
   const logger = { error: vi.fn(), warn: vi.fn() } as unknown as Logger;
+  const publicPageVerifier = options.publicPageVerifier ?? vi.fn(async (_url: string) => ({
+    ok: true,
+    status: 200,
+    message: "Live public page verified",
+  }));
   return {
-    notifier: new ReviewNotifier(store, bot, config, logger),
+    notifier: new ReviewNotifier(store, bot, config, logger, publicPageVerifier),
     article,
     events,
     appendEvent,
@@ -113,6 +123,7 @@ function publicationNotifierHarness(options: {
     listEvents,
     sendMessage,
     logger,
+    publicPageVerifier,
   };
 }
 
@@ -197,18 +208,51 @@ describe("ReviewNotifier publication outcomes", () => {
     const text = String(test.sendMessage.mock.calls[0]?.[1] ?? "");
     const messageOptions = test.sendMessage.mock.calls[0]?.[2] as Record<string, unknown> | undefined;
     expect(text).toContain("SEO-PUBLISH-1");
+    expect(text).toContain("✅");
     expect(text.toLowerCase()).toContain("опублик");
     expect(text).toContain(
       '<a href="https://beaver.run.place/sr/blog/kako-izabrati-igraonicu"',
     );
     expect(text).not.toContain("https://beaver.run.place/internal/ghost-post");
     expect(messageOptions?.parse_mode).toBe("HTML");
+    expect(test.publicPageVerifier).toHaveBeenCalledTimes(1);
+    expect(test.publicPageVerifier).toHaveBeenCalledWith(canonicalPublicUrl);
     expect(test.appendEvent).toHaveBeenCalledTimes(1);
     const marker = test.appendEvent.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
     expect(marker?.event_type).toBe("publication_notified");
     expect(marker?.article_id).toBe("SEO-PUBLISH-1");
     expect(String(marker?.provider_object_id)).toBe("321");
     expect(String(marker?.payload_json)).toContain("evt-published-success");
+  });
+
+  it("warns instead of sending a green success when the recorded success URL is now live-404", async () => {
+    const publicPageVerifier = vi.fn(async (url: string) => ({
+      ok: false,
+      status: 404,
+      message: `Live public URL returned 404: ${url}`,
+    }));
+    const published = publicationEvent("published", {
+      event_id: "evt-published-live-404",
+    });
+    const test = publicationNotifierHarness({
+      events: [telegramApprovalEvent(), published],
+      publicPageVerifier,
+    });
+
+    await test.notifier.runOnce();
+
+    expect(publicPageVerifier).toHaveBeenCalledTimes(1);
+    expect(publicPageVerifier).toHaveBeenCalledWith(canonicalPublicUrl);
+    expect(test.sendMessage).toHaveBeenCalledTimes(1);
+    const text = String(test.sendMessage.mock.calls[0]?.[1] ?? "");
+    expect(text).toContain("⚠️");
+    expect(text).toContain("404");
+    expect(text).not.toContain("✅");
+    expect(text.toLowerCase()).not.toContain("опубликована в ghost");
+    expect(text).toContain(
+      'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000001&range=A14:AO14"',
+    );
+    expect(test.appendEvent).toHaveBeenCalledTimes(1);
   });
 
   it("retries a failed Telegram send and creates no notification marker before delivery succeeds", async () => {
