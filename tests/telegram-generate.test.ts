@@ -77,7 +77,11 @@ function reviewArticle(overrides: Partial<Article> = {}): Article {
 
 function botHarness(
   manualResult: Record<string, unknown> = queuedGenerationResult,
-  options: { reviewArticles?: Article[]; failSendMessageCalls?: number[] } = {},
+  options: {
+    reviewArticles?: Article[];
+    approvalResult?: Record<string, unknown>;
+    failSendMessageCalls?: number[];
+  } = {},
 ) {
   const requestManualGeneration = vi.fn(async () => manualResult);
   const article = reviewArticle();
@@ -85,7 +89,7 @@ function botHarness(
     outcome: "regenerated" as const,
     article,
   }));
-  const approve = vi.fn(async () => ({
+  const approve = vi.fn(async () => options.approvalResult ?? ({
     outcome: "approved" as const,
     article: { ...article, status: "approved" },
   }));
@@ -449,7 +453,7 @@ function legacyCallbackUpdate(action: "approve" | "regenerate" | "status") {
 }
 
 describe("minimal Telegram review workflow", () => {
-  it("/help documents only generation, reply-with-comment regeneration, and reply approval", async () => {
+  it("/help documents only generation, current-article regeneration, and approval", async () => {
     const test = botHarness();
     await test.bot.handleUpdate(commandUpdate("help"));
 
@@ -457,8 +461,9 @@ describe("minimal Telegram review workflow", () => {
     expect(help).toContain("/generate");
     expect(help).toContain("/regenerate");
     expect(help).toContain("/approve");
-    expect(help.toLowerCase()).toMatch(/ответ.*карточ/);
     expect(help.toLowerCase()).toContain("коммент");
+    expect(help.toLowerCase()).toMatch(/одн.*стать/);
+    expect(help.toLowerCase()).toMatch(/approve.*без.*текст/);
     expect(help).not.toContain("/seo_");
     expect(help).not.toContain("/status");
     expect(help).not.toContain("/cancel");
@@ -591,17 +596,114 @@ describe("minimal Telegram review workflow", () => {
       providerObjectId: "message:-5484259760:78",
     });
     expect(test.findArticleByTelegramMessageId).toHaveBeenCalledWith(12);
+    expect(test.listArticles).not.toHaveBeenCalled();
     expect(test.findArticle).not.toHaveBeenCalled();
   });
 
+  it("bare /approve selects and approves the sole needs_review article", async () => {
+    const onlyActiveArticle = reviewArticle({
+      __rowNumber: 7,
+      article_id: "SEO-TG-APPROVE-READY",
+      status: "needs_review",
+      telegram_message_id: 75,
+    });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [onlyActiveArticle],
+      approvalResult: { outcome: "approved", article: { ...onlyActiveArticle, status: "approved" } },
+    });
+
+    await test.bot.handleUpdate(commandUpdate("approve"));
+
+    expect(test.listArticles).toHaveBeenCalledWith(["needs_review", "failed_qa"]);
+    expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
+    expect(test.approve).toHaveBeenCalledWith("SEO-TG-APPROVE-READY", {
+      id: 42,
+      displayName: "Owner",
+      providerObjectId: "message:-5484259760:78",
+    });
+  });
+
+  it("bare /approve does not call ApprovalService for a sole failed_qa article", async () => {
+    const failedArticle = reviewArticle({
+      __rowNumber: 7,
+      article_id: "SEO-TG-APPROVE-FAILED-QA",
+      status: "failed_qa",
+      telegram_message_id: "",
+    });
+    const test = botHarness(queuedGenerationResult, { reviewArticles: [failedArticle] });
+
+    await test.bot.handleUpdate(commandUpdate("approve"));
+
+    expect(test.listArticles).toHaveBeenCalledWith(["needs_review", "failed_qa"]);
+    expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
+    expect(test.approve).not.toHaveBeenCalled();
+    const text = String(sentMessagePayload(test)?.text ?? "");
+    expect(text).toContain("SEO-TG-APPROVE-FAILED-QA");
+    expect(text).toContain("/regenerate");
+  });
+
+  it("fails closed when bare /approve has no active review article", async () => {
+    const test = botHarness(queuedGenerationResult, { reviewArticles: [] });
+
+    await test.bot.handleUpdate(commandUpdate("approve"));
+
+    expect(test.listArticles).toHaveBeenCalledWith(["needs_review", "failed_qa"]);
+    expect(test.approve).not.toHaveBeenCalled();
+    expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
+    const text = String(sentMessagePayload(test)?.text ?? "");
+    expect(text.toLowerCase()).toMatch(/нет|не наш[её]л|активн/);
+    expect(text).toContain("/generate");
+  });
+
+  it("fails closed and points to every conflicting row when bare /approve sees multiple active reviews", async () => {
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [
+        reviewArticle({ __rowNumber: 4, article_id: "SEO-TG-APPROVE-1", status: "needs_review" }),
+        reviewArticle({ __rowNumber: 9, article_id: "SEO-TG-APPROVE-2", status: "failed_qa" }),
+      ],
+    });
+
+    await test.bot.handleUpdate(commandUpdate("approve"));
+
+    expect(test.listArticles).toHaveBeenCalledWith(["needs_review", "failed_qa"]);
+    expect(test.approve).not.toHaveBeenCalled();
+    expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
+    const text = String(sentMessagePayload(test)?.text ?? "");
+    expect(text.toLowerCase()).toMatch(/несколько|однозначно|поврежд/);
+    expect(text).toContain("SEO-TG-APPROVE-1");
+    expect(text).toContain("SEO-TG-APPROVE-2");
+    expect(text).toContain("gid=910000001&range=A4:AO4");
+    expect(text).toContain("gid=910000001&range=A9:AO9");
+    expect(text.toLowerCase()).toMatch(/ответ.*команд.*карточ/);
+  });
+
+  it("reports an idempotent approval without creating a second approval", async () => {
+    const activeArticle = reviewArticle({ article_id: "SEO-TG-IDEMPOTENT" });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [activeArticle],
+      approvalResult: {
+        outcome: "already_approved",
+        article: { ...activeArticle, status: "approved" },
+      },
+    });
+
+    await test.bot.handleUpdate(commandUpdate("approve"));
+
+    expect(test.approve).toHaveBeenCalledTimes(1);
+    expect(test.approve).toHaveBeenCalledWith("SEO-TG-IDEMPOTENT", expect.any(Object));
+    expect(String(sentMessagePayload(test)?.text ?? "").toLowerCase()).toContain("уже согласована");
+  });
+
   it.each([
-    ["without a reply", commandUpdate("approve")],
+    ["without a reply", commandUpdate("approve", "SEO-TG-1")],
     ["with arguments", commandUpdate("approve", "SEO-TG-1", { replyMessageId: 12 })],
-  ])("rejects /approve %s", async (_case, update) => {
+  ])("rejects /approve arguments %s", async (_case, update) => {
     const test = botHarness();
     await test.bot.handleUpdate(update);
 
     expect(test.approve).not.toHaveBeenCalled();
+    expect(test.listArticles).not.toHaveBeenCalled();
+    expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
     expect(String(sentMessagePayload(test)?.text ?? "")).toContain("/approve");
   });
 

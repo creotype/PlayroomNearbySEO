@@ -55,9 +55,9 @@ export function createTelegramBot(options: {
         "",
         "/generate — взять следующую ready-строку из таблицы",
         "/regenerate замечания — переписать текущую статью на ревью",
-        "/approve — ответом на карточку согласовать и отправить на публикацию",
+        "/approve — согласовать текущую статью и отправить на публикацию",
         "",
-        "Бот ведёт только одну статью за раз. У /regenerate комментарий обязателен. /approve отправляется reply на карточку без текста после команды.",
+        "Бот ведёт только одну статью за раз. У /regenerate комментарий обязателен. /approve отправляется без дополнительного текста.",
       ].join("\n"),
       { parse_mode: "HTML" },
     );
@@ -90,17 +90,33 @@ export function createTelegramBot(options: {
   bot.command("approve", async (ctx) => {
     if (!(await authorizeReviewChat(ctx, config, store))) return;
     if (commandArgs(ctx)) {
-      await ctx.reply("Отправьте только /approve ответом на карточку статьи — без ARTICLE-ID и другого текста.");
+      await ctx.reply("Отправьте только /approve — без ARTICLE-ID и другого текста.");
       return;
     }
     const replyMessageId = ctx.message?.reply_to_message?.message_id;
-    if (!replyMessageId) {
-      await ctx.reply("Ответьте на карточку статьи командой /approve.");
+    const activeReviews = replyMessageId
+      ? undefined
+      : await store.listArticles(["needs_review", "failed_qa"]);
+    const article = replyMessageId
+      ? await store.findArticleByTelegramMessageId(replyMessageId)
+      : soleActiveReviewArticle(activeReviews ?? []);
+    if (!article) {
+      if (replyMessageId) {
+        await ctx.reply("❓ Это не карточка статьи. Ответьте /approve именно на сообщение с SEO draft.");
+        return;
+      }
+      if ((activeReviews?.length ?? 0) > 1) {
+        await replyAmbiguousActiveArticles(ctx, activeReviews!, config.spreadsheetId);
+        return;
+      }
+      await ctx.reply("❓ Нет статьи, ожидающей согласования. Сначала дождитесь карточки после /generate.");
       return;
     }
-    const article = await store.findArticleByTelegramMessageId(replyMessageId);
-    if (!article) {
-      await ctx.reply("❓ Это не карточка статьи. Ответьте /approve именно на сообщение с SEO draft.");
+    if (article.status === "failed_qa") {
+      await ctx.reply(
+        `⛔ <b>${escapeHtml(article.article_id)}</b> не прошла QA. Сначала отправьте <code>/regenerate ваш комментарий</code>.`,
+        { parse_mode: "HTML" },
+      );
       return;
     }
     const result = await approvals.approve(article.article_id, actorFromContext(ctx));
@@ -127,19 +143,7 @@ export function createTelegramBot(options: {
         return;
       }
       if ((activeReviews?.length ?? 0) > 1) {
-        const rows = activeReviews!
-          .map((candidate) =>
-            `<a href="${articleSheetUrl(config.spreadsheetId, candidate.__rowNumber)}">${escapeHtml(candidate.article_id)} · строка ${candidate.__rowNumber}</a>`,
-          )
-          .join("\n");
-        await ctx.reply(
-          [
-            "⛔ <b>В таблице несколько активных статей.</b> Я не буду угадывать, какую переписывать.",
-            rows,
-            "Завершите лишние строки или ответьте командой на карточку нужной статьи.",
-          ].join("\n"),
-          { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
-        );
+        await replyAmbiguousActiveArticles(ctx, activeReviews!, config.spreadsheetId);
         return;
       }
       await ctx.reply("❓ Не нашёл активную статью на ревью. Сначала дождитесь карточки после /generate.");
@@ -184,6 +188,26 @@ export function createTelegramBot(options: {
 
 function soleActiveReviewArticle(articles: Article[]): Article | undefined {
   return articles.length === 1 ? articles[0] : undefined;
+}
+
+async function replyAmbiguousActiveArticles(
+  ctx: Context,
+  articles: Article[],
+  spreadsheetId: string,
+): Promise<void> {
+  const rows = articles
+    .map((candidate) =>
+      `<a href="${articleSheetUrl(spreadsheetId, candidate.__rowNumber)}">${escapeHtml(candidate.article_id)} · строка ${candidate.__rowNumber}</a>`,
+    )
+    .join("\n");
+  await ctx.reply(
+    [
+      "⛔ <b>В таблице несколько активных статей.</b> Я не буду угадывать, какую выбрать.",
+      rows,
+      "Завершите лишние строки или ответьте командой на карточку нужной статьи.",
+    ].join("\n"),
+    { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+  );
 }
 
 export const telegramCommandMenu = [

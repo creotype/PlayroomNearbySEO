@@ -20,7 +20,7 @@ pretend those production attestations are complete.
 ## Implemented
 
 - Dynamic Google Sheets header mapping and schema checks; no hard-coded column numbers.
-- A minimal Telegram review flow with comment-first rewriting and reply-bound approval.
+- A minimal Telegram review flow with comment-first rewriting and approval of the sole active article.
 - Equal approval rights for any human member of the configured review group.
 - Approval bound to a SHA-256 hash of all publishable fields.
 - Manual edits after approval stop publication with `status=conflict`.
@@ -37,7 +37,7 @@ pretend those production attestations are complete.
 - `/approve`
 - `/help`
 
-Only one article can be in manual generation or review at a time. While a previous article is being generated or still awaits review, another `/generate` is rejected with a pointer to the existing work. `/regenerate editor feedback` immediately rewrites that sole active review article; sending it as a direct reply selects the visible card explicitly. Editor feedback is mandatory. `/approve` remains reply-only and accepts no arguments. There is no ARTICLE-ID fallback or inline action keyboard. Regeneration replaces the same review row only after OpenAI succeeds, keeps the old draft on failure, increments `revision_count`, and never reopens an approved or published article. Workflow commands from private chats or groups other than the configured review group are rejected. `/help` explains the three available actions.
+Only one article can be in manual generation or review at a time. While a previous article is being generated or still awaits review, another `/generate` is rejected with a pointer to the existing work. `/regenerate editor feedback` immediately rewrites that sole active review article, and bare `/approve` approves it; sending either command as a direct reply selects the visible card explicitly. Editor feedback is mandatory for regeneration, while `/approve` accepts no arguments. There is no ARTICLE-ID fallback or inline action keyboard. Regeneration replaces the same review row only after OpenAI succeeds, keeps the old draft on failure, increments `revision_count`, and never reopens an approved or published article. Workflow commands from private chats or groups other than the configured review group are rejected. `/help` explains the three available actions.
 
 `/generate` accepts no arguments. It reserves the physically topmost row on `keywords` whose status is `ready`; row order is the manual priority, so the numeric `priority` value is ignored for this dequeue. Keyword, locale, and content settings come from that existing row. A malformed top row is never skipped silently: Telegram names the row and invalid fields and links directly to the relevant Sheet range. After OpenAI returns an article, the keyword becomes `used` even if article QA fails; a technical generation failure instead moves it to `paused` without an automatic paid retry. The generated article still requires Telegram review and never bypasses QA or approval. Manual generation requires both `ALLOW_TELEGRAM_GENERATION=true` in the server environment and `telegram_generation_enabled=true` in the Sheet. Scheduled generation remains independently controlled by `generation_enabled`, but the same single-active-article gate prevents it from producing a second review card. Any arguments passed to `/generate` are rejected.
 

@@ -41,7 +41,7 @@ export function articleCard(article: Article, spreadsheetId: string): string {
     `<a href="${sheetUrl}">Открыть строку в Google Sheets</a>`,
     "",
     canApprove
-      ? "/regenerate комментарий — переписать эту статью\n/approve — согласовать ответом на эту карточку"
+      ? "/regenerate комментарий — переписать эту статью\n/approve — согласовать эту статью"
       : "/regenerate комментарий — переписать эту статью. /approve останется заблокирован до успешной QA.",
   ]
     .filter(Boolean)

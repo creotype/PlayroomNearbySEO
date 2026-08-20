@@ -24,7 +24,7 @@
 - [ ] Run service startup probes with `DRY_RUN=true`.
 - [ ] Put two disposable keywords in `ready`, confirm `/generate` rejects arguments and dequeues the physically topmost row regardless of numeric `priority`.
 - [ ] Confirm generated keywords become `used` on both QA pass and QA failure, while a technical generation failure becomes `paused` without automatic retry.
-- [ ] Verify the single-active-article gate, button-free Telegram card, no-reply `/regenerate`, reply-only `/approve`, manual Sheet edit, repeated QA, and approval idempotency.
+- [ ] Verify the single-active-article gate, button-free Telegram card, no-reply `/regenerate` and `/approve`, manual Sheet edit, repeated QA, and approval idempotency.
 - [ ] Allow Ghost writes while keeping public publishing disabled; create one draft and verify the ID/update lock.
 - [ ] Perform one explicitly approved end-to-end staging publication and canonical check.
 

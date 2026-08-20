@@ -79,7 +79,7 @@ describe("ReviewNotifier generation failures", () => {
 });
 
 describe("ReviewNotifier review cards", () => {
-  it("sends a button-free card that teaches the two reply commands", async () => {
+  it("sends a button-free card that teaches the two current-article commands", async () => {
     const article = {
       __rowNumber: 2,
       article_id: "SEO-TG-1",
@@ -119,7 +119,7 @@ describe("ReviewNotifier review cards", () => {
     const options = sendMessage.mock.calls[0]?.[2] as Record<string, unknown> | undefined;
     expect(text).toContain("/regenerate");
     expect(text).toContain("/approve");
-    expect(text.toLowerCase()).toMatch(/ответ.*карточ/);
+    expect(text).toContain("/approve — согласовать эту статью");
     expect(text.toLowerCase()).toContain("коммент");
     expect(options).not.toHaveProperty("reply_markup");
     expect(JSON.stringify(sendMessage.mock.calls[0])).not.toContain("callback_data");
@@ -129,7 +129,7 @@ describe("ReviewNotifier review cards", () => {
     );
   });
 
-  it("replaces an existing legacy-button card with reply instructions exactly once", async () => {
+  it("replaces an existing legacy-button card with button-free instructions exactly once", async () => {
     const article = {
       __rowNumber: 2,
       article_id: "SEO-TG-1",
@@ -173,7 +173,7 @@ describe("ReviewNotifier review cards", () => {
       | undefined;
     expect(text).toContain("/regenerate");
     expect(text).toContain("/approve");
-    expect(text.toLowerCase()).toMatch(/ответ.*карточ/);
+    expect(text).toContain("/approve — согласовать эту статью");
     expect(options?.reply_markup?.inline_keyboard ?? []).toHaveLength(0);
     expect(JSON.stringify(editMessageText.mock.calls[0])).not.toContain("callback_data");
   });
