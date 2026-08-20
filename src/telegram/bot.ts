@@ -1,7 +1,7 @@
 import { Bot, type Context } from "grammy";
 import type { Logger } from "pino";
 import type { AppConfig } from "../config.js";
-import { booleanCell, stringCell } from "../domain/article.js";
+import { booleanCell, stringCell, type Article } from "../domain/article.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { ApprovalResult, ApprovalService, TelegramActor } from "../services/approval-service.js";
 import type {
@@ -10,7 +10,13 @@ import type {
   ManualGenerationResult,
   RegenerationResult,
 } from "../services/generation-service.js";
-import { escapeHtml, keywordSheetUrl, linkInventorySheetUrl, settingsSheetUrl } from "./messages.js";
+import {
+  articleSheetUrl,
+  escapeHtml,
+  keywordSheetUrl,
+  linkInventorySheetUrl,
+  settingsSheetUrl,
+} from "./messages.js";
 import { UpdateDrain } from "./update-drain.js";
 
 export type SeoBot = Bot<Context>;
@@ -48,10 +54,10 @@ export function createTelegramBot(options: {
         "Я беру ключевики из Google Sheets, пишу SEO-статьи и после согласования публикую их в Ghost.",
         "",
         "/generate — взять следующую ready-строку из таблицы",
-        "/regenerate замечания — ответом на карточку переписать статью",
+        "/regenerate замечания — переписать текущую статью на ревью",
         "/approve — ответом на карточку согласовать и отправить на публикацию",
         "",
-        "У /regenerate комментарий обязателен. /approve отправляется без текста после команды.",
+        "Бот ведёт только одну статью за раз. У /regenerate комментарий обязателен. /approve отправляется reply на карточку без текста после команды.",
       ].join("\n"),
       { parse_mode: "HTML" },
     );
@@ -109,29 +115,62 @@ export function createTelegramBot(options: {
       return;
     }
     const replyMessageId = ctx.message?.reply_to_message?.message_id;
-    if (!replyMessageId) {
-      await ctx.reply("Ответьте на карточку статьи командой /regenerate и напишите замечания после команды.");
-      return;
-    }
-    const article = await store.findArticleByTelegramMessageId(replyMessageId);
+    const activeReviews = replyMessageId
+      ? undefined
+      : await store.listArticles(["needs_review", "failed_qa"]);
+    const article = replyMessageId
+      ? await store.findArticleByTelegramMessageId(replyMessageId)
+      : soleActiveReviewArticle(activeReviews ?? []);
     if (!article) {
-      await ctx.reply("❓ Это не карточка статьи. Ответьте /regenerate с замечаниями именно на сообщение с SEO draft.");
+      if (replyMessageId) {
+        await ctx.reply("❓ Это не карточка статьи. Ответьте /regenerate с замечаниями именно на сообщение с SEO draft.");
+        return;
+      }
+      if ((activeReviews?.length ?? 0) > 1) {
+        const rows = activeReviews!
+          .map((candidate) =>
+            `<a href="${articleSheetUrl(config.spreadsheetId, candidate.__rowNumber)}">${escapeHtml(candidate.article_id)} · строка ${candidate.__rowNumber}</a>`,
+          )
+          .join("\n");
+        await ctx.reply(
+          [
+            "⛔ <b>В таблице несколько активных статей.</b> Я не буду угадывать, какую переписывать.",
+            rows,
+            "Завершите лишние строки или ответьте командой на карточку нужной статьи.",
+          ].join("\n"),
+          { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+        );
+        return;
+      }
+      await ctx.reply("❓ Не нашёл активную статью на ревью. Сначала дождитесь карточки после /generate.");
       return;
     }
     try {
-      const result = await generation.regenerateArticle({
+      await ctx.reply(`🧠 Принял комментарий для <b>${escapeHtml(article.article_id)}</b>. Переписываю статью…`, {
+        parse_mode: "HTML",
+      });
+    } catch (error) {
+      logger.warn(
+        { articleId: article.article_id, err: error instanceof Error ? error.message : String(error) },
+        "Could not send regeneration acknowledgement",
+      );
+    }
+    let result: RegenerationResult;
+    try {
+      result = await generation.regenerateArticle({
         articleId: article.article_id,
         feedback,
         ...generationActorFromContext(ctx),
       });
-      await replyRegenerationResult(ctx, result);
     } catch (error) {
       logger.error(
         { articleId: article.article_id, err: error instanceof Error ? error.message : String(error) },
         "Article regeneration failed",
       );
       await ctx.reply("⚠️ Исправить статью не удалось. Старый черновик сохранён; попробуйте ещё раз позже.");
+      return;
     }
+    await replyRegenerationResult(ctx, result);
   });
 
   bot.catch((error) => {
@@ -141,6 +180,10 @@ export function createTelegramBot(options: {
     );
   });
   return bot;
+}
+
+function soleActiveReviewArticle(articles: Article[]): Article | undefined {
+  return articles.length === 1 ? articles[0] : undefined;
 }
 
 export const telegramCommandMenu = [
@@ -348,6 +391,7 @@ function manualGenerationBlockedMessage(
 ): string {
   const queueUrl = keywordSheetUrl(config.spreadsheetId);
   const rowUrl = keywordSheetUrl(config.spreadsheetId, result.rowNumber);
+  const articleUrl = articleSheetUrl(config.spreadsheetId, result.rowNumber);
   const settingsUrl = settingsSheetUrl(config.spreadsheetId);
   const linkInventoryUrl = linkInventorySheetUrl(config.spreadsheetId);
   const rowTitle = result.rowNumber ? `Строка ${result.rowNumber}` : "Верхняя ready-строка";
@@ -374,6 +418,40 @@ function manualGenerationBlockedMessage(
       "Заполните <code>keyword_id</code>, <code>locale</code> и <code>primary_keyword</code>, оставьте <code>article_id</code> пустым и поставьте <code>ready</code>.",
       "",
       `<a href="${queueUrl}">Открыть очередь keywords</a>`,
+    ].join("\n");
+  }
+  if (result.reason === "active_review_exists") {
+    return [
+      "⏸ <b>Сначала закончите предыдущую статью.</b>",
+      `<code>${escapeHtml(result.articleId ?? "без ID")}</code> всё ещё ждёт решения. Новая статья не создана.`,
+      "Чтобы исправить её, отправьте <code>/regenerate ваш комментарий</code>. Чтобы согласовать — ответьте <code>/approve</code> на карточку выше.",
+      "После согласования <code>/generate</code> возьмёт следующий ключевик.",
+      "",
+      `<a href="${articleUrl}">Открыть предыдущую статью в Google Sheets</a>`,
+    ].join("\n");
+  }
+  if (result.reason === "multiple_active_reviews") {
+    const rows = (result.conflictingRows ?? []).join(", ") || "не определены";
+    const rowLinks = (result.conflictingRows ?? [])
+      .map((row) => `<a href="${articleSheetUrl(config.spreadsheetId, row)}">Строка ${row}</a>`)
+      .join(" · ");
+    return [
+      "⛔ <b>В таблице несколько активных статей.</b>",
+      `Строки <code>articles</code>: <code>${escapeHtml(rows)}</code>. Бот не создал ещё одну статью.`,
+      "Оставьте только одну статью в статусе <code>needs_review</code> или <code>failed_qa</code>; остальные сначала завершите или передайте администратору.",
+      "",
+      rowLinks || `<a href="${articleSheetUrl(config.spreadsheetId)}">Открыть articles в Google Sheets</a>`,
+    ].join("\n");
+  }
+  if (result.reason === "generation_in_progress") {
+    return [
+      "⏳ <b>Предыдущая статья ещё генерируется.</b>",
+      result.articleId
+        ? `Текущий article ID: <code>${escapeHtml(result.articleId)}</code>.`
+        : "Бот уже обрабатывает предыдущий ключевик.",
+      "Дождитесь review-карточки — повторять <code>/generate</code> не нужно.",
+      "",
+      openRow,
     ].join("\n");
   }
   if (result.reason === "invalid_keyword_row") {
@@ -454,15 +532,7 @@ function manualGenerationBlockedMessage(
       `<a href="${linkInventoryUrl}">Открыть link_inventory</a>`,
     ].join("\n");
   }
-  return [
-    `⏳ <b>Очередь заполнена: ${result.activeCount ?? "?"}/${result.queueLimit ?? "?"} заявок уже в работе.</b>`,
-    result.keywordId
-      ? `Следующим ожидает <code>${escapeHtml(result.keywordId)}</code>${result.rowNumber ? ` · Строка ${result.rowNumber}` : ""}.`
-      : "Следующий ready-ключ ждёт свободного места.",
-    "Дождитесь ближайшей карточки. Если <code>assigned</code> или <code>generating</code> висит слишком долго, передайте строку администратору — не возвращайте её в <code>ready</code> вслепую.",
-    "",
-    result.rowNumber ? openRow : `<a href="${queueUrl}">Открыть очередь keywords</a>`,
-  ].join("\n");
+  return "⛔ Не удалось определить причину блокировки. Повторите команду позже или передайте сообщение техническому администратору.";
 }
 
 function invalidKeywordFieldMessage(

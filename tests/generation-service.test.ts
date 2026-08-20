@@ -70,6 +70,10 @@ function setup(options: {
     keywordRows
       .filter((row) => listOptions.includeIncomplete || Boolean(String(row.keyword_id ?? "").trim()))
       .filter((row) => !statuses || statuses.includes(String(row.status))));
+  const listArticles = vi.fn(async (statuses?: readonly string[]) =>
+    articleRows
+      .filter((row) => Boolean(String(row.article_id ?? "").trim()))
+      .filter((row) => !statuses || statuses.includes(String(row.status))));
   const patchKeywordAndAppendEvent = vi.fn(async (
     keywordId: string,
     patch: Record<string, CellValue>,
@@ -149,6 +153,7 @@ function setup(options: {
       Object.assign(keyword, patch);
     },
     patchKeywordAndAppendEvent,
+    listArticles,
     findArticle: async (articleId: string) =>
       articleRows.find((row) => String(row.article_id).toLowerCase() === articleId.toLowerCase()),
     appendArticle: async (values: Record<string, CellValue>) => {
@@ -188,6 +193,7 @@ function setup(options: {
     events,
     generate,
     listKeywords,
+    listArticles,
     patchKeywordAndAppendEvent,
   };
 }
@@ -218,7 +224,87 @@ function readyKeyword(overrides: Record<string, CellValue> = {}): SheetRecord {
   } as SheetRecord;
 }
 
+function activeReview(overrides: Record<string, CellValue> = {}): SheetRecord {
+  return {
+    __rowNumber: 14,
+    article_id: "SEO-ACTIVE-REVIEW",
+    keyword_id: "KW-ACTIVE-REVIEW",
+    locale: "sr",
+    status: "needs_review",
+    title: "Aktivna revizija",
+    slug: "aktivna-revizija",
+    body_markdown: "draft",
+    telegram_message_id: 75,
+    ...overrides,
+  };
+}
+
 describe("manual generation requests", () => {
+  it.each(["needs_review", "failed_qa"])(
+    "blocks before claiming when one %s article is awaiting a decision",
+    async (status) => {
+      const keyword = readyKeyword();
+      const test = setup({
+        keywords: [keyword],
+        articles: [activeReview({ status })],
+      });
+
+      await expect(test.service.requestManualGeneration(request)).resolves.toEqual({
+        outcome: "blocked",
+        reason: "active_review_exists",
+        articleId: "SEO-ACTIVE-REVIEW",
+        rowNumber: 14,
+        telegramMessageId: 75,
+        activeCount: 1,
+      });
+      expect(test.listKeywords).toHaveBeenCalledBefore(test.listArticles);
+      expect(test.listArticles).toHaveBeenCalledWith(["needs_review", "failed_qa"]);
+      expect(keyword).toMatchObject({ status: "ready", article_id: "" });
+      expect(test.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
+      expect(test.events).toHaveLength(0);
+      expect(test.generate).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fails closed and reports every Sheet row when multiple review articles already exist", async () => {
+    const keyword = readyKeyword();
+    const test = setup({
+      keywords: [keyword],
+      articles: [
+        activeReview({ __rowNumber: 19, article_id: "SEO-REVIEW-LATER", telegram_message_id: 91 }),
+        activeReview({ __rowNumber: 4, article_id: "SEO-REVIEW-FIRST", telegram_message_id: 52 }),
+      ],
+    });
+
+    await expect(test.service.requestManualGeneration(request)).resolves.toEqual({
+      outcome: "blocked",
+      reason: "multiple_active_reviews",
+      articleId: "SEO-REVIEW-FIRST",
+      rowNumber: 4,
+      telegramMessageId: 52,
+      activeCount: 2,
+      conflictingRows: [4, 19],
+    });
+    expect(keyword.status).toBe("ready");
+    expect(test.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
+    expect(test.events).toHaveLength(0);
+    expect(test.generate).not.toHaveBeenCalled();
+  });
+
+  it("allows the next keyword after the previous article has been approved", async () => {
+    const keyword = readyKeyword();
+    const test = setup({
+      keywords: [keyword],
+      articles: [activeReview({ status: "approved" })],
+    });
+
+    await expect(test.service.requestManualGeneration(request)).resolves.toMatchObject({
+      outcome: "queued",
+      keywordId: "KW-READY-1",
+    });
+    expect(keyword.status).toBe("assigned");
+  });
+
   it("claims the physically topmost ready row, preserving its keyword identity and source", async () => {
     const physicallyFirst = readyKeyword({
       __rowNumber: 3,
@@ -438,7 +524,7 @@ describe("manual generation requests", () => {
     expect(test.generate).toHaveBeenCalledTimes(1);
   });
 
-  it("serializes different Telegram commands onto successive physical rows", async () => {
+  it("allows only one in-flight generation across concurrent Telegram commands", async () => {
     const firstReady = readyKeyword();
     const secondReady = readyKeyword({
       __rowNumber: 3,
@@ -456,10 +542,17 @@ describe("manual generation requests", () => {
     ]);
 
     expect(first).toMatchObject({ outcome: "queued", keywordId: "KW-READY-1" });
-    expect(second).toMatchObject({ outcome: "queued", keywordId: "KW-READY-2" });
+    expect(second).toMatchObject({
+      outcome: "blocked",
+      reason: "generation_in_progress",
+      keywordId: "KW-READY-1",
+      rowNumber: 2,
+      articleId: first.outcome === "blocked" ? "" : first.articleId,
+      activeCount: 1,
+    });
     expect(firstReady.status).toBe("assigned");
-    expect(secondReady.status).toBe("assigned");
-    expect(test.events.filter((event) => event.event_type === "generation_requested")).toHaveLength(2);
+    expect(secondReady.status).toBe("ready");
+    expect(test.events.filter((event) => event.event_type === "generation_requested")).toHaveLength(1);
   });
 
   it("reports an empty queue without creating a keyword or event", async () => {
@@ -467,7 +560,6 @@ describe("manual generation requests", () => {
       keywords: [
         readyKeyword({ status: "paused" }),
         readyKeyword({ __rowNumber: 3, keyword_id: "KW-USED", status: "used" }),
-        readyKeyword({ __rowNumber: 4, keyword_id: "KW-ASSIGNED", status: "assigned" }),
       ],
     });
     await expect(test.service.requestManualGeneration(request)).resolves.toEqual({
@@ -576,34 +668,138 @@ describe("manual generation requests", () => {
     expect(test.patchKeywordAndAppendEvent).toHaveBeenCalledTimes(1);
   });
 
-  it("caps the number of active manual requests", async () => {
-    const test = setup({
-      keywords: Array.from({ length: 4 }, (_, index) =>
-        readyKeyword({
-          __rowNumber: index + 2,
-          keyword_id: `KW-READY-${index + 1}`,
-          primary_keyword: `queue keyword ${index + 1}`,
-        }),
-      ),
+  it("blocks a manual request behind any existing generation, including a scheduled one", async () => {
+    const scheduledInFlight = readyKeyword({
+      __rowNumber: 2,
+      keyword_id: "KW-SCHEDULED-IN-FLIGHT",
+      article_id: "SEO-SCHEDULED-IN-FLIGHT",
+      status: "generating",
     });
-    for (let index = 0; index < 3; index += 1) {
-      expect(
-        await test.service.requestManualGeneration({
-          ...request,
-          providerObjectId: `message:-5484259760:${index}`,
-        }),
-      ).toMatchObject({ outcome: "queued" });
-    }
+    const waiting = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-WAITING",
+      primary_keyword: "waiting keyword",
+    });
+    const test = setup({
+      keywords: [waiting, scheduledInFlight],
+    });
+
     expect(await test.service.requestManualGeneration(request)).toMatchObject({
       outcome: "blocked",
-      reason: "queue_full",
-      keywordId: "KW-READY-4",
-      rowNumber: 5,
-      queueLimit: 3,
-      activeCount: 3,
+      reason: "generation_in_progress",
+      keywordId: "KW-SCHEDULED-IN-FLIGHT",
+      rowNumber: 2,
+      articleId: "SEO-SCHEDULED-IN-FLIGHT",
+      activeCount: 1,
     });
-    expect(test.keywordRows.filter((row) => row.status === "assigned")).toHaveLength(3);
-    expect(test.keywordRows[3]?.status).toBe("ready");
+    expect(scheduledInFlight.status).toBe("generating");
+    expect(waiting.status).toBe("ready");
+    expect(test.listArticles).toHaveBeenCalledWith(["needs_review", "failed_qa"]);
+    expect(test.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
+    expect(test.events).toHaveLength(0);
+  });
+
+  it("points to the active review before a legacy in-flight request waiting behind it", async () => {
+    const inFlight = readyKeyword({
+      keyword_id: "KW-WAITING-BEHIND-REVIEW",
+      article_id: "SEO-WAITING-BEHIND-REVIEW",
+      status: "assigned",
+    });
+    const review = activeReview({ article_id: "SEO-REVIEW-FIRST" });
+    const test = setup({ keywords: [inFlight], articles: [review] });
+
+    await expect(test.service.requestManualGeneration(request)).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "active_review_exists",
+      articleId: "SEO-REVIEW-FIRST",
+      rowNumber: review.__rowNumber,
+    });
+    expect(inFlight.status).toBe("assigned");
+    expect(test.patchKeywordAndAppendEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe("single active article worker invariant", () => {
+  it("does not let the scheduled worker generate a ready row while an article awaits review", async () => {
+    const keyword = readyKeyword();
+    const review = activeReview();
+    const test = setup({
+      settings: settings({ generation_enabled: true }),
+      keywords: [keyword],
+      articles: [review],
+    });
+
+    await test.service.runOnce();
+
+    expect(keyword).toMatchObject({ status: "ready", article_id: "" });
+    expect(test.articleRows).toEqual([review]);
+    expect(test.generate).not.toHaveBeenCalled();
+    expect(test.events).toHaveLength(0);
+  });
+
+  it("recovers the keyword transition for the same existing review without generating again", async () => {
+    const review = activeReview({ article_id: "SEO-RECOVERY" });
+    const olderInFlight = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-OTHER-IN-FLIGHT",
+      article_id: "SEO-OTHER-IN-FLIGHT",
+      status: "assigned",
+    });
+    const keyword = readyKeyword({
+      __rowNumber: 8,
+      keyword_id: "KW-RECOVERY",
+      article_id: "SEO-RECOVERY",
+      status: "assigned",
+    });
+    const test = setup({
+      settings: settings({ generation_enabled: true }),
+      keywords: [keyword, olderInFlight],
+      articles: [review],
+    });
+
+    await test.service.runOnce();
+
+    expect(keyword.status).toBe("used");
+    expect(olderInFlight.status).toBe("assigned");
+    expect(test.articleRows).toEqual([review]);
+    expect(test.generate).not.toHaveBeenCalled();
+    expect(test.events).toContainEqual(
+      expect.objectContaining({
+        article_id: "SEO-RECOVERY",
+        event_type: "generated",
+        to_status: "needs_review",
+      }),
+    );
+  });
+
+  it("drains only the top legacy in-flight row before its new review blocks the rest", async () => {
+    const topInFlight = readyKeyword({
+      __rowNumber: 4,
+      keyword_id: "KW-LEGACY-TOP",
+      article_id: "SEO-LEGACY-TOP",
+      status: "assigned",
+    });
+    const laterInFlight = readyKeyword({
+      __rowNumber: 11,
+      keyword_id: "KW-LEGACY-LATER",
+      article_id: "SEO-LEGACY-LATER",
+      status: "generating",
+    });
+    const test = setup({
+      settings: settings({ generation_enabled: true }),
+      keywords: [laterInFlight, topInFlight],
+    });
+
+    await test.service.runOnce();
+
+    expect(topInFlight.status).toBe("used");
+    expect(laterInFlight.status).toBe("generating");
+    expect(test.generate).toHaveBeenCalledTimes(1);
+    expect(test.articleRows).toHaveLength(1);
+    expect(test.articleRows[0]).toMatchObject({
+      article_id: "SEO-LEGACY-TOP",
+      status: "needs_review",
+    });
   });
 });
 
@@ -807,6 +1003,14 @@ describe("article regeneration", () => {
         provider_object_id: `telegram:${regenerationRequest.providerObjectId}`,
       }),
     );
+    await expect(test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:501",
+    })).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "active_review_exists",
+      articleId: regenerationRequest.articleId,
+    });
   });
 
   it("is idempotent for a repeated Telegram delivery", async () => {

@@ -4,6 +4,12 @@ import { booleanCell, displayDateCell, numberCell, stringCell } from "../domain/
 const KEYWORDS_SHEET_GID = 910000002;
 const LINK_INVENTORY_SHEET_GID = 910000004;
 const SETTINGS_SHEET_GID = 910000005;
+const ARTICLES_SHEET_GID = 910000001;
+
+export function articleSheetUrl(spreadsheetId: string, rowNumber?: number): string {
+  const range = rowNumber ? `A${rowNumber}:AO${rowNumber}` : "A2:AO";
+  return sheetRangeUrl(spreadsheetId, ARTICLES_SHEET_GID, range);
+}
 
 export function keywordSheetUrl(spreadsheetId: string, rowNumber?: number): string {
   const range = rowNumber ? `A${rowNumber}:T${rowNumber}` : "A2:T";
@@ -20,7 +26,7 @@ export function settingsSheetUrl(spreadsheetId: string): string {
 
 export function articleCard(article: Article, spreadsheetId: string): string {
   const row = article.__rowNumber;
-  const sheetUrl = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(spreadsheetId)}/edit#gid=910000001&range=A${row}:AO${row}`;
+  const sheetUrl = articleSheetUrl(spreadsheetId, row);
   const schedule = displayDateCell(article.scheduled_publish_at) || "после согласования";
   const blockers = stringCell(article.qa_blockers);
   const canApprove = stringCell(article.qa_status) === "pass" && !booleanCell(article.manual_required);
@@ -35,8 +41,8 @@ export function articleCard(article: Article, spreadsheetId: string): string {
     `<a href="${sheetUrl}">Открыть строку в Google Sheets</a>`,
     "",
     canApprove
-      ? "Ответьте на эту карточку:\n/regenerate комментарий — переписать\n/approve — согласовать"
-      : "Ответьте на эту карточку командой /regenerate и напишите комментарий. /approve останется заблокирован до успешной QA.",
+      ? "/regenerate комментарий — переписать эту статью\n/approve — согласовать ответом на эту карточку"
+      : "/regenerate комментарий — переписать эту статью. /approve останется заблокирован до успешной QA.",
   ]
     .filter(Boolean)
     .join("\n");

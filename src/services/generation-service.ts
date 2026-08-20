@@ -34,7 +34,9 @@ export type ManualGenerationBlockReason =
   | "locale_disabled"
   | "ru_disabled"
   | "no_internal_links"
-  | "queue_full";
+  | "active_review_exists"
+  | "multiple_active_reviews"
+  | "generation_in_progress";
 
 export type InvalidKeywordField = "keyword_id" | "locale" | "primary_keyword" | "article_id";
 
@@ -62,8 +64,8 @@ export type ManualGenerationResult =
       invalidFields?: InvalidKeywordField[];
       conflictingRows?: number[];
       articleId?: string;
+      telegramMessageId?: number;
       allowedLocales?: string[];
-      queueLimit?: number;
       activeCount?: number;
     };
 
@@ -135,6 +137,45 @@ export class GenerationService {
         return resultForExistingKeyword(existing);
       }
 
+      const activeGenerationRequests = allKeywords
+        .filter((candidate) => [CLAIMED_STATUS, "generating"].includes(stringCell(candidate.status)))
+        .sort((left, right) =>
+          left.__rowNumber - right.__rowNumber ||
+          stringCell(left.keyword_id).localeCompare(stringCell(right.keyword_id)),
+        );
+      const activeReviews = (await this.store.listArticles(["needs_review", "failed_qa"]))
+        .sort((left, right) =>
+          left.__rowNumber - right.__rowNumber || left.article_id.localeCompare(right.article_id),
+        );
+      if (activeReviews.length > 0) {
+        const activeReview = activeReviews[0]!;
+        const telegramMessageId = Number(activeReview.telegram_message_id);
+        return {
+          outcome: "blocked",
+          reason: activeReviews.length === 1 ? "active_review_exists" : "multiple_active_reviews",
+          articleId: activeReview.article_id,
+          rowNumber: activeReview.__rowNumber,
+          ...(Number.isSafeInteger(telegramMessageId) && telegramMessageId > 0
+            ? { telegramMessageId }
+            : {}),
+          activeCount: activeReviews.length,
+          ...(activeReviews.length > 1
+            ? { conflictingRows: activeReviews.map((article) => article.__rowNumber) }
+            : {}),
+        };
+      }
+      if (activeGenerationRequests.length > 0) {
+        const activeRequest = activeGenerationRequests[0]!;
+        const activeArticleId = stringCell(activeRequest.article_id);
+        return blockedForKeyword("generation_in_progress", activeRequest, {
+          ...(activeArticleId ? { articleId: activeArticleId } : {}),
+          activeCount: activeGenerationRequests.length,
+          ...(activeGenerationRequests.length > 1
+            ? { conflictingRows: activeGenerationRequests.map((candidate) => candidate.__rowNumber) }
+            : {}),
+        });
+      }
+
       const keyword = allKeywords
         .filter((candidate) => stringCell(candidate.status) === "ready")
         .sort((left, right) => left.__rowNumber - right.__rowNumber)[0];
@@ -177,16 +218,6 @@ export class GenerationService {
         return blockedForKeyword("locale_disabled", keyword, { allowedLocales });
       }
 
-      const queueLimit = Math.max(1, numberCell(settings.get("telegram_generation_queue_limit")) || 3);
-      const activeManualRequests = allKeywords.filter(
-        (candidate) => [CLAIMED_STATUS, "generating"].includes(stringCell(candidate.status)),
-      );
-      const activeCount = (
-        await Promise.all(activeManualRequests.map((candidate) => this.#hasValidManualRequest(candidate)))
-      ).filter(Boolean).length;
-      if (activeCount >= queueLimit) {
-        return blockedForKeyword("queue_full", keyword, { activeCount, queueLimit });
-      }
       const links = await this.store.listLinks();
       const hasInternalLink = links.some(
         (link) =>
@@ -382,6 +413,15 @@ export class GenerationService {
           ? [CLAIMED_STATUS, "generating"]
           : ["ready", CLAIMED_STATUS, "generating"];
         const candidates = await this.store.listKeywords(statuses);
+        const inFlightCandidates = candidates
+          .filter((candidate) =>
+            [CLAIMED_STATUS, "generating"].includes(stringCell(candidate.status)),
+          )
+          .sort((left, right) =>
+            left.__rowNumber - right.__rowNumber ||
+            stringCell(left.keyword_id).localeCompare(stringCell(right.keyword_id)),
+          );
+        const activeReviews = await this.store.listArticles(["needs_review", "failed_qa"]);
         const manualFlags = await Promise.all(
           candidates.map((candidate) => this.#hasManualRequestEvent(candidate)),
         );
@@ -403,7 +443,24 @@ export class GenerationService {
             }
             return left.__rowNumber - right.__rowNumber;
           });
-        let selected = keywords[0];
+        const recoveries = keywords.filter((candidate) =>
+          [CLAIMED_STATUS, "generating"].includes(stringCell(candidate.status)),
+        );
+        let selected: SheetRecord | undefined;
+        if (activeReviews.length > 1) {
+          return undefined;
+        }
+        if (activeReviews.length === 1) {
+          const activeArticleId = activeReviews[0]!.article_id.toLowerCase();
+          selected = recoveries.find(
+            (candidate) => stringCell(candidate.article_id).toLowerCase() === activeArticleId,
+          );
+        } else if (inFlightCandidates.length > 0) {
+          const inFlight = inFlightCandidates[0]!;
+          selected = recoveries.find((candidate) => candidate.__rowNumber === inFlight.__rowNumber);
+        } else {
+          selected = keywords[0];
+        }
         if (!selected) return undefined;
 
         if (stringCell(selected.status) !== CLAIMED_STATUS || !stringCell(selected.article_id)) {

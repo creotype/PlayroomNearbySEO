@@ -57,9 +57,8 @@ const queuedGenerationResult = {
   keyword: "igraonice za decu Beograd",
 };
 
-function botHarness(manualResult: Record<string, unknown> = queuedGenerationResult) {
-  const requestManualGeneration = vi.fn(async () => manualResult);
-  const article = {
+function reviewArticle(overrides: Partial<Article> = {}): Article {
+  return {
     __rowNumber: 2,
     article_id: "SEO-TG-1",
     locale: "sr",
@@ -72,7 +71,16 @@ function botHarness(manualResult: Record<string, unknown> = queuedGenerationResu
     manual_required: false,
     revision_count: 1,
     telegram_message_id: 12,
+    ...overrides,
   } as Article;
+}
+
+function botHarness(
+  manualResult: Record<string, unknown> = queuedGenerationResult,
+  options: { reviewArticles?: Article[]; failSendMessageCalls?: number[] } = {},
+) {
+  const requestManualGeneration = vi.fn(async () => manualResult);
+  const article = reviewArticle();
   const regenerateArticle = vi.fn(async () => ({
     outcome: "regenerated" as const,
     article,
@@ -83,10 +91,14 @@ function botHarness(manualResult: Record<string, unknown> = queuedGenerationResu
   }));
   const findArticle = vi.fn(async (articleId: string) => articleId === article.article_id ? article : undefined);
   const findArticleByTelegramMessageId = vi.fn(
-    async (messageId: number) => messageId === 12 ? article : undefined,
+    async (messageId: number) => (options.reviewArticles ?? [article]).find(
+      (candidate) => Number(candidate.telegram_message_id) === messageId,
+    ),
   );
+  const listArticles = vi.fn(async () => options.reviewArticles ?? [article]);
   const store = {
     getSettings: async () => new Map(),
+    listArticles,
     findArticle,
     findArticleByTelegramMessageId,
   } as unknown as GoogleSheetsStore;
@@ -95,7 +107,7 @@ function botHarness(manualResult: Record<string, unknown> = queuedGenerationResu
     store,
     approvals: { approve } as unknown as ApprovalService,
     generation: { requestManualGeneration, regenerateArticle } as unknown as GenerationService,
-    logger: { error: vi.fn() } as unknown as Logger,
+    logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
   });
   bot.botInfo = {
     id: 8692086487,
@@ -115,6 +127,10 @@ function botHarness(manualResult: Record<string, unknown> = queuedGenerationResu
   const apiCalls: Array<{ method: string; payload: unknown }> = [];
   bot.api.config.use(async (_previous, method, payload) => {
     apiCalls.push({ method, payload });
+    const sendMessageCall = apiCalls.filter((call) => call.method === "sendMessage").length;
+    if (method === "sendMessage" && options.failSendMessageCalls?.includes(sendMessageCall)) {
+      throw new Error(`sendMessage ${sendMessageCall} failed`);
+    }
     return {
       ok: true,
       result: method === "sendMessage"
@@ -133,6 +149,7 @@ function botHarness(manualResult: Record<string, unknown> = queuedGenerationResu
     approve,
     findArticle,
     findArticleByTelegramMessageId,
+    listArticles,
     article,
     apiCalls,
   };
@@ -256,6 +273,50 @@ describe("/generate Telegram handler", () => {
     expect(payload?.text).not.toContain("undefined");
   });
 
+  it("explains that /generate is blocked until the sole active review article is resolved", async () => {
+    const test = botHarness({
+      outcome: "blocked",
+      reason: "active_review_exists",
+      articleId: "SEO-TG-ACTIVE",
+      rowNumber: 22,
+      telegramMessageId: 75,
+      activeCount: 1,
+    });
+
+    await test.bot.handleUpdate(generateUpdate(-5484259760));
+
+    const payload = sentMessagePayload(test);
+    expect(payload?.parse_mode).toBe("HTML");
+    expect(payload?.text).toContain("SEO-TG-ACTIVE");
+    expect(payload?.text?.toLowerCase()).toMatch(/соглас|ревью|активн/);
+    expect(payload?.text).toContain("/regenerate");
+    expect(payload?.text).toContain("/approve");
+    expect(payload?.text).toContain(
+      'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000001&range=A22:AO22"',
+    );
+    expect(payload?.text).not.toContain("undefined");
+  });
+
+  it("reports multiple active reviews as a data problem instead of queueing another article", async () => {
+    const test = botHarness({
+      outcome: "blocked",
+      reason: "multiple_active_reviews",
+      activeCount: 2,
+      conflictingRows: [4, 9],
+    });
+
+    await test.bot.handleUpdate(generateUpdate(-5484259760));
+
+    const payload = sentMessagePayload(test);
+    expect(payload?.parse_mode).toBe("HTML");
+    expect(payload?.text?.toLowerCase()).toMatch(/несколько|конфликт|поврежд/);
+    expect(payload?.text).toContain("4");
+    expect(payload?.text).toContain("9");
+    expect(payload?.text).toContain("gid=910000001&range=A4:AO4");
+    expect(payload?.text).toContain("gid=910000001&range=A9:AO9");
+    expect(payload?.text).not.toContain("undefined");
+  });
+
   it("explains a disabled locale and links to its exact keyword row", async () => {
     const test = botHarness({
       outcome: "blocked",
@@ -299,22 +360,23 @@ describe("/generate Telegram handler", () => {
     );
   });
 
-  it("shows the queue occupancy and waiting keyword row when the manual queue is full", async () => {
+  it("shows the existing article while its generation is still in progress", async () => {
     const test = botHarness({
       outcome: "blocked",
-      reason: "queue_full",
-      keywordId: "KW-WAITING",
+      reason: "generation_in_progress",
+      keywordId: "KW-IN-PROGRESS",
+      articleId: "SEO-IN-PROGRESS",
       rowNumber: 15,
-      queueLimit: 3,
-      activeCount: 3,
+      activeCount: 1,
     });
 
     await test.bot.handleUpdate(generateUpdate(-5484259760));
 
     const payload = sentMessagePayload(test);
     expect(payload?.parse_mode).toBe("HTML");
-    expect(payload?.text).toMatch(/3(?:\/| из )3/);
-    expect(payload?.text).toContain("KW-WAITING");
+    expect(payload?.text).toContain("SEO-IN-PROGRESS");
+    expect(payload?.text?.toLowerCase()).toMatch(/генерир|дожд/);
+    expect(payload?.text).toContain("/generate");
     expect(payload?.text).toContain(
       'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000002&range=A15:T15"',
     );
@@ -417,6 +479,7 @@ describe("minimal Telegram review workflow", () => {
       providerObjectId: "message:-5484259760:78",
     });
     expect(test.findArticleByTelegramMessageId).toHaveBeenCalledWith(12);
+    expect(test.listArticles).not.toHaveBeenCalled();
     expect(test.findArticle).not.toHaveBeenCalled();
   });
 
@@ -426,16 +489,96 @@ describe("minimal Telegram review workflow", () => {
 
     expect(test.regenerateArticle).not.toHaveBeenCalled();
     expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
+    expect(test.listArticles).not.toHaveBeenCalled();
     expect(String(sentMessagePayload(test)?.text ?? "").toLowerCase()).toContain("коммент");
   });
 
-  it("rejects /regenerate with a comment unless it replies to a review card", async () => {
-    const test = botHarness();
-    await test.bot.handleUpdate(commandUpdate("regenerate", "SEO-TG-1 ispravi izvore"));
+  it.each(["needs_review", "failed_qa"] as const)(
+    "regenerates the sole active %s article immediately when the command is not a reply",
+    async (status) => {
+      const onlyActiveArticle = reviewArticle({
+        __rowNumber: 9,
+        article_id: `SEO-TG-ONLY-${status}`,
+        status,
+        telegram_message_id: status === "needs_review" ? "75" : "",
+      });
+      const test = botHarness(queuedGenerationResult, {
+        reviewArticles: [onlyActiveArticle],
+      });
 
+      await test.bot.handleUpdate(commandUpdate("regenerate", "сделай статью дружелюбнее и теплее"));
+
+      expect(test.listArticles).toHaveBeenCalledWith(["needs_review", "failed_qa"]);
+      expect(test.regenerateArticle).toHaveBeenCalledWith({
+        articleId: `SEO-TG-ONLY-${status}`,
+        feedback: "сделай статью дружелюбнее и теплее",
+        actorId: 42,
+        actorName: "Owner",
+        providerObjectId: "message:-5484259760:78",
+      });
+      expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
+      expect(test.findArticle).not.toHaveBeenCalled();
+    },
+  );
+
+  it("still regenerates when the immediate acknowledgement cannot be delivered", async () => {
+    const test = botHarness(queuedGenerationResult, { failSendMessageCalls: [1] });
+
+    await test.bot.handleUpdate(commandUpdate("regenerate", "сделай вступление теплее"));
+
+    expect(test.regenerateArticle).toHaveBeenCalledWith(expect.objectContaining({
+      articleId: "SEO-TG-1",
+      feedback: "сделай вступление теплее",
+    }));
+    expect(test.apiCalls.filter((call) => call.method === "sendMessage")).toHaveLength(2);
+  });
+
+  it("does not claim that the old draft was preserved when only the final Telegram reply fails", async () => {
+    const test = botHarness(queuedGenerationResult, { failSendMessageCalls: [2] });
+
+    await expect(
+      test.bot.handleUpdate(commandUpdate("regenerate", "сделай вступление теплее")),
+    ).rejects.toThrow("sendMessage 2 failed");
+
+    expect(test.regenerateArticle).toHaveBeenCalledTimes(1);
+    const texts = test.apiCalls
+      .filter((call) => call.method === "sendMessage")
+      .map((call) => String((call.payload as { text?: string }).text ?? ""));
+    expect(texts).toHaveLength(2);
+    expect(texts.join("\n")).not.toContain("Старый черновик сохранён");
+  });
+
+  it("does not regenerate without a reply when no review card can be selected", async () => {
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [],
+    });
+
+    await test.bot.handleUpdate(commandUpdate("regenerate", "перепиши вступление"));
+
+    expect(test.listArticles).toHaveBeenCalledWith(["needs_review", "failed_qa"]);
     expect(test.regenerateArticle).not.toHaveBeenCalled();
-    expect(test.findArticle).not.toHaveBeenCalled();
-    expect(String(sentMessagePayload(test)?.text ?? "").toLowerCase()).toMatch(/ответ.*карточ/);
+    expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
+    expect(String(sentMessagePayload(test)?.text ?? "").toLowerCase()).toMatch(/нет|не найден|карточ/);
+  });
+
+  it("fails closed when more than one active review article exists", async () => {
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [
+        reviewArticle({ __rowNumber: 4, article_id: "SEO-TG-ACTIVE-1", status: "needs_review", telegram_message_id: 75 }),
+        reviewArticle({ __rowNumber: 9, article_id: "SEO-TG-ACTIVE-2", status: "failed_qa", telegram_message_id: 70 }),
+      ],
+    });
+
+    await test.bot.handleUpdate(commandUpdate("regenerate", "перепиши вступление"));
+
+    expect(test.listArticles).toHaveBeenCalledWith(["needs_review", "failed_qa"]);
+    expect(test.regenerateArticle).not.toHaveBeenCalled();
+    const text = String(sentMessagePayload(test)?.text ?? "");
+    expect(text.toLowerCase()).toMatch(/несколько|однозначно|поврежд/);
+    expect(text).toContain("SEO-TG-ACTIVE-1");
+    expect(text).toContain("SEO-TG-ACTIVE-2");
+    expect(text).toContain("gid=910000001&range=A4:AO4");
+    expect(text).toContain("gid=910000001&range=A9:AO9");
   });
 
   it("approves only the article whose card receives a bare /approve reply", async () => {
