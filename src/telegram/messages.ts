@@ -35,8 +35,8 @@ export function articleCard(article: Article, spreadsheetId: string): string {
     `<a href="${sheetUrl}">Открыть строку в Google Sheets</a>`,
     "",
     canApprove
-      ? "Если черновик устраивает, нажмите «Согласовать»."
-      : "Нажмите «Исправить ИИ» или поправьте строку вручную; согласование останется заблокировано до успешной QA.",
+      ? "Ответьте на эту карточку:\n/regenerate комментарий — переписать\n/approve — согласовать"
+      : "Ответьте на эту карточку командой /regenerate и напишите комментарий. /approve останется заблокирован до успешной QA.",
   ]
     .filter(Boolean)
     .join("\n");

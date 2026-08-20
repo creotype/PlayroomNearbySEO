@@ -1,7 +1,7 @@
-import { Bot, InlineKeyboard, type Context } from "grammy";
+import { Bot, type Context } from "grammy";
 import type { Logger } from "pino";
 import type { AppConfig } from "../config.js";
-import { booleanCell, stringCell, type Article } from "../domain/article.js";
+import { booleanCell, stringCell } from "../domain/article.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { ApprovalResult, ApprovalService, TelegramActor } from "../services/approval-service.js";
 import type {
@@ -10,15 +10,15 @@ import type {
   ManualGenerationResult,
   RegenerationResult,
 } from "../services/generation-service.js";
-import {
-  articleStatusMessage,
-  escapeHtml,
-  keywordSheetUrl,
-  linkInventorySheetUrl,
-  settingsSheetUrl,
-} from "./messages.js";
+import { escapeHtml, keywordSheetUrl, linkInventorySheetUrl, settingsSheetUrl } from "./messages.js";
+import { UpdateDrain } from "./update-drain.js";
 
 export type SeoBot = Bot<Context>;
+const updateDrains = new WeakMap<SeoBot, UpdateDrain>();
+
+export function waitForTelegramIdle(bot: SeoBot): Promise<void> {
+  return updateDrains.get(bot)?.wait() ?? Promise.resolve();
+}
 
 export function createTelegramBot(options: {
   config: AppConfig;
@@ -29,30 +29,32 @@ export function createTelegramBot(options: {
 }): SeoBot {
   const { config, store, approvals, generation, logger } = options;
   const bot = new Bot(config.telegramBotToken);
+  const updateDrain = new UpdateDrain();
+  updateDrains.set(bot, updateDrain);
+  bot.use(async (_ctx, next) => {
+    const leave = updateDrain.enter();
+    try {
+      await next();
+    } finally {
+      leave();
+    }
+  });
 
-  bot.command("seo_help", async (ctx) => {
+  bot.command("help", async (ctx) => {
     await ctx.reply(
       [
         "<b>Playroom SEO bot</b>",
-        "/generate — взять верхний ready-ключ из таблицы",
-        "/seo_regenerate ARTICLE-ID [пожелание] — исправить черновик ИИ",
-        "/seo_approve ARTICLE-ID — согласовать",
-        "/seo_status ARTICLE-ID — актуальный статус",
-        "/seo_cancel ARTICLE-ID причина — отменить",
-        "/seo_chat_id — показать ID этой группы",
         "",
-        "ARTICLE-ID можно не указывать, если команда отправлена ответом на карточку статьи.",
+        "Я беру ключевики из Google Sheets, пишу SEO-статьи и после согласования публикую их в Ghost.",
+        "",
+        "/generate — взять следующую ready-строку из таблицы",
+        "/regenerate замечания — ответом на карточку переписать статью",
+        "/approve — ответом на карточку согласовать и отправить на публикацию",
+        "",
+        "У /regenerate комментарий обязателен. /approve отправляется без текста после команды.",
       ].join("\n"),
       { parse_mode: "HTML" },
     );
-  });
-
-  bot.command("seo_chat_id", async (ctx) => {
-    if (ctx.chat.type === "private") {
-      await ctx.reply("Добавьте меня в review-группу и выполните эту команду там.");
-      return;
-    }
-    await ctx.reply(`Chat ID: <code>${ctx.chat.id}</code>`, { parse_mode: "HTML" });
   });
 
   bot.command("generate", async (ctx) => {
@@ -79,43 +81,47 @@ export function createTelegramBot(options: {
     }
   });
 
-  bot.command("seo_status", async (ctx) => {
+  bot.command("approve", async (ctx) => {
     if (!(await authorizeReviewChat(ctx, config, store))) return;
-    const article = await resolveArticle(ctx, store, commandArgs(ctx));
-    if (!article) return;
-    await ctx.reply(articleStatusMessage(article), { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
-  });
-
-  bot.command("seo_approve", async (ctx) => {
-    if (!(await authorizeReviewChat(ctx, config, store))) return;
-    const article = await resolveArticle(ctx, store, commandArgs(ctx));
-    if (!article) return;
+    if (commandArgs(ctx)) {
+      await ctx.reply("Отправьте только /approve ответом на карточку статьи — без ARTICLE-ID и другого текста.");
+      return;
+    }
+    const replyMessageId = ctx.message?.reply_to_message?.message_id;
+    if (!replyMessageId) {
+      await ctx.reply("Ответьте на карточку статьи командой /approve.");
+      return;
+    }
+    const article = await store.findArticleByTelegramMessageId(replyMessageId);
+    if (!article) {
+      await ctx.reply("❓ Это не карточка статьи. Ответьте /approve именно на сообщение с SEO draft.");
+      return;
+    }
     const result = await approvals.approve(article.article_id, actorFromContext(ctx));
     await replyApprovalResult(ctx, result);
   });
 
-  bot.command("seo_regenerate", async (ctx) => {
+  bot.command("regenerate", async (ctx) => {
     if (!(await authorizeReviewChat(ctx, config, store))) return;
-    const raw = commandArgs(ctx);
-    const replyMessageId = ctx.message?.reply_to_message?.message_id;
-    let article: Article | undefined;
-    let feedback = "";
-    if (replyMessageId) {
-      article = await store.findArticleByTelegramMessageId(replyMessageId);
-      feedback = raw;
-    } else {
-      const [articleId = "", ...feedbackParts] = raw.split(/\s+/);
-      article = articleId ? await store.findArticle(articleId) : undefined;
-      feedback = feedbackParts.join(" ");
+    const feedback = commandArgs(ctx);
+    if (!feedback) {
+      await ctx.reply("Добавьте замечания после команды: /regenerate ваш комментарий.");
+      return;
     }
+    const replyMessageId = ctx.message?.reply_to_message?.message_id;
+    if (!replyMessageId) {
+      await ctx.reply("Ответьте на карточку статьи командой /regenerate и напишите замечания после команды.");
+      return;
+    }
+    const article = await store.findArticleByTelegramMessageId(replyMessageId);
     if (!article) {
-      await ctx.reply("❓ Не удалось определить статью. Ответьте на карточку или укажите ARTICLE-ID.");
+      await ctx.reply("❓ Это не карточка статьи. Ответьте /regenerate с замечаниями именно на сообщение с SEO draft.");
       return;
     }
     try {
       const result = await generation.regenerateArticle({
         articleId: article.article_id,
-        ...(feedback.trim() ? { feedback: feedback.trim() } : {}),
+        feedback,
         ...generationActorFromContext(ctx),
       });
       await replyRegenerationResult(ctx, result);
@@ -128,68 +134,6 @@ export function createTelegramBot(options: {
     }
   });
 
-  bot.command("seo_cancel", async (ctx) => {
-    if (!(await authorizeReviewChat(ctx, config, store))) return;
-    const raw = commandArgs(ctx);
-    const replyMessageId = ctx.message?.reply_to_message?.message_id;
-    let article: Article | undefined;
-    let reason: string;
-    if (replyMessageId) {
-      article = await store.findArticleByTelegramMessageId(replyMessageId);
-      reason = raw;
-    } else {
-      const [articleId = "", ...reasonParts] = raw.split(/\s+/);
-      article = articleId ? await store.findArticle(articleId) : undefined;
-      reason = reasonParts.join(" ");
-    }
-    if (!article) {
-      await ctx.reply("❓ Не удалось определить статью. Ответьте на карточку или укажите ARTICLE-ID.");
-      return;
-    }
-    if (!reason.trim()) {
-      await ctx.reply("Укажите причину отмены после команды.");
-      return;
-    }
-    const cancelled = await approvals.cancel(article.article_id, reason.trim(), actorFromContext(ctx));
-    await ctx.reply(`🛑 <b>${escapeHtml(cancelled.article_id)}</b> отменена.`, { parse_mode: "HTML" });
-  });
-
-  bot.callbackQuery(/^seo:(approve|regenerate|status):(.+)$/, async (ctx) => {
-    if (!(await authorizeReviewChat(ctx, config, store))) return;
-    const match = ctx.match;
-    const action = match[1];
-    const articleId = match[2];
-    if (!articleId) return;
-    const article = await store.findArticle(articleId);
-    if (!article) {
-      await ctx.answerCallbackQuery({ text: "Статья не найдена", show_alert: true });
-      return;
-    }
-    await ctx.answerCallbackQuery();
-    if (action === "status") {
-      await ctx.reply(articleStatusMessage(article), { parse_mode: "HTML" });
-      return;
-    }
-    if (action === "regenerate") {
-      try {
-        const result = await generation.regenerateArticle({
-          articleId: article.article_id,
-          ...generationActorFromContext(ctx),
-        });
-        await replyRegenerationResult(ctx, result);
-      } catch (error) {
-        logger.error(
-          { articleId: article.article_id, err: error instanceof Error ? error.message : String(error) },
-          "Article regeneration failed",
-        );
-        await ctx.reply("⚠️ Исправить статью не удалось. Старый черновик сохранён; попробуйте ещё раз позже.");
-      }
-      return;
-    }
-    const result = await approvals.approve(article.article_id, actorFromContext(ctx));
-    await replyApprovalResult(ctx, result);
-  });
-
   bot.catch((error) => {
     logger.error(
       { updateId: error.ctx.update.update_id, err: error.error instanceof Error ? error.error.message : String(error.error) },
@@ -200,13 +144,10 @@ export function createTelegramBot(options: {
 }
 
 export const telegramCommandMenu = [
-  { command: "generate", description: "Взять следующий ready-ключ" },
-  { command: "seo_status", description: "Показать статус статьи" },
-  { command: "seo_regenerate", description: "Исправить черновик с помощью ИИ" },
-  { command: "seo_approve", description: "Согласовать статью" },
-  { command: "seo_cancel", description: "Отменить статью с причиной" },
-  { command: "seo_help", description: "Показать справку" },
-  { command: "seo_chat_id", description: "Показать ID review-группы" },
+  { command: "generate", description: "Сгенерировать следующую статью" },
+  { command: "regenerate", description: "Переписать по комментарию" },
+  { command: "approve", description: "Согласовать статью" },
+  { command: "help", description: "Как работает бот" },
 ] as const;
 
 export type ParsedGenerateCommand =
@@ -222,13 +163,6 @@ export function parseGenerateCommand(raw: string): ParsedGenerateCommand {
   };
 }
 
-export function reviewKeyboard(article: Article): InlineKeyboard {
-  return new InlineKeyboard()
-    .text("✅ Согласовать", `seo:approve:${article.article_id}`)
-    .text("🔄 Исправить ИИ", `seo:regenerate:${article.article_id}`)
-    .text("ℹ️ Статус", `seo:status:${article.article_id}`);
-}
-
 async function authorizeReviewChat(
   ctx: Context,
   config: AppConfig,
@@ -242,7 +176,7 @@ async function authorizeReviewChat(
   const fromSheet = Number(settings.get("telegram_chat_id"));
   const allowedChatId = config.telegramReviewChatId ?? (Number.isSafeInteger(fromSheet) ? fromSheet : undefined);
   if (!allowedChatId) {
-    await ctx.reply("Review-группа ещё не привязана. Выполните /seo_chat_id и внесите ID в settings.");
+    await ctx.reply("Review-группа ещё не привязана. Передайте ID группы техническому администратору.");
     return false;
   }
   if (ctx.chat.id !== allowedChatId) {
@@ -251,22 +185,6 @@ async function authorizeReviewChat(
   }
   if (!ctx.from || ctx.from.is_bot) return false;
   return true;
-}
-
-async function resolveArticle(
-  ctx: Context,
-  store: GoogleSheetsStore,
-  explicitId: string,
-): Promise<Article | undefined> {
-  const article = explicitId
-    ? await store.findArticle(explicitId.split(/\s+/)[0] ?? "")
-    : ctx.message?.reply_to_message?.message_id
-      ? await store.findArticleByTelegramMessageId(ctx.message.reply_to_message.message_id)
-      : undefined;
-  if (!article) {
-    await ctx.reply("❓ Не удалось определить статью. Ответьте на карточку или укажите ARTICLE-ID.");
-  }
-  return article;
 }
 
 function commandArgs(ctx: Context): string {
@@ -344,7 +262,7 @@ async function replyGenerationResult(
     await ctx.reply(
       [
         `ℹ️ По этому ключу уже создана статья <code>${escapeHtml(result.articleId)}</code>.`,
-        `Проверить: <code>/seo_status ${escapeHtml(result.articleId)}</code>`,
+        "Её review-карточка уже была отправлена в эту группу.",
       ].join("\n"),
       { parse_mode: "HTML" },
     );

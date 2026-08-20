@@ -12,7 +12,7 @@ import { PublicationService } from "./services/publication-service.js";
 import { QualityGate } from "./services/quality-gate.js";
 import { ReviewNotifier } from "./services/review-notifier.js";
 import { Scheduler } from "./services/scheduler.js";
-import { createTelegramBot, telegramCommandMenu, type SeoBot } from "./telegram/bot.js";
+import { createTelegramBot, telegramCommandMenu, waitForTelegramIdle, type SeoBot } from "./telegram/bot.js";
 
 export type RunningApp = {
   shutdown: (signal?: string) => Promise<void>;
@@ -52,7 +52,7 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
   const healthServer = startHealthServer(config.port, () => readiness, logger);
   await runStartupChecks({ readiness, store, ghost, bot, logger, config });
   scheduler.start();
-  void bot
+  const polling = bot
     .start({
       drop_pending_updates: false,
       onStart: (info) => logger.info({ bot: info.username }, "Telegram long polling started"),
@@ -72,12 +72,23 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
       if (stopping) return;
       stopping = true;
       readiness.ready = false;
-      scheduler.stop();
+      const schedulerDrain = scheduler.stop();
+      let stopPolling = Promise.resolve();
       try {
-        await bot.stop();
-      } catch {
-        // grammY throws if polling has not fully started; shutdown can continue.
+        stopPolling = bot.stop().catch((error: unknown) => {
+          logger.warn(
+            { err: error instanceof Error ? error.message : String(error) },
+            "Telegram polling stop failed; shutdown drain continues",
+          );
+        });
+      } catch (error) {
+        logger.warn(
+          { err: error instanceof Error ? error.message : String(error) },
+          "Telegram polling was not fully started; shutdown drain continues",
+        );
       }
+      await Promise.allSettled([schedulerDrain, stopPolling, polling]);
+      await waitForTelegramIdle(bot);
       await closeServer(healthServer);
       logger.info({ signal }, "Service stopped");
     },

@@ -3,10 +3,11 @@ import type { AppConfig } from "../config.js";
 import { articleContentHash, stringCell, type SheetRecord } from "../domain/article.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { SeoBot } from "../telegram/bot.js";
-import { reviewKeyboard } from "../telegram/bot.js";
 import { articleCard, escapeHtml, keywordSheetUrl } from "../telegram/messages.js";
 
 export class ReviewNotifier {
+  readonly #clearedReviewMarkup = new Set<number>();
+
   constructor(
     private readonly store: GoogleSheetsStore,
     private readonly bot: SeoBot,
@@ -25,32 +26,64 @@ export class ReviewNotifier {
       const existingMessageId = Number(article.telegram_message_id);
       try {
         if (Number.isSafeInteger(existingMessageId) && existingMessageId > 0) {
-          if (stringCell(article.content_hash) === currentHash) continue;
-          await this.bot.api.editMessageText(
-            chatId,
-            existingMessageId,
-            articleCard(article, this.config.spreadsheetId),
-            { parse_mode: "HTML", reply_markup: reviewKeyboard(article), link_preview_options: { is_disabled: true } },
-          );
-          await this.store.patchArticle(article.article_id, {
-            content_hash: currentHash,
-            updated_at: new Date().toISOString(),
-          });
+          const contentChanged = stringCell(article.content_hash) !== currentHash;
+          const needsMarkupMigration = !this.#clearedReviewMarkup.has(existingMessageId);
+          if (!contentChanged && !needsMarkupMigration) continue;
+          try {
+            await this.bot.api.editMessageText(
+              chatId,
+              existingMessageId,
+              articleCard(article, this.config.spreadsheetId),
+              {
+                parse_mode: "HTML",
+                reply_markup: { inline_keyboard: [] },
+                link_preview_options: { is_disabled: true },
+              },
+            );
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            if (!/message is not modified/iu.test(detail)) throw error;
+          }
+          this.#clearedReviewMarkup.add(existingMessageId);
+          if (contentChanged) {
+            await this.store.patchArticle(article.article_id, {
+              content_hash: currentHash,
+              updated_at: new Date().toISOString(),
+            });
+          }
           continue;
         }
         const message = await this.bot.api.sendMessage(
           chatId,
           articleCard(article, this.config.spreadsheetId),
-          { parse_mode: "HTML", reply_markup: reviewKeyboard(article), link_preview_options: { is_disabled: true } },
+          { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
         );
+        this.#clearedReviewMarkup.add(message.message_id);
         await this.store.patchArticle(article.article_id, {
           telegram_message_id: message.message_id,
           content_hash: currentHash,
           updated_at: new Date().toISOString(),
         });
       } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        if (
+          Number.isSafeInteger(existingMessageId) &&
+          existingMessageId > 0 &&
+          /message to edit not found/iu.test(detail)
+        ) {
+          await this.store.patchArticle(article.article_id, {
+            telegram_message_id: "",
+            content_hash: "",
+            updated_at: new Date().toISOString(),
+          });
+          this.logger.warn(
+            { articleId: article.article_id, telegramMessageId: existingMessageId },
+            "Missing review card mapping cleared; notifier will send a replacement",
+          );
+          continue;
+        }
         this.logger.error(
-          { articleId: article.article_id, err: error instanceof Error ? error.message : String(error) },
+          { articleId: article.article_id, err: detail },
           "Review notification failed",
         );
       }

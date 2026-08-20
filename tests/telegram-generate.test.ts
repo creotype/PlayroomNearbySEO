@@ -8,9 +8,9 @@ import type { GenerationService } from "../src/services/generation-service.js";
 import {
   createTelegramBot,
   parseGenerateCommand,
-  reviewKeyboard,
   telegramCommandMenu,
 } from "../src/telegram/bot.js";
+import type { SeoBot } from "../src/telegram/bot.js";
 
 describe("/generate command parser", () => {
   it("accepts the command with no arguments", () => {
@@ -30,9 +30,15 @@ describe("/generate command parser", () => {
     },
   );
 
-  it("registers generate in the Telegram command menu", () => {
-    expect(telegramCommandMenu.some((command) => command.command === "generate")).toBe(true);
-    expect(telegramCommandMenu.some((command) => command.command === "seo_regenerate")).toBe(true);
+  it("exposes exactly the four owner-facing commands", () => {
+    expect(telegramCommandMenu.map(({ command }) => command)).toEqual([
+      "generate",
+      "regenerate",
+      "approve",
+      "help",
+    ]);
+    expect(telegramCommandMenu).toHaveLength(4);
+    expect(telegramCommandMenu.every(({ command }) => !command.startsWith("seo_"))).toBe(true);
   });
 });
 
@@ -71,15 +77,23 @@ function botHarness(manualResult: Record<string, unknown> = queuedGenerationResu
     outcome: "regenerated" as const,
     article,
   }));
+  const approve = vi.fn(async () => ({
+    outcome: "approved" as const,
+    article: { ...article, status: "approved" },
+  }));
+  const findArticle = vi.fn(async (articleId: string) => articleId === article.article_id ? article : undefined);
+  const findArticleByTelegramMessageId = vi.fn(
+    async (messageId: number) => messageId === 12 ? article : undefined,
+  );
   const store = {
     getSettings: async () => new Map(),
-    findArticle: async (articleId: string) => articleId === article.article_id ? article : undefined,
-    findArticleByTelegramMessageId: async (messageId: number) => messageId === 12 ? article : undefined,
+    findArticle,
+    findArticleByTelegramMessageId,
   } as unknown as GoogleSheetsStore;
   const bot = createTelegramBot({
     config,
     store,
-    approvals: {} as ApprovalService,
+    approvals: { approve } as unknown as ApprovalService,
     generation: { requestManualGeneration, regenerateArticle } as unknown as GenerationService,
     logger: { error: vi.fn() } as unknown as Logger,
   });
@@ -112,7 +126,16 @@ function botHarness(manualResult: Record<string, unknown> = queuedGenerationResu
         : true,
     } as never;
   });
-  return { bot, requestManualGeneration, regenerateArticle, article, apiCalls };
+  return {
+    bot,
+    requestManualGeneration,
+    regenerateArticle,
+    approve,
+    findArticle,
+    findArticleByTelegramMessageId,
+    article,
+    apiCalls,
+  };
 }
 
 function sentMessagePayload(test: ReturnType<typeof botHarness>) {
@@ -316,28 +339,43 @@ describe("/generate Telegram handler", () => {
   });
 });
 
-function regenerateUpdate() {
+function commandUpdate(
+  command: string,
+  args = "",
+  options: { replyMessageId?: number; messageId?: number; updateId?: number } = {},
+): Parameters<SeoBot["handleUpdate"]>[0] {
+  const text = `/${command}${args ? ` ${args}` : ""}`;
+  const replyToMessage = options.replyMessageId
+    ? {
+        message_id: options.replyMessageId,
+        date: 1,
+        chat: { id: -5484259760, type: "supergroup" as const, title: "Review" },
+        from: { id: 8692086487, is_bot: true, first_name: "Playroom Nearby" },
+        text: "SEO draft",
+      }
+    : undefined;
   return {
-    update_id: 2,
+    update_id: options.updateId ?? 2,
     message: {
-      message_id: 78,
+      message_id: options.messageId ?? 78,
       date: 1,
       chat: { id: -5484259760, type: "supergroup" as const, title: "Review" },
       from: { id: 42, is_bot: false, first_name: "Owner" },
-      text: "/seo_regenerate SEO-TG-1 ispravi izvore",
-      entities: [{ offset: 0, length: 15, type: "bot_command" as const }],
+      text,
+      entities: [{ offset: 0, length: command.length + 1, type: "bot_command" as const }],
+      ...(replyToMessage ? { reply_to_message: replyToMessage } : {}),
     },
-  };
+  } as unknown as Parameters<SeoBot["handleUpdate"]>[0];
 }
 
-function regenerateCallbackUpdate() {
+function legacyCallbackUpdate(action: "approve" | "regenerate" | "status") {
   return {
     update_id: 3,
     callback_query: {
       id: "callback-1",
       chat_instance: "review",
       from: { id: 42, is_bot: false, first_name: "Owner" },
-      data: "seo:regenerate:SEO-TG-1",
+      data: `seo:${action}:SEO-TG-1`,
       message: {
         message_id: 12,
         date: 1,
@@ -348,41 +386,111 @@ function regenerateCallbackUpdate() {
   };
 }
 
-describe("/seo_regenerate Telegram flow", () => {
-  it("regenerates an explicit article with editor feedback", async () => {
+describe("minimal Telegram review workflow", () => {
+  it("/help documents only generation, reply-with-comment regeneration, and reply approval", async () => {
     const test = botHarness();
-    await test.bot.handleUpdate(regenerateUpdate());
+    await test.bot.handleUpdate(commandUpdate("help"));
+
+    const help = String(sentMessagePayload(test)?.text ?? "");
+    expect(help).toContain("/generate");
+    expect(help).toContain("/regenerate");
+    expect(help).toContain("/approve");
+    expect(help.toLowerCase()).toMatch(/ответ.*карточ/);
+    expect(help.toLowerCase()).toContain("коммент");
+    expect(help).not.toContain("/seo_");
+    expect(help).not.toContain("/status");
+    expect(help).not.toContain("/cancel");
+    expect(help).not.toContain("ARTICLE-ID");
+  });
+
+  it("regenerates the replied-to article with a required editor comment", async () => {
+    const test = botHarness();
+    await test.bot.handleUpdate(commandUpdate("regenerate", "  ispravi izvore i proveri činjenice  ", {
+      replyMessageId: 12,
+    }));
+
     expect(test.regenerateArticle).toHaveBeenCalledWith({
       articleId: "SEO-TG-1",
-      feedback: "ispravi izvore",
+      feedback: "ispravi izvore i proveri činjenice",
       actorId: 42,
       actorName: "Owner",
       providerObjectId: "message:-5484259760:78",
     });
-    expect(test.apiCalls.some((call) => call.method === "sendMessage")).toBe(true);
+    expect(test.findArticleByTelegramMessageId).toHaveBeenCalledWith(12);
+    expect(test.findArticle).not.toHaveBeenCalled();
   });
 
-  it("shows AI repair and fresh-approval actions for a failed QA card", () => {
+  it("rejects /regenerate without a nonblank comment", async () => {
     const test = botHarness();
-    const failed = { ...test.article, qa_status: "fail", manual_required: true } as Article;
-    const buttons = reviewKeyboard(failed).inline_keyboard.flat();
-    expect(buttons).toContainEqual(
-      expect.objectContaining({ text: "🔄 Исправить ИИ", callback_data: "seo:regenerate:SEO-TG-1" }),
-    );
-    expect(buttons).toContainEqual(
-      expect.objectContaining({ text: "✅ Согласовать", callback_data: "seo:approve:SEO-TG-1" }),
-    );
+    await test.bot.handleUpdate(commandUpdate("regenerate", "   ", { replyMessageId: 12 }));
+
+    expect(test.regenerateArticle).not.toHaveBeenCalled();
+    expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
+    expect(String(sentMessagePayload(test)?.text ?? "").toLowerCase()).toContain("коммент");
   });
 
-  it("acknowledges the callback before invoking the long regeneration flow", async () => {
+  it("rejects /regenerate with a comment unless it replies to a review card", async () => {
     const test = botHarness();
-    await test.bot.handleUpdate(regenerateCallbackUpdate());
-    expect(test.apiCalls[0]?.method).toBe("answerCallbackQuery");
-    expect(test.regenerateArticle).toHaveBeenCalledWith({
-      articleId: "SEO-TG-1",
-      actorId: 42,
-      actorName: "Owner",
-      providerObjectId: "callback:callback-1",
+    await test.bot.handleUpdate(commandUpdate("regenerate", "SEO-TG-1 ispravi izvore"));
+
+    expect(test.regenerateArticle).not.toHaveBeenCalled();
+    expect(test.findArticle).not.toHaveBeenCalled();
+    expect(String(sentMessagePayload(test)?.text ?? "").toLowerCase()).toMatch(/ответ.*карточ/);
+  });
+
+  it("approves only the article whose card receives a bare /approve reply", async () => {
+    const test = botHarness();
+    await test.bot.handleUpdate(commandUpdate("approve", "", { replyMessageId: 12 }));
+
+    expect(test.approve).toHaveBeenCalledWith("SEO-TG-1", {
+      id: 42,
+      displayName: "Owner",
+      providerObjectId: "message:-5484259760:78",
     });
+    expect(test.findArticleByTelegramMessageId).toHaveBeenCalledWith(12);
+    expect(test.findArticle).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["without a reply", commandUpdate("approve")],
+    ["with arguments", commandUpdate("approve", "SEO-TG-1", { replyMessageId: 12 })],
+  ])("rejects /approve %s", async (_case, update) => {
+    const test = botHarness();
+    await test.bot.handleUpdate(update);
+
+    expect(test.approve).not.toHaveBeenCalled();
+    expect(String(sentMessagePayload(test)?.text ?? "")).toContain("/approve");
+  });
+
+  it.each([
+    "seo_help",
+    "seo_chat_id",
+    "seo_status",
+    "seo_cancel",
+    "seo_regenerate",
+    "seo_approve",
+  ])("does not execute the removed /%s workflow", async (legacyCommand) => {
+    const test = botHarness();
+    await test.bot.handleUpdate(commandUpdate(legacyCommand));
+
+    expect(test.requestManualGeneration).not.toHaveBeenCalled();
+    expect(test.regenerateArticle).not.toHaveBeenCalled();
+    expect(test.approve).not.toHaveBeenCalled();
+    expect(test.findArticle).not.toHaveBeenCalled();
+    expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
+    expect(test.apiCalls).toHaveLength(0);
+  });
+
+  it.each(["approve", "regenerate", "status"] as const)(
+    "ignores the removed %s inline callback",
+    async (action) => {
+      const test = botHarness();
+      await test.bot.handleUpdate(legacyCallbackUpdate(action));
+
+      expect(test.regenerateArticle).not.toHaveBeenCalled();
+      expect(test.approve).not.toHaveBeenCalled();
+      expect(test.findArticle).not.toHaveBeenCalled();
+      expect(test.apiCalls).toHaveLength(0);
+    },
+  );
 });

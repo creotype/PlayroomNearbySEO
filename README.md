@@ -4,7 +4,7 @@ Long-running TypeScript service that treats the [Playroom SEO spreadsheet](https
 
 ```text
 keywords → OpenAI generation/research → articles → Telegram review
-/generate ────────────────┘         → /seo_approve → Ghost publish → verify
+/generate ────────────────┘         → /approve → Ghost publish → verify
 ```
 
 The service is safe by default. It will not write to Ghost in any environment unless all of these are true:
@@ -20,7 +20,7 @@ pretend those production attestations are complete.
 ## Implemented
 
 - Dynamic Google Sheets header mapping and schema checks; no hard-coded column numbers.
-- Telegram group commands and inline approval button.
+- A minimal Telegram review flow with reply-bound rewrite and approval commands.
 - Equal approval rights for any human member of the configured review group.
 - Approval bound to a SHA-256 hash of all publishable fields.
 - Manual edits after approval stop publication with `status=conflict`.
@@ -32,15 +32,12 @@ pretend those production attestations are complete.
 
 ## Telegram commands
 
-- `/seo_help`
-- `/seo_chat_id`
 - `/generate`
-- `/seo_status ARTICLE-ID`
-- `/seo_regenerate ARTICLE-ID [editor feedback]`
-- `/seo_approve ARTICLE-ID`
-- `/seo_cancel ARTICLE-ID reason`
+- `/regenerate editor feedback`
+- `/approve`
+- `/help`
 
-`ARTICLE-ID` can be omitted when the command is sent as a reply to a review card. Regeneration replaces the same review row only after OpenAI succeeds, keeps the old draft on failure, increments `revision_count`, and never reopens an approved or published article. Generation, regeneration, status, approval, and cancellation commands from private chats or any group other than the configured review group are rejected. `/seo_help` is public help, and `/seo_chat_id` intentionally works before a group is bound.
+`/regenerate editor feedback` and `/approve` work only as direct replies to a review card. Editor feedback is mandatory for regeneration; `/approve` accepts no arguments. There is no ARTICLE-ID fallback and no inline action keyboard, so every action is bound to the visible card being replied to. Regeneration replaces the same review row only after OpenAI succeeds, keeps the old draft on failure, increments `revision_count`, and never reopens an approved or published article. Workflow commands from private chats or groups other than the configured review group are rejected. `/help` explains the three available actions.
 
 `/generate` accepts no arguments. It reserves the physically topmost row on `keywords` whose status is `ready`; row order is the manual priority, so the numeric `priority` value is ignored for this dequeue. Keyword, locale, and content settings come from that existing row. A malformed top row is never skipped silently: Telegram names the row and invalid fields and links directly to the relevant Sheet range. After OpenAI returns an article, the keyword becomes `used` even if article QA fails; a technical generation failure instead moves it to `paused` without an automatic paid retry. The generated article still requires Telegram review and never bypasses QA or approval. Manual generation requires both `ALLOW_TELEGRAM_GENERATION=true` in the server environment and `telegram_generation_enabled=true` in the Sheet. Scheduled generation remains independently controlled by `generation_enabled`. The manual queue is bounded by `telegram_generation_queue_limit` (default: 3), and any arguments passed to `/generate` are rejected.
 
@@ -73,6 +70,8 @@ npm test
 npm run build
 npm run dev
 ```
+
+On the configured Windows workstation, run `scripts/install-windows.ps1` once. It builds the service and the lightweight tray controller, creates a `Playroom SEO Bot` desktop shortcut, and does not add Windows-login autostart. Opening the shortcut starts the controller and bot. The tray menu exposes Start, Stop, Restart, and Exit; Stop and Exit request graceful service shutdown before any forced fallback.
 
 Health endpoints:
 
