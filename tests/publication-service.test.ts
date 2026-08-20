@@ -7,7 +7,11 @@ import type { GhostAdminClient } from "../src/ghost/client.js";
 import { KeyedMutex } from "../src/lib/keyed-mutex.js";
 import type { GoogleSheetsStore } from "../src/sheets/google-sheets.js";
 import { ApprovalService, type TelegramActor } from "../src/services/approval-service.js";
-import { PublicationService, publicationIsEnabled } from "../src/services/publication-service.js";
+import {
+  PublicationService,
+  publicationIsEnabled,
+  verifyPublicPage,
+} from "../src/services/publication-service.js";
 import type { QualityGate } from "../src/services/quality-gate.js";
 
 const actor: TelegramActor = {
@@ -479,5 +483,273 @@ describe("PublicationService concurrency hardening", () => {
       appendEvent.mock.calls.some(([event]) => event.event_type === "published"),
     ).toBe(false);
     expect(current.status).toBe("published");
+  });
+
+  it("atomically records a failed publication and its audit event", async () => {
+    let current = approvedArticle();
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const atomicWrites: Array<{
+      patch: Record<string, unknown>;
+      event: Record<string, unknown>;
+    }> = [];
+    const patchArticle = vi.fn(async (_id: string, patch: Record<string, unknown>) => {
+      current = { ...current, ...patch } as Article;
+      return current;
+    });
+    const appendEvent = vi.fn(async (event: Record<string, unknown>) => {
+      events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+    });
+    const store = {
+      getSettings: async () => enabledSettings(),
+      listArticles: async () => [{ ...current }],
+      findArticle: async () => current,
+      listEvents: async () => events,
+      patchArticle,
+      patchArticleAndAppendEvent: async (
+        _id: string,
+        patch: Record<string, unknown>,
+        event: Record<string, unknown>,
+      ) => {
+        atomicWrites.push({ patch, event });
+        current = { ...current, ...patch } as Article;
+        events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+        return current;
+      },
+      appendEvent,
+    } as unknown as GoogleSheetsStore;
+    const ghost = {
+      findPostBySlug: async () => {
+        throw new Error("Ghost API unavailable");
+      },
+    } as unknown as GhostAdminClient;
+
+    await new PublicationService(store, ghost, config, logger, new KeyedMutex()).runOnce();
+
+    expect(atomicWrites).toHaveLength(1);
+    expect(atomicWrites[0]?.patch).toMatchObject({
+      status: "failed_publish",
+    });
+    expect(atomicWrites[0]?.event).toMatchObject({
+      article_id: current.article_id,
+      event_type: "publish_failed",
+      from_status: "publishing",
+      to_status: "failed_publish",
+      provider: "ghost",
+    });
+    expect(
+      patchArticle.mock.calls.some(([, patch]) => patch.status === "failed_publish"),
+    ).toBe(false);
+    expect(
+      appendEvent.mock.calls.some(([event]) => event.event_type === "publish_failed"),
+    ).toBe(false);
+    expect(current.status).toBe("failed_publish");
+  });
+
+  it("atomically records a publication conflict and its audit event", async () => {
+    let current = approvedArticle();
+    const events: SheetRecord[] = [
+      {
+        ...approvalEvent(current),
+        payload_json: JSON.stringify({ hash: "stale-approved-hash" }),
+      },
+    ];
+    const atomicWrites: Array<{
+      patch: Record<string, unknown>;
+      event: Record<string, unknown>;
+    }> = [];
+    const patchArticle = vi.fn(async (_id: string, patch: Record<string, unknown>) => {
+      current = { ...current, ...patch } as Article;
+      return current;
+    });
+    const appendEvent = vi.fn(async (event: Record<string, unknown>) => {
+      events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+    });
+    const store = {
+      getSettings: async () => enabledSettings(),
+      listArticles: async () => [{ ...current }],
+      findArticle: async () => current,
+      listEvents: async () => events,
+      patchArticle,
+      patchArticleAndAppendEvent: async (
+        _id: string,
+        patch: Record<string, unknown>,
+        event: Record<string, unknown>,
+      ) => {
+        atomicWrites.push({ patch, event });
+        current = { ...current, ...patch } as Article;
+        events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+        return current;
+      },
+      appendEvent,
+    } as unknown as GoogleSheetsStore;
+    const ghost = ghostSpy();
+
+    await new PublicationService(store, ghost.client, config, logger, new KeyedMutex()).runOnce();
+
+    expect(atomicWrites).toHaveLength(1);
+    expect(atomicWrites[0]?.patch).toMatchObject({
+      status: "conflict",
+      qa_blockers: "changed_after_approval",
+      manual_required: true,
+    });
+    expect(atomicWrites[0]?.event).toMatchObject({
+      article_id: current.article_id,
+      event_type: "publication_conflict",
+      from_status: "approved",
+      to_status: "conflict",
+      provider: "ghost",
+    });
+    expect(
+      patchArticle.mock.calls.some(([, patch]) => patch.status === "conflict"),
+    ).toBe(false);
+    expect(
+      appendEvent.mock.calls.some(([event]) => event.event_type === "publication_conflict"),
+    ).toBe(false);
+    expect(current.status).toBe("conflict");
+    expect(ghost.calls).not.toHaveBeenCalled();
+  });
+});
+
+describe("verifyPublicPage", () => {
+  const publicUrl = "https://example.com/rs/blog/kako-izabrati-igraonicu";
+
+  it.each([
+    {
+      name: "an exact canonical with rel before href",
+      html: `<link rel="canonical" href="${publicUrl}">`,
+    },
+    {
+      name: "a relative canonical with href before rel",
+      html: '<link href="/rs/blog/kako-izabrati-igraonicu" rel="alternate canonical">',
+    },
+    {
+      name: "a mixed-case canonical token and attributes",
+      html: '<LINK HREF="/rs/blog/kako-izabrati-igraonicu" REL="alternate CANONICAL">',
+    },
+  ])("accepts $name", async ({ html }) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        ({
+          ok: true,
+          status: 200,
+          url: publicUrl,
+          text: async () => `<html><head>${html}</head></html>`,
+        }) as Response,
+      ),
+    );
+
+    try {
+      await expect(verifyPublicPage(publicUrl)).resolves.toEqual({
+        ok: true,
+        status: 200,
+        message: "Public page verified",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("rejects a page without a canonical link", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        ({
+          ok: true,
+          status: 200,
+          url: publicUrl,
+          text: async () => "<html><head><title>Article</title></head></html>",
+        }) as Response,
+      ),
+    );
+
+    try {
+      await expect(verifyPublicPage(publicUrl)).resolves.toEqual({
+        ok: false,
+        status: 200,
+        message: "Canonical link missing",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("rejects a page with multiple canonical links", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        ({
+          ok: true,
+          status: 200,
+          url: publicUrl,
+          text: async () => [
+            `<link rel="canonical" href="${publicUrl}">`,
+            `<link href="${publicUrl}" rel="canonical">`,
+          ].join(""),
+        }) as Response,
+      ),
+    );
+
+    try {
+      await expect(verifyPublicPage(publicUrl)).resolves.toEqual({
+        ok: false,
+        status: 200,
+        message: "Multiple canonical links",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("rejects a mismatched canonical URL", async () => {
+    const canonicalUrl = "https://example.com/rs/blog/druga-igraonica";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        ({
+          ok: true,
+          status: 200,
+          url: publicUrl,
+          text: async () => `<link href="${canonicalUrl}" rel="canonical">`,
+        }) as Response,
+      ),
+    );
+
+    try {
+      await expect(verifyPublicPage(publicUrl)).resolves.toEqual({
+        ok: false,
+        status: 200,
+        message: `Canonical mismatch: ${canonicalUrl}`,
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("rejects a redirected final response URL", async () => {
+    const redirectedUrl = "https://example.com/rs/blog/druga-igraonica";
+    const text = vi.fn(async () => `<link href="${redirectedUrl}" rel="canonical">`);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        ({
+          ok: true,
+          status: 200,
+          url: redirectedUrl,
+          text,
+        }) as unknown as Response,
+      ),
+    );
+
+    try {
+      await expect(verifyPublicPage(publicUrl)).resolves.toEqual({
+        ok: false,
+        status: 200,
+        message: `Public URL redirected to ${redirectedUrl}`,
+      });
+      expect(text).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

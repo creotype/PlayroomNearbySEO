@@ -91,15 +91,7 @@ export class PublicationService {
     } catch (error) {
       const message = sanitizeError(error);
       this.logger.error({ articleId: article.article_id, err: message }, "Ghost publication failed");
-      const latest = await this.store.findArticle(article.article_id);
-      if (!latest || latest.status !== "publishing") return;
-      const now = new Date().toISOString();
-      await this.store.patchArticle(article.article_id, {
-        status: "failed_publish",
-        last_error: message,
-        updated_at: now,
-      });
-      await this.#event(article, "publish_failed", "publishing", "failed_publish", message);
+      await this.#failPublishing(article, message);
     }
   }
 
@@ -245,12 +237,28 @@ export class PublicationService {
     const current = await this.store.findArticle(article.article_id);
     if (!current || current.status !== "publishing") return;
     assertTransition("publishing", "failed_publish");
-    await this.store.patchArticle(article.article_id, {
-      status: "failed_publish",
-      last_error: message,
-      updated_at: new Date().toISOString(),
-    });
-    await this.#event(article, "publish_failed", "publishing", "failed_publish", message);
+    const now = new Date().toISOString();
+    await this.store.patchArticleAndAppendEvent(
+      current.article_id,
+      {
+        status: "failed_publish",
+        last_error: message,
+        updated_at: now,
+      },
+      {
+        event_id: randomUUID(),
+        article_id: current.article_id,
+        event_type: "publish_failed",
+        from_status: "publishing",
+        to_status: "failed_publish",
+        actor_type: "system",
+        actor_id: "publisher",
+        provider: "ghost",
+        message,
+        payload_json: "",
+        created_at: now,
+      },
+    );
   }
 
   async #latestApprovedHash(articleId: string): Promise<string | undefined> {
@@ -286,20 +294,28 @@ export class PublicationService {
   ): Promise<void> {
     assertTransition(article.status, "conflict");
     const now = new Date().toISOString();
-    await this.store.patchArticle(article.article_id, {
-      status: "conflict",
-      qa_blockers: blocker,
-      manual_required: true,
-      last_error: message,
-      updated_at: now,
-    });
-    await this.#event(
-      article,
-      "publication_conflict",
-      article.status,
-      "conflict",
-      message,
-      payload,
+    await this.store.patchArticleAndAppendEvent(
+      article.article_id,
+      {
+        status: "conflict",
+        qa_blockers: blocker,
+        manual_required: true,
+        last_error: message,
+        updated_at: now,
+      },
+      {
+        event_id: randomUUID(),
+        article_id: article.article_id,
+        event_type: "publication_conflict",
+        from_status: article.status,
+        to_status: "conflict",
+        actor_type: "system",
+        actor_id: "publisher",
+        provider: "ghost",
+        message,
+        payload_json: payload ? JSON.stringify(payload) : "",
+        created_at: now,
+      },
     );
   }
 
@@ -377,10 +393,20 @@ export async function verifyPublicPage(url: string): Promise<PublicPageVerificat
       signal: AbortSignal.timeout(10_000),
     });
     if (!response.ok) return { ok: false, status: response.status, message: `Public URL returned ${response.status}` };
+    if (response.url && normalizeUrl(response.url) !== normalizeUrl(url)) {
+      return {
+        ok: false,
+        status: response.status,
+        message: `Public URL redirected to ${response.url}`,
+      };
+    }
     const html = await response.text();
-    const canonical = html.match(/<link[^>]+rel=["']canonical["'][^>]+href=["']([^"']+)/i)?.[1];
-    if (canonical && normalizeUrl(canonical) !== normalizeUrl(url)) {
-      return { ok: false, status: response.status, message: `Canonical mismatch: ${canonical}` };
+    const canonical = canonicalUrl(html, response.url || url);
+    if (!canonical.url) {
+      return { ok: false, status: response.status, message: canonical.error };
+    }
+    if (normalizeUrl(canonical.url) !== normalizeUrl(url)) {
+      return { ok: false, status: response.status, message: `Canonical mismatch: ${canonical.url}` };
     }
     return { ok: true, status: response.status, message: "Public page verified" };
   } catch (error) {
@@ -390,4 +416,34 @@ export async function verifyPublicPage(url: string): Promise<PublicPageVerificat
 
 function normalizeUrl(value: string): string {
   return value.replace(/\/$/, "");
+}
+
+function canonicalUrl(
+  html: string,
+  baseUrl: string,
+): { url?: string; error: string } {
+  const canonicalTags: string[] = [];
+  for (const match of html.matchAll(/<link\b[^>]*>/giu)) {
+    const tag = match[0];
+    const rel = htmlAttribute(tag, "rel");
+    if (!rel?.split(/\s+/u).some((token) => token.toLowerCase() === "canonical")) continue;
+    canonicalTags.push(tag);
+  }
+  if (canonicalTags.length === 0) return { error: "Canonical link missing" };
+  if (canonicalTags.length > 1) return { error: "Multiple canonical links" };
+  const href = htmlAttribute(canonicalTags[0]!, "href");
+  if (!href) return { error: "Invalid canonical URL" };
+  try {
+    return { url: new URL(href, baseUrl).toString(), error: "" };
+  } catch {
+    return { error: "Invalid canonical URL" };
+  }
+}
+
+function htmlAttribute(tag: string, name: string): string | undefined {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const match = tag.match(
+    new RegExp(`\\b${escapedName}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "iu"),
+  );
+  return match?.[1] ?? match?.[2] ?? match?.[3];
 }
