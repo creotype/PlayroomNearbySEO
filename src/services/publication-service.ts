@@ -208,22 +208,37 @@ export class PublicationService {
     const publicUrl = publicArticleUrl(frontendBaseUrl, article);
     const verification = await verifyPublicPage(publicUrl);
     const now = new Date().toISOString();
-    await this.store.patchArticle(article.article_id, {
-      status: "published",
-      ghost_post_id: published.id,
-      ghost_updated_at: published.updated_at,
-      ghost_draft_url: published.url,
-      public_url: publicUrl,
-      published_at: published.published_at ?? now,
-      last_error: verification.ok ? "" : verification.message,
-      updated_at: now,
-    });
-    await this.#event(article, "published", "publishing", "published", "Published to Ghost", {
-      hash: currentHash,
-      ghost_post_id: published.id,
-      public_url: publicUrl,
-      verification,
-    });
+    await this.store.patchArticleAndAppendEvent(
+      article.article_id,
+      {
+        status: "published",
+        ghost_post_id: published.id,
+        ghost_updated_at: published.updated_at,
+        ghost_draft_url: published.url,
+        public_url: publicUrl,
+        published_at: published.published_at ?? now,
+        last_error: verification.ok ? "" : verification.message,
+        updated_at: now,
+      },
+      {
+        event_id: randomUUID(),
+        article_id: article.article_id,
+        event_type: "published",
+        from_status: "publishing",
+        to_status: "published",
+        actor_type: "system",
+        actor_id: "publisher",
+        provider: "ghost",
+        message: "Published to Ghost",
+        payload_json: JSON.stringify({
+          hash: currentHash,
+          ghost_post_id: published.id,
+          public_url: publicUrl,
+          verification,
+        }),
+        created_at: now,
+      },
+    );
   }
 
   async #failPublishing(article: Article, message: string): Promise<void> {

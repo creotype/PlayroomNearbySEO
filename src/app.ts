@@ -46,8 +46,8 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
   const scheduler = new Scheduler(config.pollIntervalMs, logger);
   scheduler.add("manual-generator", () => generation.runManualOnce());
   scheduler.add("scheduled-generator", () => generation.runOnce());
-  scheduler.add("review-notifier", () => notifier.runOnce());
   scheduler.add("publisher", () => publication.runOnce());
+  scheduler.add("review-notifier", () => notifier.runOnce());
 
   const healthServer = startHealthServer(config.port, () => readiness, logger);
   await runStartupChecks({ readiness, store, ghost, bot, logger, config });

@@ -378,4 +378,106 @@ describe("PublicationService concurrency hardening", () => {
     expect(current.status).toBe("cancelled");
     expect(ghost.calls).not.toHaveBeenCalled();
   });
+
+  it("atomically records the published article state and its audit event", async () => {
+    let current = approvedArticle();
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const atomicWrites: Array<{
+      patch: Record<string, unknown>;
+      event: Record<string, unknown>;
+    }> = [];
+    const patchArticle = vi.fn(async (_id: string, patch: Record<string, unknown>) => {
+      current = { ...current, ...patch } as Article;
+      return current;
+    });
+    const appendEvent = vi.fn(async (event: Record<string, unknown>) => {
+      events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+    });
+    const store = {
+      getSettings: async () => enabledSettings(),
+      listArticles: async () => [{ ...current }],
+      findArticle: async () => current,
+      listEvents: async () => events,
+      patchArticle,
+      patchArticleAndAppendEvent: async (
+        _id: string,
+        patch: Record<string, unknown>,
+        event: Record<string, unknown>,
+      ) => {
+        atomicWrites.push({ patch, event });
+        current = { ...current, ...patch } as Article;
+        events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+        return current;
+      },
+      appendEvent,
+    } as unknown as GoogleSheetsStore;
+    const draft = {
+      id: "ghost-post-1",
+      title: current.title,
+      slug: "kako-izabrati-igraonicu-rs",
+      status: "draft" as const,
+      url: "https://example.com/internal/ghost-post-1/",
+      updated_at: "2026-08-19T12:00:00.000Z",
+      published_at: null,
+    };
+    const published = {
+      ...draft,
+      status: "published" as const,
+      updated_at: "2026-08-19T12:01:00.000Z",
+      published_at: "2026-08-19T12:01:00.000Z",
+    };
+    const ghost = {
+      findPostBySlug: async () => undefined,
+      readCurrentUser: async () => undefined,
+      createPost: async () => draft,
+      readPost: async () => draft,
+      updatePost: async () => published,
+    } as unknown as GhostAdminClient;
+    const publicUrl = "https://example.com/rs/blog/kako-izabrati-igraonicu";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(`<html><head><link rel="canonical" href="${publicUrl}"></head></html>`, {
+          status: 200,
+        }),
+      ),
+    );
+
+    try {
+      await new PublicationService(store, ghost, config, logger, new KeyedMutex()).runOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(atomicWrites).toHaveLength(1);
+    const atomicWrite = atomicWrites[0]!;
+    expect(atomicWrite.patch).toMatchObject({
+      status: "published",
+      ghost_post_id: published.id,
+      public_url: publicUrl,
+    });
+    expect(atomicWrite.event).toMatchObject({
+      article_id: current.article_id,
+      event_type: "published",
+      from_status: "publishing",
+      to_status: "published",
+      provider: "ghost",
+    });
+    expect(JSON.parse(String(atomicWrite.event.payload_json))).toMatchObject({
+      ghost_post_id: published.id,
+      public_url: publicUrl,
+      verification: {
+        ok: true,
+        status: 200,
+        message: "Public page verified",
+      },
+    });
+    expect(
+      patchArticle.mock.calls.some(([, patch]) => patch.status === "published"),
+    ).toBe(false);
+    expect(
+      appendEvent.mock.calls.some(([event]) => event.event_type === "published"),
+    ).toBe(false);
+    expect(current.status).toBe("published");
+  });
 });

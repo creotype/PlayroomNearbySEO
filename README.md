@@ -26,6 +26,7 @@ pretend those production attestations are complete.
 - Manual edits after approval stop publication with `status=conflict`.
 - Deterministic QA for locale, title, slug, metadata, sources, allow-listed internal links, manual blockers, and score.
 - Ghost 5.x JWT authentication, localized slugs (`-en`, `-rs`), HTML sanitization, draft-first upsert, optimistic `updated_at` lock, and public-page verification.
+- A durable Telegram publication outcome: after Ghost and the public page are verified, the review group receives the canonical article link exactly once per publication event; failures receive an actionable Sheet link instead.
 - OpenAI Responses API generation with web research and strict structured output.
 - Append-only audit events, single-process per-article locking, health endpoints, Docker build, and unit tests.
 - Recovery for stale `publishing` claims, including reconciliation when Ghost was updated before a process crash.

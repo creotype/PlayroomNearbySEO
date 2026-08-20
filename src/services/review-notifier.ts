@@ -3,7 +3,7 @@ import type { AppConfig } from "../config.js";
 import { articleContentHash, stringCell, type SheetRecord } from "../domain/article.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { SeoBot } from "../telegram/bot.js";
-import { articleCard, escapeHtml, keywordSheetUrl } from "../telegram/messages.js";
+import { articleCard, articleSheetUrl, escapeHtml, keywordSheetUrl } from "../telegram/messages.js";
 
 export class ReviewNotifier {
   readonly #clearedReviewMarkup = new Set<number>();
@@ -89,6 +89,10 @@ export class ReviewNotifier {
       }
     }
     await this.#notifyGenerationFailures(chatId);
+    const frontendBaseUrl = stringCell(
+      settings.get(`${this.config.targetEnvironment}_frontend_base_url`),
+    );
+    await this.#notifyPublicationOutcomes(chatId, frontendBaseUrl);
   }
 
   async #notifyGenerationFailures(chatId: number): Promise<void> {
@@ -137,6 +141,162 @@ export class ReviewNotifier {
         );
       }
     }
+  }
+
+  async #notifyPublicationOutcomes(chatId: number, frontendBaseUrl: string): Promise<void> {
+    const articles = await this.store.listArticles(["published", "failed_publish", "conflict"]);
+    for (const article of articles) {
+      try {
+        if (!["published", "failed_publish", "conflict"].includes(article.status)) continue;
+        const events = await this.store.listEvents(article.article_id);
+        const approvedFromTelegram = events.some(
+          (event) =>
+            stringCell(event.event_type) === "approved" &&
+            stringCell(event.provider) === "telegram",
+        );
+        if (!approvedFromTelegram) continue;
+        const expectedEventType = article.status === "published"
+          ? "published"
+          : article.status === "failed_publish"
+            ? "publish_failed"
+            : "publication_conflict";
+        const outcome = [...events]
+          .reverse()
+          .find((event) => stringCell(event.event_type) === expectedEventType);
+        if (!outcome) continue;
+        const outcomeEventId = stringCell(outcome.event_id);
+        if (!outcomeEventId) continue;
+        const notificationEventId = `evt-publication-notified-${outcomeEventId}`;
+        if (events.some((event) => stringCell(event.event_id) === notificationEventId)) continue;
+        const notification = publicationOutcomeMessage(
+          article,
+          outcome,
+          this.config.spreadsheetId,
+          frontendBaseUrl,
+        );
+        const message = await this.bot.api.sendMessage(
+          chatId,
+          notification.text,
+          { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+        );
+        await this.store.appendEvent({
+          event_id: notificationEventId,
+          article_id: article.article_id,
+          event_type: "publication_notified",
+          from_status: article.status,
+          to_status: article.status,
+          actor_type: "system",
+          actor_id: "review-notifier",
+          provider: "telegram",
+          provider_object_id: String(message.message_id),
+          message: `Publication outcome notification sent for ${outcomeEventId}`,
+          payload_json: JSON.stringify({
+            outcome_event_id: outcomeEventId,
+            outcome_type: expectedEventType,
+            public_url: notification.publicUrl ?? null,
+          }),
+          created_at: new Date().toISOString(),
+        });
+      } catch (error) {
+        this.logger.error(
+          { articleId: article.article_id, err: error instanceof Error ? error.message : String(error) },
+          "Publication outcome notification failed",
+        );
+      }
+    }
+  }
+}
+
+function publicationOutcomeMessage(
+  article: SheetRecord,
+  outcome: SheetRecord,
+  spreadsheetId: string,
+  frontendBaseUrl: string,
+): { text: string; publicUrl?: string | undefined } {
+  const sheetUrl = articleSheetUrl(spreadsheetId, article.__rowNumber);
+  if (stringCell(outcome.event_type) === "published") {
+    const payload = publicationEventPayload(outcome);
+    const articleUrl = publicUrlForFrontend(stringCell(article.public_url), frontendBaseUrl);
+    const eventUrl = publicUrlForFrontend(payload.publicUrl ?? "", frontendBaseUrl);
+    const publicUrl = articleUrl && eventUrl && articleUrl === eventUrl ? articleUrl : undefined;
+    if (payload.verificationOk && publicUrl) {
+      return {
+        text: [
+          `✅ <b>${escapeHtml(stringCell(article.article_id))} опубликована в Ghost.</b>`,
+          `<a href="${escapeHtml(publicUrl)}">Открыть статью на сайте</a>`,
+        ].join("\n"),
+        publicUrl,
+      };
+    }
+    const verificationMessage = payload.verificationMessage || stringCell(article.last_error);
+    return {
+      text: [
+        `⚠️ <b>${escapeHtml(stringCell(article.article_id))} отправлена в Ghost, но публичная страница не прошла проверку.</b>`,
+        verificationMessage
+          ? `Причина: ${escapeHtml(verificationMessage)}`
+          : "Публичный адрес не подтверждён или не совпадает с адресом в таблице.",
+        articleUrl
+          ? `<a href="${escapeHtml(articleUrl)}">Проверить публичную страницу</a>`
+          : "",
+        `<a href="${sheetUrl}">Проверить строку в Google Sheets</a>`,
+      ].filter(Boolean).join("\n"),
+      publicUrl: articleUrl,
+    };
+  }
+  if (stringCell(outcome.event_type) === "publication_conflict") {
+    return {
+      text: [
+        `⛔ <b>Публикация остановлена · ${escapeHtml(stringCell(article.article_id))}</b>`,
+        "Текст изменился после согласования или состояние Ghost не совпало с таблицей. Статья не опубликована повторно.",
+        "Исправьте конфликт в таблице и повторите публикацию после проверки.",
+        `<a href="${sheetUrl}">Открыть статью в Google Sheets</a>`,
+      ].join("\n"),
+    };
+  }
+  return {
+    text: [
+      `⛔ <b>Ghost не опубликовал ${escapeHtml(stringCell(article.article_id))}</b>`,
+      stringCell(article.last_error)
+        ? `Причина: ${escapeHtml(stringCell(article.last_error))}`
+        : "Причина записана в журнале событий.",
+      "Исправьте причину в таблице или обратитесь к администратору, затем повторите публикацию.",
+      `<a href="${sheetUrl}">Открыть статью в Google Sheets</a>`,
+    ].join("\n"),
+  };
+}
+
+function publicationEventPayload(event: SheetRecord): {
+  publicUrl?: string | undefined;
+  verificationOk: boolean;
+  verificationMessage?: string | undefined;
+} {
+  try {
+    const payload = JSON.parse(stringCell(event.payload_json)) as {
+      public_url?: unknown;
+      verification?: { ok?: unknown; message?: unknown };
+    };
+    return {
+      publicUrl: typeof payload.public_url === "string" ? payload.public_url : undefined,
+      verificationOk: payload.verification?.ok === true,
+      verificationMessage:
+        typeof payload.verification?.message === "string"
+          ? payload.verification.message
+          : undefined,
+    };
+  } catch {
+    return { verificationOk: false };
+  }
+}
+
+function publicUrlForFrontend(value: string, frontendBaseUrl: string): string | undefined {
+  try {
+    const parsed = new URL(value);
+    const frontend = new URL(frontendBaseUrl);
+    if (!["http:", "https:"].includes(parsed.protocol)) return undefined;
+    if (!["http:", "https:"].includes(frontend.protocol)) return undefined;
+    return parsed.origin === frontend.origin ? parsed.toString() : undefined;
+  } catch {
+    return undefined;
   }
 }
 

@@ -291,7 +291,10 @@ function generationActorFromContext(ctx: Context): {
 
 async function replyApprovalResult(ctx: Context, result: ApprovalResult): Promise<void> {
   if (result.outcome === "approved") {
-    await ctx.reply(`✅ <b>${escapeHtml(result.article.article_id)}</b> согласована.`, { parse_mode: "HTML" });
+    await ctx.reply(
+      `✅ <b>${escapeHtml(result.article.article_id)}</b> согласована. После публикации в Ghost пришлю отдельное сообщение с готовой ссылкой.`,
+      { parse_mode: "HTML" },
+    );
     return;
   }
   if (result.outcome === "already_approved") {
