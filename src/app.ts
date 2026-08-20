@@ -95,7 +95,7 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
   };
 }
 
-async function runStartupChecks(options: {
+export async function runStartupChecks(options: {
   readiness: ReadinessState;
   store: GoogleSheetsStore;
   ghost: GhostAdminClient;
@@ -106,7 +106,7 @@ async function runStartupChecks(options: {
   const { readiness, store, ghost, bot, logger, config } = options;
   const checks = await Promise.allSettled([
     verifySheets(store, config),
-    ghost.readSite(),
+    verifyGhost(ghost),
     verifyTelegram(bot, logger),
   ]);
   const names = ["google_sheets", "ghost", "telegram"] as const;
@@ -117,7 +117,7 @@ async function runStartupChecks(options: {
     } else {
       readiness.checks[name] = {
         ok: false,
-        detail: result.reason instanceof Error ? result.reason.message : String(result.reason),
+        detail: startupErrorDetail(result.reason, config),
       };
     }
   });
@@ -130,6 +130,14 @@ async function runStartupChecks(options: {
     { dryRun: config.dryRun, ghostPublishingAllowed: config.allowGhostPublish, generatorConfigured: Boolean(config.openAiApiKey) },
     "Startup checks passed",
   );
+}
+
+export async function verifyGhost(ghost: GhostAdminClient): Promise<void> {
+  const [, currentUser] = await Promise.all([ghost.readSite(), ghost.readCurrentUser()]);
+  if (!currentUser) throw new Error("Ghost current user was not returned");
+  if (currentUser.status.trim().toLowerCase() !== "active") {
+    throw new Error("Ghost current user is not active");
+  }
 }
 
 async function verifySheets(store: GoogleSheetsStore, config: AppConfig): Promise<void> {
@@ -151,6 +159,22 @@ async function verifyTelegram(bot: SeoBot, logger: Logger): Promise<void> {
       "Telegram command menu update failed; command handlers remain available",
     );
   }
+}
+
+function startupErrorDetail(error: unknown, config: AppConfig): string {
+  let detail = error instanceof Error ? error.message : String(error);
+  const ghostSecret = config.ghostAdminApiKey.split(":")[1];
+  const secrets = [
+    config.ghostAdminApiKey,
+    ghostSecret,
+    config.telegramBotToken,
+    config.openAiApiKey,
+    config.googleServiceAccountJson,
+  ];
+  for (const secret of secrets) {
+    if (secret && secret.length >= 6) detail = detail.replaceAll(secret, "[REDACTED]");
+  }
+  return detail.slice(0, 500);
 }
 
 async function closeServer(server: Server): Promise<void> {
