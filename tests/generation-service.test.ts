@@ -872,6 +872,7 @@ describe("manual generation worker", () => {
     expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
     await test.service.runManualOnce();
     expect(test.articleRows[0]).toMatchObject({
+      status: "failed_qa",
       qa_status: "fail",
       qa_blockers: "missing_authoritative_source",
       manual_required: true,
@@ -893,6 +894,7 @@ describe("manual generation worker", () => {
     expect(String(test.articleRows[0]?.qa_blockers)).toContain("malformed_markdown_link");
     expect(String(test.articleRows[0]?.qa_blockers)).toContain("external_url_in_body");
     expect(String(test.articleRows[0]?.qa_blockers)).toContain("tracking_parameters_in_source_url");
+    expect(test.articleRows[0]?.status).toBe("failed_qa");
     expect(test.articleRows[0]?.qa_status).toBe("fail");
   });
 
@@ -905,6 +907,24 @@ describe("manual generation worker", () => {
     expect(test.generate).toHaveBeenCalledTimes(1);
     expect(keyword.status).toBe("paused");
     expect(test.articleRows).toHaveLength(0);
+  });
+
+  it("does not replay a paid initial attempt after a restart with no committed article", async () => {
+    const keyword = readyKeyword();
+    const test = setup({ keywords: [keyword] });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    test.events.push({
+      __rowNumber: test.events.length + 2,
+      event_id: "evt-ambiguous-paid-attempt",
+      article_id: String(keyword.article_id),
+      event_type: "generation_attempt_started",
+    });
+
+    await test.service.runManualOnce();
+
+    expect(test.generate).not.toHaveBeenCalled();
+    expect(keyword.status).toBe("paused");
+    expect(test.events.some((event) => event.event_type === "generation_failed")).toBe(true);
   });
 
   it("stores the generated Ghost hero URL and alt text before review", async () => {
@@ -1084,7 +1104,10 @@ describe("article regeneration", () => {
   });
 
   it("records an explicit system actor for an administrative repair", async () => {
-    const test = setup({ articles: [reviewArticle()] });
+    const test = setup({
+      articles: [reviewArticle({ manual_required: false })],
+      settings: settings({ generation_enabled: true }),
+    });
 
     await test.service.regenerateArticle({
       ...regenerationRequest,
@@ -1104,6 +1127,30 @@ describe("article regeneration", () => {
         provider_object_id: "system:repair-v2",
       }),
     );
+  });
+
+  it("keeps a semantic manual gate sticky across an automatic repair", async () => {
+    const test = setup({
+      articles: [reviewArticle({ manual_required: true })],
+      settings: settings({ generation_enabled: true }),
+    });
+
+    const result = await test.service.regenerateArticle({
+      ...regenerationRequest,
+      actorId: "auto-qa-repair",
+      actorName: "Automatic QA repair",
+      actorType: "system",
+      provider: "system",
+      providerObjectId: "sticky-repair",
+    });
+
+    expect(result).toMatchObject({ outcome: "regenerated" });
+    expect(test.articleRows[0]).toMatchObject({
+      status: "failed_qa",
+      qa_status: "fail",
+      manual_required: true,
+    });
+    expect(String(test.articleRows[0]?.qa_blockers)).toContain("manual_required");
   });
 
   it("uses the shared article mutex before reading or replacing the draft", async () => {
@@ -1142,7 +1189,10 @@ describe("article regeneration", () => {
 
     expect(test.articleRows[0]?.body_markdown).toBe(oldBody);
     expect(test.articleRows[0]?.revision_count).toBe(0);
-    expect(test.events).toHaveLength(0);
+    expect(test.events).toContainEqual(
+      expect.objectContaining({ event_type: "regeneration_attempt_started" }),
+    );
+    expect(test.events.some((event) => event.event_type === "regenerated")).toBe(false);
   });
 
   it("refuses approved and later workflow states before calling OpenAI", async () => {
@@ -1182,6 +1232,7 @@ describe("article regeneration", () => {
     });
     await test.service.regenerateArticle(regenerationRequest);
     expect(test.articleRows[0]).toMatchObject({
+      status: "failed_qa",
       qa_status: "fail",
       qa_blockers: "missing_authoritative_source",
       manual_required: true,

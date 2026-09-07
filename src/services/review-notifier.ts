@@ -1,6 +1,6 @@
 import type { Logger } from "pino";
 import type { AppConfig } from "../config.js";
-import { articleContentHash, stringCell, type SheetRecord } from "../domain/article.js";
+import { articleContentHash, booleanCell, stringCell, type SheetRecord } from "../domain/article.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { SeoBot } from "../telegram/bot.js";
 import { articleCard, articleSheetUrl, escapeHtml, keywordSheetUrl } from "../telegram/messages.js";
@@ -29,7 +29,9 @@ export class ReviewNotifier {
       ),
       publicationTime: stringCell(settings.get("publication_time")) || this.config.publicationTime || "10:00",
     };
-    const articles = await this.store.listArticles(["needs_review"]);
+    const articles = (await this.store.listArticles(["needs_review"]))
+      .filter((article) => stringCell(article.qa_status) === "pass")
+      .filter((article) => !booleanCell(article.manual_required));
     for (const article of articles) {
       const currentHash = articleContentHash(article);
       const existingMessageId = Number(article.telegram_message_id);

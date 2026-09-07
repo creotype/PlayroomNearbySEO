@@ -10,6 +10,7 @@ import { startHealthServer, type ReadinessState } from "./health.js";
 import { KeyedMutex } from "./lib/keyed-mutex.js";
 import { GoogleSheetsStore } from "./sheets/google-sheets.js";
 import { ApprovalService } from "./services/approval-service.js";
+import { AutoQaRepairService } from "./services/auto-qa-repair-service.js";
 import { EditorialAutomationService } from "./services/editorial-automation-service.js";
 import { GenerationService } from "./services/generation-service.js";
 import { HeroImageService } from "./services/hero-image-service.js";
@@ -72,6 +73,7 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
   const bot = createTelegramBot({ config, store, approvals, generation, logger });
   const publication = new PublicationService(store, ghost, config, logger, workflowMutex);
   const notifier = new ReviewNotifier(store, bot, config, logger);
+  const autoQaRepair = new AutoQaRepairService(store, generation, bot, config, logger);
   const editorial = new EditorialAutomationService(
     store,
     generation,
@@ -88,6 +90,7 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
   } else {
     scheduler.add("scheduled-generator", () => generation.runOnce());
   }
+  scheduler.add("auto-qa-repair", () => autoQaRepair.runOnce());
   scheduler.add("publisher", () => publication.runOnce());
   scheduler.add("review-notifier", () => notifier.runOnce());
 

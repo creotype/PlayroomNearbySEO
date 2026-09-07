@@ -453,7 +453,7 @@ function legacyCallbackUpdate(action: "approve" | "regenerate" | "status") {
 }
 
 describe("minimal Telegram review workflow", () => {
-  it("/help documents commands, editorial automation, review SLA, QA, and publication timing", async () => {
+  it("/help documents commands, editorial automation, review SLA, internal checks, and publication timing", async () => {
     const test = botHarness();
     await test.bot.handleUpdate(commandUpdate("help"));
 
@@ -469,7 +469,8 @@ describe("minimal Telegram review workflow", () => {
     expect(help.toLowerCase()).toContain("пятницам");
     expect(help).toContain("10:00");
     expect(help).toContain("48 часов");
-    expect(help).toContain("QA");
+    expect(help).toContain("внутреннюю проверку");
+    expect(help).toContain("сам запускаю одну доработку");
     expect(help.toLowerCase()).toContain("картин");
     expect(help).toContain("Ghost");
     expect(help.toLowerCase()).toContain("технической ошибке");

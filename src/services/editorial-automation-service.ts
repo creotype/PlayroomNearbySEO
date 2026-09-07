@@ -248,7 +248,7 @@ export class EditorialAutomationService {
         chatId,
         [
           `⛔ <b>${escapeHtml(article.article_id)} не опубликована автоматически.</b>`,
-          `После ${ttlHours} часов QA всё ещё блокирует статью: ${escapeHtml(stringCell(article.qa_blockers) || "неизвестная ошибка")}.`,
+          `После ${ttlHours} часов финальная внутренняя проверка всё ещё требует правок. Технические детали записаны в таблице.`,
           "Исправьте статью в таблице и отправьте /regenerate с комментарием либо /approve после исправления.",
           `<a href="${articleSheetUrl(this.config.spreadsheetId, article.__rowNumber)}">Открыть статью в Google Sheets</a>`,
         ].join("\n"),

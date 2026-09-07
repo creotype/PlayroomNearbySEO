@@ -462,6 +462,42 @@ describe("ReviewNotifier publication outcomes", () => {
 });
 
 describe("ReviewNotifier review cards", () => {
+  it("does not expose a failed internal QA draft or its blocker codes", async () => {
+    const article = {
+      __rowNumber: 2,
+      article_id: "SEO-TG-FAILED",
+      primary_keyword: "igraonice za decu Beograd",
+      locale: "sr",
+      status: "needs_review",
+      title: "Igraonice za decu u Beogradu",
+      slug: "igraonice-za-decu-u-beogradu",
+      body_markdown: "draft",
+      qa_status: "fail",
+      qa_blockers: "quality_score_below_threshold,missing_authoritative_source",
+      manual_required: false,
+      quality_score: 0.9,
+      telegram_message_id: "",
+      content_hash: "",
+    } as SheetRecord;
+    const sendMessage = vi.fn(async (..._args: unknown[]) => ({ message_id: 123 }));
+    const store = {
+      getSettings: async () => new Map([["telegram_chat_id", -5484259760]]),
+      listArticles: async (statuses?: readonly string[]) =>
+        statuses?.includes("needs_review") ? [article] : [],
+      listKeywords: async () => [],
+    } as unknown as GoogleSheetsStore;
+    const notifier = new ReviewNotifier(
+      store,
+      { api: { sendMessage } } as unknown as SeoBot,
+      config,
+      { error: vi.fn() } as unknown as Logger,
+    );
+
+    await notifier.runOnce();
+
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   it("sends a button-free card that teaches the two current-article commands", async () => {
     const article = {
       __rowNumber: 2,
@@ -505,6 +541,8 @@ describe("ReviewNotifier review cards", () => {
     expect(text).toContain("/approve");
     expect(text).toContain("/approve — согласовать эту статью");
     expect(text.toLowerCase()).toContain("коммент");
+    expect(text).not.toContain("QA:");
+    expect(text).not.toContain("Blockers:");
     expect(options).not.toHaveProperty("reply_markup");
     expect(JSON.stringify(sendMessage.mock.calls[0])).not.toContain("callback_data");
     expect(patchArticle).toHaveBeenCalledWith(

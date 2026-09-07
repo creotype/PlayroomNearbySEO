@@ -87,6 +87,8 @@ export type RegenerationResult =
       reason:
         | "generator_not_configured"
         | "manual_generation_disabled"
+        | "automatic_generation_disabled"
+        | "ambiguous_attempt"
         | "invalid_status"
         | "locale_disabled"
         | "ru_disabled"
@@ -293,7 +295,11 @@ export class GenerationService {
       }
 
       const settings = await this.store.getSettings();
-      if (!manualGenerationIsEnabled(this.config, settings)) {
+      if (provider === "system") {
+        if (!booleanCell(settings.get("generation_enabled") ?? false)) {
+          return { outcome: "blocked", reason: "automatic_generation_disabled", article };
+        }
+      } else if (!manualGenerationIsEnabled(this.config, settings)) {
         return { outcome: "blocked", reason: "manual_generation_disabled", article };
       }
       const [guardrails, links] = await Promise.all([
@@ -320,9 +326,32 @@ export class GenerationService {
       if (allowedLinks.length === 0) {
         return { outcome: "blocked", reason: "no_internal_links", article };
       }
+      const attemptEventId = stableEventId("regeneration_attempt_started", commandId);
+      if (events.some((event) => stringCell(event.event_id) === attemptEventId)) {
+        // The previous process may have received a paid response without committing it.
+        // Replaying would be financially ambiguous, so require a new explicit command.
+        return { outcome: "blocked", reason: "ambiguous_attempt", article };
+      }
       const currentQuality = await this.qualityGate.evaluate({
         ...article,
         manual_required: false,
+      });
+      await this.store.appendEvent({
+        event_id: attemptEventId,
+        article_id: article.article_id,
+        event_type: "regeneration_attempt_started",
+        from_status: article.status,
+        to_status: article.status,
+        actor_type: request.actorType ?? "telegram_user",
+        actor_id: String(request.actorId),
+        provider,
+        provider_object_id: commandId,
+        message: `Paid regeneration attempt started by ${request.actorName}`,
+        payload_json: JSON.stringify({
+          base_hash: articleContentHash(article),
+          model: this.config.openAiModel,
+        }),
+        created_at: new Date().toISOString(),
       });
       const generated = await this.generator!.generate({
         keyword: {
@@ -354,16 +383,22 @@ export class GenerationService {
       const heroImageFields = await this.#prepareHeroImage(candidate);
       candidate = { ...candidate, ...heroImageFields } as Article;
       const quality = await this.#evaluateGeneratedCandidate(candidate, generated.qa_blockers);
+      const stickyManualRequired = provider === "system" && booleanCell(article.manual_required);
+      const manualRequired = quality.manualRequired || stickyManualRequired;
+      const blockers = stickyManualRequired && !quality.blockers.includes("manual_required")
+        ? [...quality.blockers, "manual_required"].sort()
+        : quality.blockers;
+      const finalStatus = blockers.length === 0 ? "needs_review" : "failed_qa";
       const revisionCount = numberCell(article.revision_count) + 1;
       const updated = await this.store.patchArticleAndAppendEvent(
         article.article_id,
         {
           ...generatedFields,
           ...heroImageFields,
-          status: "needs_review",
-          qa_status: quality.blockers.length === 0 ? "pass" : "fail",
-          qa_blockers: quality.blockers.join(","),
-          manual_required: quality.manualRequired,
+          status: finalStatus,
+          qa_status: blockers.length === 0 ? "pass" : "fail",
+          qa_blockers: blockers.join(","),
+          manual_required: manualRequired,
           revision_count: revisionCount,
           content_hash: "",
           approved_by: "",
@@ -382,7 +417,7 @@ export class GenerationService {
           article_id: article.article_id,
           event_type: "regenerated",
           from_status: article.status,
-          to_status: "needs_review",
+          to_status: finalStatus,
           actor_type: request.actorType ?? "telegram_user",
           actor_id: String(request.actorId),
           provider,
@@ -393,7 +428,7 @@ export class GenerationService {
             revision_count: revisionCount,
             feedback: stringCell(request.feedback) || null,
             model: this.config.openAiModel,
-            qa_blockers: quality.blockers,
+            qa_blockers: blockers,
           }),
           created_at: now,
         },
@@ -529,7 +564,7 @@ export class GenerationService {
     const articleId = stringCell(keyword.article_id) || createArticleId();
     const existingArticle = await this.store.findArticle(articleId);
     if (existingArticle) {
-      await this.#completeKeyword(keyword, articleId);
+      await this.#completeKeyword(keyword, articleId, existingArticle.status);
       return;
     }
     const priorEvents = await this.store.listEvents(articleId);
@@ -544,6 +579,15 @@ export class GenerationService {
       });
       return;
     }
+    if (
+      priorEvents.some((event) => stringCell(event.event_type) === "generation_attempt_started")
+    ) {
+      await this.#failKeyword(
+        keyword,
+        new Error("A previous paid generation attempt ended without a committed article; automatic replay is disabled"),
+      );
+      return;
+    }
 
     let generated;
     try {
@@ -552,6 +596,19 @@ export class GenerationService {
         this.store.listLinks(),
       ]);
       const targetWords = numberCell(settings.get("default_article_length_words")) || 1_200;
+      await this.store.appendEvent({
+        event_id: stableEventId("generation_attempt_started", articleId),
+        article_id: articleId,
+        event_type: "generation_attempt_started",
+        from_status: CLAIMED_STATUS,
+        to_status: CLAIMED_STATUS,
+        actor_type: "system",
+        actor_id: "generator",
+        provider: "openai",
+        message: `Paid generation attempt started for keyword ${keywordId}`,
+        payload_json: JSON.stringify({ keyword_id: keywordId, model: this.config.openAiModel }),
+        created_at: new Date().toISOString(),
+      });
       generated = await this.generator!.generate({
         keyword,
         guardrails,
@@ -609,6 +666,10 @@ export class GenerationService {
       await this.#failKeyword(keyword, error);
       return;
     }
+    const finalStatus = stringCell(values.qa_status) === "pass" && !booleanCell(values.manual_required)
+      ? "needs_review"
+      : "failed_qa";
+    values.status = finalStatus;
     values.content_hash = articleContentHash({ ...values, __rowNumber: 0 } as SheetRecord);
 
     try {
@@ -621,10 +682,14 @@ export class GenerationService {
       }
       this.logger.warn({ keywordId, articleId }, "Article append response failed but the article exists");
     }
-    await this.#completeKeyword(keyword, articleId);
+    await this.#completeKeyword(keyword, articleId, finalStatus);
   }
 
-  async #completeKeyword(keyword: SheetRecord, articleId: string): Promise<void> {
+  async #completeKeyword(
+    keyword: SheetRecord,
+    articleId: string,
+    articleStatus: Article["status"] = "needs_review",
+  ): Promise<void> {
     const keywordId = stringCell(keyword.keyword_id);
     const now = new Date().toISOString();
     const eventId = stableEventId("generated", articleId);
@@ -641,12 +706,16 @@ export class GenerationService {
         article_id: articleId,
         event_type: "generated",
         from_status: CLAIMED_STATUS,
-        to_status: "needs_review",
+        to_status: articleStatus,
         actor_type: "system",
         actor_id: "generator",
         provider: "openai",
         message: `Generated from keyword ${keywordId}`,
-        payload_json: JSON.stringify({ keyword_id: keywordId, model: this.config.openAiModel }),
+        payload_json: JSON.stringify({
+          keyword_id: keywordId,
+          model: this.config.openAiModel,
+          article_status: articleStatus,
+        }),
         created_at: now,
       },
     );

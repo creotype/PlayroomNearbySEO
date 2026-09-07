@@ -1,5 +1,5 @@
 import type { Article } from "../domain/article.js";
-import { booleanCell, displayDateCell, numberCell, stringCell } from "../domain/article.js";
+import { booleanCell, displayDateCell, stringCell } from "../domain/article.js";
 
 const KEYWORDS_SHEET_GID = 910000002;
 const LINK_INVENTORY_SHEET_GID = 910000004;
@@ -32,34 +32,29 @@ export function articleCard(
   const row = article.__rowNumber;
   const sheetUrl = articleSheetUrl(spreadsheetId, row);
   const schedule = displayDateCell(article.scheduled_publish_at) || "после согласования";
-  const blockers = stringCell(article.qa_blockers);
-  const canApprove = stringCell(article.qa_status) === "pass" && !booleanCell(article.manual_required);
   return [
     `📝 <b>SEO draft · ${escapeHtml(article.article_id)}</b>`,
     `${escapeHtml(article.locale.toUpperCase())} · ${escapeHtml(stringCell(article.primary_keyword))}`,
     `<b>Title:</b> ${escapeHtml(article.title)}`,
-    `<b>QA:</b> ${numberCell(article.quality_score).toFixed(1)}/10 · ${escapeHtml(stringCell(article.qa_status))}`,
-    blockers ? `<b>Blockers:</b> ${escapeHtml(blockers)}` : "",
+    "✅ Внутренняя проверка пройдена — статья готова к вашему ревью.",
     `<b>Publish:</b> ${escapeHtml(schedule)}`,
     "",
     `<a href="${sheetUrl}">Открыть строку в Google Sheets</a>`,
     "",
     `⏳ На проверку — ${reviewPolicy.deadlineHours ?? 48} часов с момента этой карточки. Затем статья будет автоматически согласована и поставлена на ближайшие ${escapeHtml(reviewPolicy.publicationTime ?? "10:00")}.`,
     "",
-    canApprove
-      ? "/regenerate комментарий — переписать эту статью\n/approve — согласовать эту статью"
-      : "/regenerate комментарий — переписать эту статью. /approve останется заблокирован до успешной QA.",
+    "/regenerate комментарий — переписать эту статью\n/approve — согласовать эту статью",
   ]
     .filter(Boolean)
     .join("\n");
 }
 
 export function articleStatusMessage(article: Article): string {
+  const ready = stringCell(article.qa_status) === "pass" && !booleanCell(article.manual_required);
   return [
     `ℹ️ <b>${escapeHtml(article.article_id)}</b>`,
     `Status: <code>${escapeHtml(article.status)}</code>`,
-    `QA: ${numberCell(article.quality_score).toFixed(1)}/10 · ${escapeHtml(stringCell(article.qa_status))}`,
-    stringCell(article.qa_blockers) ? `Blockers: ${escapeHtml(stringCell(article.qa_blockers))}` : "",
+    ready ? "✅ Статья готова к согласованию." : "🛠 Статья ещё проходит внутреннюю доработку.",
     stringCell(article.public_url) ? `<a href="${escapeHtml(stringCell(article.public_url))}">Открыть статью</a>` : "",
   ]
     .filter(Boolean)

@@ -19,7 +19,9 @@ export const generatedArticleResponseSchema = z.object({
   // Keep the wire schema format-free and apply URL validation after parsing.
   source_urls: z.array(z.string().min(8).max(2_048)).min(1),
   internal_links: z.array(z.string().min(8).max(2_048)).min(1),
-  quality_score: z.number().min(0).max(10),
+  quality_score: z.number().min(0).max(10).describe(
+    "Editorial quality score on a 0 to 10 scale. Never use a 0 to 1 probability scale.",
+  ),
   qa_blockers: z.array(generatedQaBlockerSchema).max(GENERATED_QA_BLOCKER_CODES.length),
 });
 
@@ -37,7 +39,9 @@ export class OpenAiArticleGenerator {
     apiKey: string,
     private readonly model: string,
   ) {
-    this.#client = new OpenAI({ apiKey });
+    // A model/network failure is financially ambiguous. Do not let the SDK turn one
+    // editorial attempt into several paid requests behind our own bounded workflow.
+    this.#client = new OpenAI({ apiKey, maxRetries: 0, timeout: 300_000 });
   }
 
   async generate(input: {
@@ -102,6 +106,7 @@ export class OpenAiArticleGenerator {
             "Serbian content uses Latin script unless the brief explicitly requests Cyrillic.",
             "Body must be Markdown with one H1-equivalent title omitted from the body, descriptive H2/H3 sections, practical guidance, and a concise conclusion.",
             "The meta description must be a complete natural sentence. Never truncate a word or sentence to meet the character limit; aim for 120-150 characters.",
+            "quality_score is an editorial score from 0 to 10, where 10 is excellent. Never return a probability or a 0-to-1 value. A clean publication-ready draft should normally score 8.0-10.0; a score below 8.0 means the draft still needs correction.",
             "Revise the draft to satisfy every mandatory guardrail before returning it. qa_blockers is only for concrete defects that truly remain in the returned draft; never copy, quote, paraphrase, or list the guardrail instructions themselves.",
             `qa_blockers may contain only these machine codes: ${GENERATED_QA_BLOCKER_CODES.join(", ")}. Return [] when the submitted draft complies.`,
           ].join("\n"),

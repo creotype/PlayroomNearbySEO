@@ -68,8 +68,9 @@ export function createTelegramBot(options: {
         "<b>Проверка и публикация</b>",
         "",
         "На проверку даётся 48 часов с момента появления карточки. Успешный /regenerate обновляет эту же карточку и запускает новые 48 часов.",
-        "/approve или истечение 48 часов запускают финальную QA и ставят прошедшую проверку статью на ближайшие будущие 10:00. Публикация может быть в любой день, но назначается только на 10:00 по Белграду; технический запуск может занять до 15 минут.",
-        "Если QA не пройдена, автоматической публикации не будет — я покажу причины и ссылку на строку.",
+        "/approve или истечение 48 часов запускают финальную внутреннюю проверку и ставят готовую статью на ближайшие будущие 10:00. Публикация может быть в любой день, но назначается только на 10:00 по Белграду; технический запуск может занять до 15 минут.",
+        "Если черновик не проходит внутреннюю проверку, я сам запускаю одну доработку и пишу в чат, что занят исправлением. Технические причины в чат не вываливаю.",
+        "Если автодоработка не помогла, публикация останется заблокированной: я дам понятную инструкцию и ссылку на строку. Тогда отправьте /regenerate и сразу напишите замечания.",
         "",
         "Каждая статья получает тематическую картинку в фирменной оранжево-жёлтой гамме. После успешной публикации в Ghost я пришлю прямую ссылку на статью на сайте. При технической ошибке покажу причину и дам ссылку на нужную строку таблицы.",
       ].join("\n"),
@@ -128,7 +129,7 @@ export function createTelegramBot(options: {
     }
     if (article.status === "failed_qa") {
       await ctx.reply(
-        `⛔ <b>${escapeHtml(article.article_id)}</b> не прошла QA. Сначала отправьте <code>/regenerate ваш комментарий</code>.`,
+        `🛠 <b>${escapeHtml(article.article_id)}</b> ещё проходит внутреннюю доработку. Пока согласовывать её не нужно; если бот попросит ручную правку — отправьте <code>/regenerate ваш комментарий</code>.`,
         { parse_mode: "HTML" },
       );
       return;
@@ -319,7 +320,7 @@ async function replyApprovalResult(ctx: Context, result: ApprovalResult): Promis
   }
   if (result.outcome === "blocked") {
     await ctx.reply(
-      `⛔ Согласование не выполнено.\nQA blockers: <code>${escapeHtml(result.quality.blockers.join(", "))}</code>`,
+      "🛠 Статья ещё не готова к согласованию. Я не отправлю её на публикацию, пока внутренняя проверка не будет пройдена.",
       { parse_mode: "HTML" },
     );
     return;
@@ -377,7 +378,7 @@ async function replyGenerationResult(
     [
       `🧠 Взял следующий ключ «${escapeHtml(result.keyword)}» · ${escapeHtml(result.locale.toUpperCase())}`,
       `Keyword ID: <code>${escapeHtml(result.keywordId)}</code>`,
-      "Карточка появится в этой группе после генерации и QA.",
+      "Карточка появится в этой группе после генерации и внутренней проверки.",
     ].join("\n"),
     { parse_mode: "HTML" },
   );
@@ -391,6 +392,12 @@ async function replyRegenerationResult(ctx: Context, result: RegenerationResult)
     }
     if (result.reason === "manual_generation_disabled") {
       await ctx.reply("⛔ Исправление ИИ сейчас выключено администратором.");
+      return;
+    }
+    if (result.reason === "ambiguous_attempt") {
+      await ctx.reply(
+        "⚠️ Предыдущая попытка прервалась в неопределённом состоянии, поэтому я не списываю деньги повторно автоматически. Отправьте новый /regenerate с тем же комментарием, если хотите повторить.",
+      );
       return;
     }
     if (result.reason === "ru_disabled") {
@@ -420,8 +427,8 @@ async function replyRegenerationResult(ctx: Context, result: RegenerationResult)
   const passed = stringCell(result.article.qa_status) === "pass" && !booleanCell(result.article.manual_required);
   await ctx.reply(
     passed
-      ? `✅ <b>${escapeHtml(result.article.article_id)}</b> исправлена и прошла QA. Карточка обновится автоматически.`
-      : `⚠️ <b>${escapeHtml(result.article.article_id)}</b> обновлена, но QA всё ещё нашла замечания. Карточка обновится автоматически.`,
+      ? `✅ <b>${escapeHtml(result.article.article_id)}</b> исправлена и прошла внутреннюю проверку. Карточка обновится автоматически.`
+      : `🛠 <b>${escapeHtml(result.article.article_id)}</b> обновлена, но ещё требует доработки. Я автоматически попробую исправить замечания; пока ничего делать не нужно.`,
     { parse_mode: "HTML" },
   );
 }
