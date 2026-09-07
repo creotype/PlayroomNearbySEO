@@ -4,6 +4,7 @@ import type { AppConfig } from "../config.js";
 import {
   articleContentHash,
   booleanCell,
+  numberCell,
   stringCell,
   type Article,
   type CellValue,
@@ -20,6 +21,7 @@ const REPAIRABLE_STATUSES = ["needs_review", "failed_qa"] as const;
 const TERMINAL_EVENT_TYPES = new Set([
   "auto_qa_repair_completed",
   "auto_qa_repair_exhausted",
+  "auto_qa_repair_superseded",
 ]);
 
 type Delivery = {
@@ -70,7 +72,6 @@ export class AutoQaRepairService {
       Number.isSafeInteger(configuredChatId) ? configuredChatId : undefined
     );
     const candidates = (await this.store.listArticles([...REPAIRABLE_STATUSES]))
-      .filter((article) => stringCell(article.qa_status) === "fail")
       .sort((left, right) => left.__rowNumber - right.__rowNumber);
 
     for (const candidate of candidates) {
@@ -90,7 +91,7 @@ export class AutoQaRepairService {
 
   async #processArticle(articleId: string, chatId: number | undefined): Promise<void> {
     let article = await this.store.findArticle(articleId);
-    if (!isRepairCandidate(article)) return;
+    if (!isActiveRepairArticle(article)) return;
 
     let events = await this.store.listEvents(articleId);
     const currentHash = articleContentHash(article);
@@ -106,12 +107,14 @@ export class AutoQaRepairService {
       .reverse()
       .find((event) =>
         stringCell(event.event_type) === "auto_qa_repair_started" &&
-        !terminalForStartedEvent(events, stringCell(event.event_id)),
+        !terminalForStartedEvent(events, stringCell(event.event_id)) &&
+        unfinishedStartApplies(event, events, article!, currentHash),
       );
     if (unfinishedStart) {
       await this.#recoverUnfinished(article, unfinishedStart, events, chatId);
       return;
     }
+    if (!isRepairCandidate(article)) return;
 
     const identity = repairIdentity(article.article_id, currentHash);
     const progress = events.some((event) => stringCell(event.event_id) === identity.progressEventId)
@@ -131,10 +134,9 @@ export class AutoQaRepairService {
     const started = await this.store.patchArticleAndAppendEvent(
       article.article_id,
       {
-        status: "failed_qa",
-        // failed_qa already blocks approval. Preserve this flag so a repair of a
-        // purely mechanical defect does not become sticky-manual in GenerationService.
-        manual_required: article.manual_required ?? false,
+        // Do not mutate editorial state before the paid call. A concurrent human
+        // regeneration may already hold the shared article lock; the expected
+        // hash below is what authorizes this automatic attempt.
         ...(progress.messageId ? { telegram_message_id: progress.messageId } : {}),
         updated_at: startedAt,
       },
@@ -143,7 +145,7 @@ export class AutoQaRepairService {
         article_id: article.article_id,
         event_type: "auto_qa_repair_started",
         from_status: article.status,
-        to_status: "failed_qa",
+        to_status: article.status,
         actor_type: "system",
         actor_id: ACTOR_ID,
         provider: "openai",
@@ -171,6 +173,8 @@ export class AutoQaRepairService {
         providerObjectId: identity.providerObjectId,
         actorType: "system",
         provider: "system",
+        expectedContentHash: identity.inputHash,
+        requireQaFailure: true,
       });
     } catch (error) {
       failure = error;
@@ -190,6 +194,14 @@ export class AutoQaRepairService {
         chatId,
         result?.outcome ?? "recovered_regenerated",
       );
+      return;
+    }
+
+    if (
+      result?.outcome === "blocked" &&
+      ["stale_article", "invalid_status"].includes(result.reason)
+    ) {
+      await this.#finishSuperseded(article, identity, events, result.reason);
       return;
     }
 
@@ -279,8 +291,13 @@ export class AutoQaRepairService {
     chatId: number | undefined,
   ): Promise<void> {
     const identity = identityFromStarted(article.article_id, started);
-    if (matchingRegeneratedEvent(events, identity.providerObjectId)) {
+    const regenerated = matchingRegeneratedEvent(events, identity.providerObjectId);
+    if (regenerated && regeneratedMatchesArticle(regenerated, article)) {
       await this.#finishAttempt(article, identity, events, chatId, "recovered_regenerated");
+      return;
+    }
+    if (identity.inputHash !== articleContentHash(article)) {
+      await this.#finishSuperseded(article, identity, events, "newer_article_revision");
       return;
     }
     await this.#finishExhausted(
@@ -381,6 +398,41 @@ export class AutoQaRepairService {
     await this.#notifyExhausted(failedArticle, terminal, events, chatId);
   }
 
+  async #finishSuperseded(
+    article: Article,
+    identity: RepairIdentity,
+    events: SheetRecord[],
+    reason: string,
+  ): Promise<void> {
+    const terminalId = stableEventId("auto-qa-repair-superseded", identity.startedEventId);
+    if (events.some((event) => stringCell(event.event_id) === terminalId)) return;
+    const latest = await this.store.findArticle(article.article_id) ?? article;
+    const now = new Date().toISOString();
+    await this.store.patchArticleAndAppendEvent(
+      latest.article_id,
+      {},
+      {
+        event_id: terminalId,
+        article_id: latest.article_id,
+        event_type: "auto_qa_repair_superseded",
+        from_status: latest.status,
+        to_status: latest.status,
+        actor_type: "system",
+        actor_id: ACTOR_ID,
+        provider: "system",
+        provider_object_id: identity.providerObjectId,
+        message: "Automatic QA repair skipped because the article changed",
+        payload_json: JSON.stringify({
+          input_hash: identity.inputHash,
+          outcome: "superseded",
+          detail: reason,
+          started_event_id: identity.startedEventId,
+        }),
+        created_at: now,
+      },
+    );
+  }
+
   async #notifyExhausted(
     article: Article,
     terminal: SheetRecord,
@@ -461,6 +513,12 @@ function isRepairCandidate(article: Article | undefined): article is Article {
   );
 }
 
+function isActiveRepairArticle(article: Article | undefined): article is Article {
+  return Boolean(
+    article && REPAIRABLE_STATUSES.includes(article.status as (typeof REPAIRABLE_STATUSES)[number]),
+  );
+}
+
 function existingMessage(article: Article): Delivery {
   const messageId = Number(article.telegram_message_id);
   return Number.isSafeInteger(messageId) && messageId > 0
@@ -497,6 +555,24 @@ function terminalForStartedEvent(events: SheetRecord[], startedEventId: string):
     TERMINAL_EVENT_TYPES.has(stringCell(event.event_type)) &&
     stringField(eventPayload(event), "started_event_id") === startedEventId,
   );
+}
+
+function unfinishedStartApplies(
+  started: SheetRecord,
+  events: SheetRecord[],
+  article: Article,
+  currentHash: string,
+): boolean {
+  const identity = identityFromStarted(article.article_id, started);
+  if (identity.inputHash === currentHash) return true;
+  const regenerated = matchingRegeneratedEvent(events, identity.providerObjectId);
+  if (!regenerated) return false;
+  return regeneratedMatchesArticle(regenerated, article);
+}
+
+function regeneratedMatchesArticle(regenerated: SheetRecord, article: Article): boolean {
+  const revisionCount = Number(eventPayload(regenerated).revision_count);
+  return Number.isInteger(revisionCount) && revisionCount === numberCell(article.revision_count);
 }
 
 function terminalForHash(events: SheetRecord[], hash: string): SheetRecord | undefined {

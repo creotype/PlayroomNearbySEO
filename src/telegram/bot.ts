@@ -400,6 +400,12 @@ async function replyRegenerationResult(ctx: Context, result: RegenerationResult)
       );
       return;
     }
+    if (result.reason === "stale_article") {
+      await ctx.reply(
+        "ℹ️ Статья изменилась, пока я готовил новую версию, поэтому я не перезаписал свежие правки. Проверьте текущий текст и при необходимости отправьте новый /regenerate с комментарием.",
+      );
+      return;
+    }
     if (result.reason === "ru_disabled") {
       await ctx.reply("⛔ RU-генерация выключена до готовности русского раздела сайта.");
       return;

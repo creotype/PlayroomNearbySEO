@@ -78,6 +78,10 @@ export type RegenerationRequest = {
   providerObjectId: string;
   actorType?: "telegram_user" | "system";
   provider?: "telegram" | "system";
+  /** Fail closed when the article changed after an automatic repair was selected. */
+  expectedContentHash?: string;
+  /** Automatic repair may only spend against a draft that still fails QA. */
+  requireQaFailure?: boolean;
 };
 
 export type RegenerationResult =
@@ -87,8 +91,8 @@ export type RegenerationResult =
       reason:
         | "generator_not_configured"
         | "manual_generation_disabled"
-        | "automatic_generation_disabled"
         | "ambiguous_attempt"
+        | "stale_article"
         | "invalid_status"
         | "locale_disabled"
         | "ru_disabled"
@@ -278,6 +282,14 @@ export class GenerationService {
       const article = await this.store.findArticle(request.articleId);
       if (!article) throw new Error(`Article not found: ${request.articleId}`);
 
+      const baseContentHash = articleContentHash(article);
+      if (
+        (request.expectedContentHash && request.expectedContentHash !== baseContentHash) ||
+        (request.requireQaFailure && stringCell(article.qa_status) !== "fail")
+      ) {
+        return { outcome: "blocked", reason: "stale_article", article };
+      }
+
       const provider = request.provider ?? "telegram";
       const commandId = providerCommandId(provider, request.providerObjectId);
       const events = await this.store.listEvents(article.article_id);
@@ -295,11 +307,7 @@ export class GenerationService {
       }
 
       const settings = await this.store.getSettings();
-      if (provider === "system") {
-        if (!booleanCell(settings.get("generation_enabled") ?? false)) {
-          return { outcome: "blocked", reason: "automatic_generation_disabled", article };
-        }
-      } else if (!manualGenerationIsEnabled(this.config, settings)) {
+      if (provider !== "system" && !manualGenerationIsEnabled(this.config, settings)) {
         return { outcome: "blocked", reason: "manual_generation_disabled", article };
       }
       const [guardrails, links] = await Promise.all([
@@ -390,6 +398,16 @@ export class GenerationService {
         : quality.blockers;
       const finalStatus = blockers.length === 0 ? "needs_review" : "failed_qa";
       const revisionCount = numberCell(article.revision_count) + 1;
+      const latest = await this.store.findArticle(article.article_id);
+      if (
+        !latest ||
+        latest.status !== article.status ||
+        numberCell(latest.revision_count) !== numberCell(article.revision_count) ||
+        articleContentHash(latest) !== baseContentHash ||
+        (request.requireQaFailure && stringCell(latest.qa_status) !== "fail")
+      ) {
+        return { outcome: "blocked", reason: "stale_article", ...(latest ? { article: latest } : {}) };
+      }
       const updated = await this.store.patchArticleAndAppendEvent(
         article.article_id,
         {

@@ -16,7 +16,7 @@ import type {
 } from "../src/services/generation-service.js";
 import type { SeoBot } from "../src/telegram/bot.js";
 
-type RegenerationMode = "pass" | "fail" | "blocked" | "throw";
+type RegenerationMode = "pass" | "fail" | "blocked" | "stale" | "throw";
 
 function repairArticle(overrides: Partial<SheetRecord> = {}): Article {
   const article = {
@@ -101,7 +101,18 @@ function setup(options: {
     manualFlagAtCall.push(article.manual_required ?? false);
     if (mode === "throw") throw new Error("upstream secret detail");
     if (mode === "blocked") {
-      return { outcome: "blocked", reason: "automatic_generation_disabled", article };
+      return { outcome: "blocked", reason: "generator_not_configured", article };
+    }
+    if (mode === "stale") {
+      Object.assign(article, {
+        title: "Sveža ručna verzija koja ne sme biti prepisana",
+        status: "failed_qa",
+        qa_status: "fail",
+        qa_blockers: "article_too_short",
+        manual_required: false,
+        revision_count: 1,
+      });
+      return { outcome: "blocked", reason: "stale_article", article };
     }
 
     Object.assign(article, mode === "pass"
@@ -138,7 +149,7 @@ function setup(options: {
       provider: "system",
       provider_object_id: `system:${request.providerObjectId}`,
       message: "Regenerated",
-      payload_json: "{}",
+      payload_json: JSON.stringify({ revision_count: 1 }),
       created_at: "2026-09-07T08:01:00.000Z",
     });
     return { outcome: "regenerated", article };
@@ -201,6 +212,8 @@ describe("AutoQaRepairService", () => {
       actorType: "system",
       provider: "system",
       providerObjectId: expect.stringMatching(/^auto-qa-repair:[a-f0-9]{24}$/u),
+      expectedContentHash: inputHash,
+      requireQaFailure: true,
     }));
     expect(test.article).toMatchObject({
       status: "needs_review",
@@ -311,6 +324,62 @@ describe("AutoQaRepairService", () => {
     expect(payload(eventsOf(test, "auto_qa_repair_exhausted")[0]!).detail).toBe(
       "error:upstream secret detail",
     );
+  });
+
+  it("marks a raced automatic attempt superseded without exhausting the newer draft", async () => {
+    const test = setup({ mode: "stale" });
+
+    await test.service.runOnce();
+
+    expect(test.regenerateArticle).toHaveBeenCalledOnce();
+    expect(test.article).toMatchObject({
+      status: "failed_qa",
+      qa_status: "fail",
+      manual_required: false,
+      revision_count: 1,
+    });
+    expect(eventsOf(test, "auto_qa_repair_superseded")).toHaveLength(1);
+    expect(eventsOf(test, "auto_qa_repair_exhausted")).toHaveLength(0);
+    expect(eventsOf(test, "auto_qa_repair_notified")).toHaveLength(0);
+  });
+
+  it("reconciles a committed passing regeneration after restart before scanning new failures", async () => {
+    const article = repairArticle({
+      status: "needs_review",
+      qa_status: "pass",
+      qa_blockers: "",
+      manual_required: false,
+      revision_count: 1,
+      title: "Potpuni vodič posle automatske dorade",
+      body_markdown: "Dovoljno dugačak i proveren tekst za roditelje.".repeat(80),
+    });
+    const inputHash = "a".repeat(64);
+    const providerObjectId = "auto-qa-repair:recovered-pass";
+    const started: SheetRecord = {
+      __rowNumber: 20,
+      event_id: "evt-auto-started-pass-crash",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_started",
+      provider: "openai",
+      provider_object_id: providerObjectId,
+      payload_json: JSON.stringify({ input_hash: inputHash }),
+    };
+    const regenerated: SheetRecord = {
+      __rowNumber: 21,
+      event_id: "evt-regenerated-pass-crash",
+      article_id: article.article_id,
+      event_type: "regenerated",
+      provider: "system",
+      provider_object_id: `system:${providerObjectId}`,
+      payload_json: JSON.stringify({ revision_count: 1 }),
+    };
+    const test = setup({ article, events: [started, regenerated] });
+
+    await test.service.runOnce();
+
+    expect(test.regenerateArticle).not.toHaveBeenCalled();
+    expect(eventsOf(test, "auto_qa_repair_completed")).toHaveLength(1);
+    expect(eventsOf(test, "auto_qa_repair_exhausted")).toHaveLength(0);
   });
 
   it("continues the one repair when the progress message cannot be delivered", async () => {

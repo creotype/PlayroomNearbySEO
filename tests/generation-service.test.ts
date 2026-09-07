@@ -1,7 +1,7 @@
 import type { Logger } from "pino";
 import { describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config.js";
-import type { CellValue, SheetRecord } from "../src/domain/article.js";
+import { articleContentHash, type CellValue, type SheetRecord } from "../src/domain/article.js";
 import type { OpenAiArticleGenerator } from "../src/generation/openai-generator.js";
 import { KeyedMutex } from "../src/lib/keyed-mutex.js";
 import type { GoogleSheetsStore } from "../src/sheets/google-sheets.js";
@@ -72,6 +72,7 @@ function setup(options: {
   workflowMutex?: KeyedMutex;
   heroImages?: HeroImageService;
   beforeKeywordClaim?: (keyword: SheetRecord) => void;
+  onGenerate?: () => void | Promise<void>;
 } = {}) {
   const keywordRows = options.keywords ?? [];
   const articleRows = options.articles ?? [];
@@ -110,6 +111,7 @@ function setup(options: {
   });
   const generate = vi.fn(async () => {
     if (options.generatorError) throw options.generatorError;
+    await options.onGenerate?.();
     return {
       title: "Kako izabrati igraonicu u Beogradu",
       slug: "kako-izabrati-igraonicu-u-beogradu",
@@ -1151,6 +1153,57 @@ describe("article regeneration", () => {
       manual_required: true,
     });
     expect(String(test.articleRows[0]?.qa_blockers)).toContain("manual_required");
+  });
+
+  it("rejects an automatic repair before spending when its expected draft hash is stale", async () => {
+    const article = reviewArticle({ status: "failed_qa", manual_required: false });
+    const expectedContentHash = articleContentHash(article);
+    article.title = "Ručno izmenjen naslov pre automatskog pokušaja";
+    const test = setup({ articles: [article] });
+
+    const result = await test.service.regenerateArticle({
+      ...regenerationRequest,
+      actorId: "auto-qa-repair",
+      actorName: "Automatic QA repair",
+      actorType: "system",
+      provider: "system",
+      providerObjectId: "stale-before-paid",
+      expectedContentHash,
+      requireQaFailure: true,
+    });
+
+    expect(result).toMatchObject({ outcome: "blocked", reason: "stale_article" });
+    expect(test.generate).not.toHaveBeenCalled();
+    expect(test.events).toHaveLength(0);
+  });
+
+  it("does not overwrite a Sheet edit made while a paid regeneration is running", async () => {
+    const article = reviewArticle({ status: "failed_qa", manual_required: false });
+    const oldBody = String(article.body_markdown);
+    const expectedContentHash = articleContentHash(article);
+    const test = setup({
+      articles: [article],
+      onGenerate: () => {
+        article.body_markdown = "Ručna izmena nastala dok je model radio.";
+      },
+    });
+
+    const result = await test.service.regenerateArticle({
+      ...regenerationRequest,
+      actorId: "auto-qa-repair",
+      actorName: "Automatic QA repair",
+      actorType: "system",
+      provider: "system",
+      providerObjectId: "stale-after-paid",
+      expectedContentHash,
+      requireQaFailure: true,
+    });
+
+    expect(result).toMatchObject({ outcome: "blocked", reason: "stale_article" });
+    expect(test.generate).toHaveBeenCalledOnce();
+    expect(article.body_markdown).not.toBe(oldBody);
+    expect(article.body_markdown).toBe("Ručna izmena nastala dok je model radio.");
+    expect(test.events.some((event) => event.event_type === "regenerated")).toBe(false);
   });
 
   it("uses the shared article mutex before reading or replacing the draft", async () => {
