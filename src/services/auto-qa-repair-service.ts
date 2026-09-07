@@ -46,7 +46,6 @@ type RepairIdentity = {
 type InterruptedRecovery = {
   started: SheetRecord;
   terminal?: SheetRecord;
-  recoverSystemManualGate: boolean;
 };
 
 /**
@@ -110,7 +109,7 @@ export class AutoQaRepairService {
     if (committedStart) {
       await this.#recoverUnfinished(
         article,
-        { started: committedStart, recoverSystemManualGate: false },
+        { started: committedStart },
         events,
         chatId,
       );
@@ -139,7 +138,6 @@ export class AutoQaRepairService {
         article,
         {
           started: unfinishedStart,
-          recoverSystemManualGate: false,
         },
         events,
         chatId,
@@ -160,7 +158,7 @@ export class AutoQaRepairService {
       const started = events.find((event) => stringCell(event.event_id) === identity.startedEventId)!;
       await this.#recoverUnfinished(
         article,
-        { started, recoverSystemManualGate: false },
+        { started },
         events,
         chatId,
       );
@@ -225,6 +223,8 @@ export class AutoQaRepairService {
         provider: "system",
         expectedContentHash: identity.inputHash,
         requireQaFailure: true,
+        expectedManualRequired: booleanCell(started.manual_required),
+        expectedQaBlockers: stringCell(started.qa_blockers),
         ...(recoverSystemManualGate ? { recoverSystemManualGate: true } : {}),
       });
     } catch (error) {
@@ -373,6 +373,10 @@ export class AutoQaRepairService {
       );
       return;
     }
+    if (hasHumanActivityAfter(events, started)) {
+      await this.#finishSuperseded(article, identity, events, "human_activity");
+      return;
+    }
 
     await this.#recordRecoveryProgress(article, identity, recovery.terminal, events, chatId);
 
@@ -385,6 +389,10 @@ export class AutoQaRepairService {
       return;
     }
     const freshEvents = await this.store.listEvents(article.article_id);
+    if (hasHumanActivityAfter(freshEvents, started)) {
+      await this.#finishSuperseded(latest, identity, freshEvents, "human_activity");
+      return;
+    }
     if (matchingRegenerationAttemptEvent(freshEvents, identity.providerObjectId)) {
       await this.#finishExhausted(
         latest,
@@ -396,12 +404,21 @@ export class AutoQaRepairService {
       return;
     }
 
+    const liveTerminal = recovery.terminal
+      ? freshEvents.find(
+          (event) => stringCell(event.event_id) === stringCell(recovery.terminal?.event_id),
+        )
+      : undefined;
+    const recoverSystemManualGate = Boolean(
+      liveTerminal && systemCreatedManualGateCanBeRecovered(started, liveTerminal, latest),
+    );
+
     await this.#executeAttempt(
       latest,
       identity,
       freshEvents,
       chatId,
-      recovery.recoverSystemManualGate,
+      recoverSystemManualGate,
     );
   }
 
@@ -807,7 +824,7 @@ function interruptedRecovery(
   if (
     identity.inputHash !== currentHash ||
     matchingRegenerationAttemptEvent(events, identity.providerObjectId) ||
-    hasHumanActivityAfter(events, terminal)
+    hasHumanActivityAfter(events, started)
   ) {
     return undefined;
   }
@@ -815,11 +832,6 @@ function interruptedRecovery(
   return {
     started,
     terminal,
-    recoverSystemManualGate: systemCreatedManualGateCanBeRecovered(
-      started,
-      terminal,
-      article,
-    ),
   };
 }
 
@@ -841,17 +853,12 @@ function systemCreatedManualGateCanBeRecovered(
     )
   ) return false;
 
-  const startedPayload = eventPayload(started);
-  const originalManualRequired = optionalBooleanField(
-    startedPayload,
+  // Legacy starts do not prove who owned an existing manual gate. Only a
+  // durable pre-attempt snapshot may authorize clearing the system-created flag.
+  return optionalBooleanField(
+    eventPayload(started),
     "manual_required_before_attempt",
-  );
-  if (originalManualRequired !== undefined) return !originalManualRequired;
-
-  // Legacy starts did not record the original flag. The interrupted terminal
-  // itself set manual_required=true without adding a blocker, so recover only
-  // when neither the terminal snapshot nor the live blockers claim a manual gate.
-  return true;
+  ) === false;
 }
 
 function hasHumanActivityAfter(events: SheetRecord[], event: SheetRecord): boolean {

@@ -1231,6 +1231,43 @@ describe("article regeneration", () => {
     expect(test.events.some((event) => event.event_type === "regenerated")).toBe(false);
   });
 
+  it("does not overwrite a manual QA gate added while automatic repair is running", async () => {
+    const article = reviewArticle({
+      status: "failed_qa",
+      qa_status: "fail",
+      qa_blockers: "quality_score_below_threshold",
+      manual_required: false,
+    });
+    const expectedContentHash = articleContentHash(article);
+    const expectedQaBlockers = String(article.qa_blockers);
+    const test = setup({
+      articles: [article],
+      onGenerate: () => {
+        article.manual_required = true;
+        article.qa_blockers = `${expectedQaBlockers},manual_required`;
+      },
+    });
+
+    const result = await test.service.regenerateArticle({
+      ...regenerationRequest,
+      actorId: "auto-qa-repair",
+      actorName: "Automatic QA repair",
+      actorType: "system",
+      provider: "system",
+      providerObjectId: "manual-gate-after-paid",
+      expectedContentHash,
+      expectedManualRequired: false,
+      expectedQaBlockers,
+      requireQaFailure: true,
+    });
+
+    expect(result).toMatchObject({ outcome: "blocked", reason: "stale_article" });
+    expect(test.generate).toHaveBeenCalledOnce();
+    expect(article.manual_required).toBe(true);
+    expect(article.qa_blockers).toContain("manual_required");
+    expect(test.events.some((event) => event.event_type === "regenerated")).toBe(false);
+  });
+
   it("uses the shared article mutex before reading or replacing the draft", async () => {
     const mutex = new KeyedMutex();
     let release!: () => void;

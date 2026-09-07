@@ -237,6 +237,8 @@ describe("AutoQaRepairService", () => {
       providerObjectId: expect.stringMatching(/^auto-qa-repair:[a-f0-9]{24}$/u),
       expectedContentHash: inputHash,
       requireQaFailure: true,
+      expectedManualRequired: false,
+      expectedQaBlockers: "article_too_short",
     }));
     expect(test.article).toMatchObject({
       status: "needs_review",
@@ -317,6 +319,7 @@ describe("AutoQaRepairService", () => {
         input_hash: inputHash,
         hash: inputHash,
         attempt: 1,
+        manual_required_before_attempt: false,
       }),
       created_at: "2026-09-07T08:00:00.000Z",
     };
@@ -417,6 +420,7 @@ describe("AutoQaRepairService", () => {
         input_hash: inputHash,
         hash: inputHash,
         attempt: 1,
+        manual_required_before_attempt: false,
       }),
       created_at: "2026-09-07T08:00:00.000Z",
     };
@@ -483,6 +487,118 @@ describe("AutoQaRepairService", () => {
     expect(finalCard).toContain("SEO draft");
     expect(finalCard).toContain("Внутренняя проверка пройдена");
     expect(finalCard).not.toContain("article_too_short");
+  });
+
+  it("never clears a legacy manual gate without a durable pre-attempt snapshot", async () => {
+    const article = repairArticle({
+      status: "failed_qa",
+      manual_required: true,
+      telegram_message_id: 60,
+    });
+    const inputHash = articleContentHash(article);
+    const started: SheetRecord = {
+      __rowNumber: 20,
+      event_id: "evt-legacy-auto-start",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_started",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "openai",
+      provider_object_id: "auto-qa-repair:legacy-gate",
+      payload_json: JSON.stringify({ input_hash: inputHash, attempt: 1 }),
+      created_at: "2026-09-07T08:00:00.000Z",
+    };
+    const exhausted: SheetRecord = {
+      __rowNumber: 21,
+      event_id: "evt-legacy-false-exhausted",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_exhausted",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "system",
+      provider_object_id: "auto-qa-repair:legacy-gate",
+      payload_json: JSON.stringify({
+        input_hash: inputHash,
+        output_hash: inputHash,
+        detail: "interrupted_after_attempt_started",
+        started_event_id: started.event_id,
+        qa_blockers: "article_too_short",
+      }),
+      created_at: "2026-09-07T08:01:00.000Z",
+    };
+    const test = setup({ article, events: [started, exhausted] });
+
+    await test.service.runOnce();
+
+    expect(test.regenerateArticle).toHaveBeenCalledOnce();
+    expect(test.regenerateArticle.mock.calls[0]?.[0].recoverSystemManualGate).toBeUndefined();
+    expect(test.regenerateArticle).toHaveBeenCalledWith(expect.objectContaining({
+      expectedManualRequired: true,
+      expectedQaBlockers: "article_too_short",
+    }));
+  });
+
+  it("stops recovery when a human acts while the progress message is being updated", async () => {
+    const article = repairArticle({
+      status: "failed_qa",
+      manual_required: true,
+      telegram_message_id: 60,
+    });
+    const inputHash = articleContentHash(article);
+    const started: SheetRecord = {
+      __rowNumber: 20,
+      event_id: "evt-auto-start-human-race",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_started",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "openai",
+      provider_object_id: "auto-qa-repair:human-race",
+      payload_json: JSON.stringify({
+        input_hash: inputHash,
+        attempt: 1,
+        manual_required_before_attempt: false,
+      }),
+      created_at: "2026-09-07T08:00:00.000Z",
+    };
+    const exhausted: SheetRecord = {
+      __rowNumber: 21,
+      event_id: "evt-false-exhausted-human-race",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_exhausted",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "system",
+      provider_object_id: "auto-qa-repair:human-race",
+      payload_json: JSON.stringify({
+        input_hash: inputHash,
+        output_hash: inputHash,
+        detail: "interrupted_after_attempt_started",
+        started_event_id: started.event_id,
+        qa_blockers: "article_too_short",
+      }),
+      created_at: "2026-09-07T08:01:00.000Z",
+    };
+    const test = setup({ article, events: [started, exhausted] });
+    test.editMessageText.mockImplementationOnce(async () => {
+      test.events.push({
+        __rowNumber: 100,
+        event_id: "evt-human-during-progress",
+        article_id: article.article_id,
+        event_type: "revision_requested",
+        actor_type: "telegram_user",
+        actor_id: "42",
+        provider: "telegram",
+        created_at: "2026-09-07T08:01:30.000Z",
+      } as SheetRecord);
+      return true;
+    });
+
+    await test.service.runOnce();
+
+    expect(test.regenerateArticle).not.toHaveBeenCalled();
+    expect(eventsOf(test, "auto_qa_repair_superseded")).toHaveLength(1);
+    expect(test.article.manual_required).toBe(true);
   });
 
   it("reconciles a failed H2 committed after a false exhaustion without buying another attempt", async () => {

@@ -82,6 +82,10 @@ export type RegenerationRequest = {
   expectedContentHash?: string;
   /** Automatic repair may only spend against a draft that still fails QA. */
   requireQaFailure?: boolean;
+  /** Fail closed if a reviewer changes the manual gate while the model is working. */
+  expectedManualRequired?: boolean;
+  /** Fail closed if a reviewer changes QA blockers while the model is working. */
+  expectedQaBlockers?: string;
   /**
    * The current manual flag was written by an interrupted automatic-repair
    * terminal, rather than by a human or the quality gate. This narrowly lets
@@ -291,7 +295,15 @@ export class GenerationService {
       const baseContentHash = articleContentHash(article);
       if (
         (request.expectedContentHash && request.expectedContentHash !== baseContentHash) ||
-        (request.requireQaFailure && stringCell(article.qa_status) !== "fail")
+        (request.requireQaFailure && stringCell(article.qa_status) !== "fail") ||
+        (
+          request.expectedManualRequired !== undefined &&
+          booleanCell(article.manual_required) !== request.expectedManualRequired
+        ) ||
+        (
+          request.expectedQaBlockers !== undefined &&
+          stringCell(article.qa_blockers) !== request.expectedQaBlockers
+        )
       ) {
         return { outcome: "blocked", reason: "stale_article", article };
       }
@@ -412,7 +424,15 @@ export class GenerationService {
         latest.status !== article.status ||
         numberCell(latest.revision_count) !== numberCell(article.revision_count) ||
         articleContentHash(latest) !== baseContentHash ||
-        (request.requireQaFailure && stringCell(latest.qa_status) !== "fail")
+        (request.requireQaFailure && stringCell(latest.qa_status) !== "fail") ||
+        (
+          request.expectedManualRequired !== undefined &&
+          booleanCell(latest.manual_required) !== request.expectedManualRequired
+        ) ||
+        (
+          request.expectedQaBlockers !== undefined &&
+          stringCell(latest.qa_blockers) !== request.expectedQaBlockers
+        )
       ) {
         return { outcome: "blocked", reason: "stale_article", ...(latest ? { article: latest } : {}) };
       }
