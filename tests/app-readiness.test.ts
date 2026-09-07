@@ -81,7 +81,8 @@ describe("startup Ghost readiness", () => {
 
   it("fails startup on Ghost authentication errors without exposing credentials", async () => {
     const readiness: ReadinessState = { ready: false, checks: {} };
-    const authError = `Ghost API 401 for ${config.ghostAdminApiKey}`;
+    const ghostKeyId = config.ghostAdminApiKey.split(":")[0]!;
+    const authError = `Ghost API 401 for ${config.ghostAdminApiKey}; id=${ghostKeyId}`;
     const ghost = ghostClient({
       readCurrentUser: vi.fn(async () => {
         throw new Error(authError);
@@ -110,9 +111,10 @@ describe("startup Ghost readiness", () => {
     expect(readiness.ready).toBe(false);
     expect(readiness.checks.ghost).toEqual({
       ok: false,
-      detail: "Ghost API 401 for [REDACTED]",
+      detail: "Ghost API 401 for [REDACTED]; id=[REDACTED]",
     });
     expect(JSON.stringify(vi.mocked(logger.error).mock.calls)).not.toContain(config.ghostAdminApiKey);
+    expect(JSON.stringify(vi.mocked(logger.error).mock.calls)).not.toContain(ghostKeyId);
     expect(JSON.stringify(vi.mocked(logger.error).mock.calls)).not.toContain("ghost-secret-value");
   });
 

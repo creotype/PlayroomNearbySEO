@@ -210,9 +210,10 @@ async function verifyTelegram(bot: SeoBot, logger: Logger): Promise<void> {
 
 function startupErrorDetail(error: unknown, config: AppConfig): string {
   let detail = error instanceof Error ? error.message : String(error);
-  const ghostSecret = config.ghostAdminApiKey.split(":")[1];
+  const [ghostKeyId, ghostSecret] = config.ghostAdminApiKey.split(":");
   const secrets = [
     config.ghostAdminApiKey,
+    ghostKeyId,
     ghostSecret,
     config.telegramBotToken,
     config.openAiApiKey,
