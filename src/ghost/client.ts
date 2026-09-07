@@ -10,6 +10,18 @@ export type GhostPost = {
   published_at?: string | null;
 };
 
+export type GhostUser = {
+  id: string;
+  name: string;
+  status: string;
+  roles?: Array<{ name: string }>;
+};
+
+export type GhostImage = {
+  url: string;
+  ref?: string;
+};
+
 export type GhostPostInput = {
   title: string;
   slug: string;
@@ -22,9 +34,15 @@ export type GhostPostInput = {
   feature_image?: string;
   feature_image_alt?: string;
   published_at?: string;
+  authors?: Array<{ id: string }>;
 };
 
-type GhostEnvelope = { posts?: GhostPost[]; errors?: Array<{ message?: string; type?: string }> };
+type GhostEnvelope = {
+  posts?: GhostPost[];
+  users?: GhostUser[];
+  images?: GhostImage[];
+  errors?: Array<{ message?: string; type?: string; context?: string }>;
+};
 
 export class GhostAdminClient {
   readonly #baseUrl: string;
@@ -46,6 +64,15 @@ export class GhostAdminClient {
       "site/",
     );
     return response.site;
+  }
+
+  async readCurrentUser(): Promise<GhostUser | undefined> {
+    const response = await this.#request<GhostEnvelope>(
+      "users/me/?include=roles",
+      undefined,
+      [404],
+    );
+    return response.users?.[0];
   }
 
   async findPostBySlug(slug: string): Promise<GhostPost | undefined> {
@@ -76,6 +103,30 @@ export class GhostAdminClient {
     return post;
   }
 
+  async uploadImage(input: {
+    bytes: Uint8Array;
+    filename: string;
+    contentType: string;
+    ref?: string;
+  }): Promise<GhostImage> {
+    if (input.bytes.byteLength === 0) throw new Error("Ghost image upload received an empty file");
+    if (input.bytes.byteLength > 20 * 1024 * 1024) {
+      throw new Error("Ghost image upload exceeds the 20 MB application limit");
+    }
+    const body = new FormData();
+    body.append("file", new Blob([input.bytes], { type: input.contentType }), input.filename);
+    body.append("purpose", "image");
+    if (input.ref) body.append("ref", input.ref);
+    const response = await this.#request<GhostEnvelope>("images/upload/", {
+      method: "POST",
+      body,
+      signal: AbortSignal.timeout(60_000),
+    });
+    const image = response.images?.[0];
+    if (!image?.url) throw new Error("Ghost image upload response contained no URL");
+    return image;
+  }
+
   async updatePost(
     id: string,
     input: GhostPostInput & { updated_at: string },
@@ -95,13 +146,14 @@ export class GhostAdminClient {
     allowedStatuses: number[] = [],
   ): Promise<T> {
     const token = await this.#createToken();
+    const isMultipart = typeof FormData !== "undefined" && init?.body instanceof FormData;
     const response = await fetch(`${this.#baseUrl}/${path}`, {
       ...init,
       headers: {
         Accept: "application/json",
         "Accept-Version": this.#apiVersion,
         Authorization: `Ghost ${token}`,
-        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...(init?.body && !isMultipart ? { "Content-Type": "application/json" } : {}),
         ...init?.headers,
       },
     });
@@ -114,7 +166,10 @@ export class GhostAdminClient {
       parsed = undefined;
     }
     if (!response.ok) {
-      const reason = parsed?.errors?.map((error) => error.message).filter(Boolean).join("; ");
+      const reason = parsed?.errors
+        ?.map((error) => [error.message, error.context].filter(Boolean).join(" — "))
+        .filter(Boolean)
+        .join("; ");
       throw new Error(`Ghost API ${response.status}: ${reason || "request failed"}`);
     }
     return (parsed ?? JSON.parse(raw)) as T;

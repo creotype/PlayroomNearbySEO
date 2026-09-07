@@ -1,6 +1,12 @@
 node_modules/
 dist/
 coverage/
+data/
+deploy/vps/secrets/
+**/secrets/
+**/*service-account*.json
+**/*credentials*.json
+playroomnearby-*.json
 .env
 .env.*
 !.env.example
