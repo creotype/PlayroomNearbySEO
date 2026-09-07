@@ -24,7 +24,11 @@ export function settingsSheetUrl(spreadsheetId: string): string {
   return sheetRangeUrl(spreadsheetId, SETTINGS_SHEET_GID, "A2:F");
 }
 
-export function articleCard(article: Article, spreadsheetId: string): string {
+export function articleCard(
+  article: Article,
+  spreadsheetId: string,
+  reviewPolicy: { deadlineHours?: number; publicationTime?: string } = {},
+): string {
   const row = article.__rowNumber;
   const sheetUrl = articleSheetUrl(spreadsheetId, row);
   const schedule = displayDateCell(article.scheduled_publish_at) || "после согласования";
@@ -39,6 +43,8 @@ export function articleCard(article: Article, spreadsheetId: string): string {
     `<b>Publish:</b> ${escapeHtml(schedule)}`,
     "",
     `<a href="${sheetUrl}">Открыть строку в Google Sheets</a>`,
+    "",
+    `⏳ На проверку — ${reviewPolicy.deadlineHours ?? 48} часов с момента этой карточки. Затем статья будет автоматически согласована и поставлена на ближайшие ${escapeHtml(reviewPolicy.publicationTime ?? "10:00")}.`,
     "",
     canApprove
       ? "/regenerate комментарий — переписать эту статью\n/approve — согласовать эту статью"

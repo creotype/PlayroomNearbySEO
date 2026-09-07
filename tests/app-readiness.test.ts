@@ -17,6 +17,17 @@ const config: AppConfig = {
   ghostApiVersion: "v5.0",
   openAiApiKey: "sk-test-openai-secret",
   openAiModel: "gpt-5-mini",
+  openAiImageModel: "gpt-image-2",
+  openAiImageSize: "1536x1024",
+  openAiImageQuality: "high",
+  heroImageCacheDir: "data/hero-images",
+  editorialAutomationEnabled: false,
+  editorialTimeZone: "Europe/Belgrade",
+  editorialRunDays: [1, 5],
+  editorialRunTime: "10:00",
+  autoPublishAfterReview: true,
+  reviewDeadlineHours: 48,
+  publicationTime: "10:00",
   targetEnvironment: "staging",
   port: 8080,
   logLevel: "silent",
@@ -78,6 +89,7 @@ describe("startup Ghost readiness", () => {
     });
     const store = {
       verifySchema: vi.fn(async () => undefined),
+      getSettings: vi.fn(async () => new Map([["timezone", "Europe/Belgrade"]])),
     } as unknown as GoogleSheetsStore;
     const bot = {
       api: {
@@ -102,5 +114,27 @@ describe("startup Ghost readiness", () => {
     });
     expect(JSON.stringify(vi.mocked(logger.error).mock.calls)).not.toContain(config.ghostAdminApiKey);
     expect(JSON.stringify(vi.mocked(logger.error).mock.calls)).not.toContain("ghost-secret-value");
+  });
+
+  it("fails startup when the Sheet timezone is not a valid IANA zone", async () => {
+    const readiness: ReadinessState = { ready: false, checks: {} };
+    const store = {
+      verifySchema: vi.fn(async () => undefined),
+      getSettings: vi.fn(async () => new Map([["timezone", "Belgrade-ish"]])),
+    } as unknown as GoogleSheetsStore;
+    const bot = {
+      api: {
+        getMe: vi.fn(async () => ({ id: 1, is_bot: true, first_name: "Bot", username: "bot" })),
+        setMyCommands: vi.fn(async () => true),
+      },
+    } as unknown as SeoBot;
+    const logger = { error: vi.fn(), info: vi.fn(), warn: vi.fn() } as unknown as Logger;
+
+    await expect(
+      runStartupChecks({ readiness, store, ghost: ghostClient(), bot, logger, config }),
+    ).rejects.toThrow("Service is not ready");
+
+    expect(readiness.checks.google_sheets?.ok).toBe(false);
+    expect(readiness.checks.google_sheets?.detail).toContain("valid IANA timezone");
   });
 });

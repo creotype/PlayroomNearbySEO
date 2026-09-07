@@ -22,6 +22,13 @@ export class ReviewNotifier {
     const sheetChatId = Number(settings.get("telegram_chat_id"));
     const chatId = this.config.telegramReviewChatId ?? (Number.isSafeInteger(sheetChatId) ? sheetChatId : undefined);
     if (!chatId) return;
+    const reviewPolicy = {
+      deadlineHours: numberSetting(
+        settings.get("review_deadline_hours") ?? settings.get("review_window_hours"),
+        this.config.reviewDeadlineHours ?? 48,
+      ),
+      publicationTime: stringCell(settings.get("publication_time")) || this.config.publicationTime || "10:00",
+    };
     const articles = await this.store.listArticles(["needs_review"]);
     for (const article of articles) {
       const currentHash = articleContentHash(article);
@@ -35,7 +42,7 @@ export class ReviewNotifier {
             await this.bot.api.editMessageText(
               chatId,
               existingMessageId,
-              articleCard(article, this.config.spreadsheetId),
+              articleCard(article, this.config.spreadsheetId, reviewPolicy),
               {
                 parse_mode: "HTML",
                 reply_markup: { inline_keyboard: [] },
@@ -57,7 +64,7 @@ export class ReviewNotifier {
         }
         const message = await this.bot.api.sendMessage(
           chatId,
-          articleCard(article, this.config.spreadsheetId),
+          articleCard(article, this.config.spreadsheetId, reviewPolicy),
           { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
         );
         this.#clearedReviewMarkup.add(message.message_id);
@@ -151,12 +158,18 @@ export class ReviewNotifier {
       try {
         if (!["published", "failed_publish", "conflict"].includes(article.status)) continue;
         const events = await this.store.listEvents(article.article_id);
-        const approvedFromTelegram = events.some(
+        const hasTrustedApproval = events.some(
           (event) =>
             stringCell(event.event_type) === "approved" &&
-            stringCell(event.provider) === "telegram",
+            (
+              stringCell(event.provider) === "telegram" ||
+              (
+                stringCell(event.provider) === "system" &&
+                stringCell(event.actor_id) === "auto-review-timeout"
+              )
+            ),
         );
-        if (!approvedFromTelegram) continue;
+        if (!hasTrustedApproval) continue;
         const expectedEventType = article.status === "published"
           ? "published"
           : article.status === "failed_publish"
@@ -214,6 +227,11 @@ export class ReviewNotifier {
       }
     }
   }
+}
+
+function numberSetting(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function publicationOutcomeMessage(

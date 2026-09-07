@@ -9,6 +9,7 @@ import {
   GenerationService,
   manualGenerationIsEnabled,
 } from "../src/services/generation-service.js";
+import type { HeroImageService } from "../src/services/hero-image-service.js";
 import { QualityGate } from "../src/services/quality-gate.js";
 
 const config: AppConfig = {
@@ -20,6 +21,17 @@ const config: AppConfig = {
   ghostApiVersion: "v5.0",
   openAiApiKey: "sk-test-abcdefghijklmnopqrstuvwxyz",
   openAiModel: "gpt-5-mini",
+  openAiImageModel: "gpt-image-2",
+  openAiImageSize: "1536x1024",
+  openAiImageQuality: "high",
+  heroImageCacheDir: "data/hero-images",
+  editorialAutomationEnabled: false,
+  editorialTimeZone: "Europe/Belgrade",
+  editorialRunDays: [1, 5],
+  editorialRunTime: "10:00",
+  autoPublishAfterReview: true,
+  reviewDeadlineHours: 48,
+  publicationTime: "10:00",
   targetEnvironment: "staging",
   port: 8080,
   logLevel: "silent",
@@ -58,6 +70,7 @@ function setup(options: {
   generatedOverrides?: Record<string, unknown>;
   links?: SheetRecord[];
   workflowMutex?: KeyedMutex;
+  heroImages?: HeroImageService;
   beforeKeywordClaim?: (keyword: SheetRecord) => void;
 } = {}) {
   const keywordRows = options.keywords ?? [];
@@ -178,6 +191,12 @@ function setup(options: {
     },
   };
   const typedStore = store as unknown as GoogleSheetsStore;
+  const heroImages = options.heroImages ?? ({
+    ensureForArticle: async () => ({
+      url: "https://example.com/content/images/generated-hero.webp",
+      alt: "Tematska ilustracija: izbor igraonice",
+    }),
+  } as unknown as HeroImageService);
   const service = new GenerationService(
     typedStore,
     { generate } as unknown as OpenAiArticleGenerator,
@@ -185,6 +204,7 @@ function setup(options: {
     logger,
     new QualityGate(typedStore, config),
     options.workflowMutex,
+    heroImages,
   );
   return {
     service,
@@ -885,6 +905,45 @@ describe("manual generation worker", () => {
     expect(test.generate).toHaveBeenCalledTimes(1);
     expect(keyword.status).toBe("paused");
     expect(test.articleRows).toHaveLength(0);
+  });
+
+  it("stores the generated Ghost hero URL and alt text before review", async () => {
+    const ensureForArticle = vi.fn(async () => ({
+      url: "https://example.com/content/images/generated-hero.webp",
+      alt: "Tematska ilustracija: izbor igraonice",
+    }));
+    const test = setup({
+      keywords: [readyKeyword()],
+      heroImages: { ensureForArticle } as unknown as HeroImageService,
+    });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+
+    await test.service.runManualOnce();
+
+    expect(ensureForArticle).toHaveBeenCalledOnce();
+    expect(test.articleRows[0]).toMatchObject({
+      status: "needs_review",
+      feature_image_url: "https://example.com/content/images/generated-hero.webp",
+      feature_image_alt: "Tematska ilustracija: izbor igraonice",
+    });
+  });
+
+  it("pauses generation and creates no review article when hero creation fails", async () => {
+    const keyword = readyKeyword();
+    const test = setup({
+      keywords: [keyword],
+      heroImages: {
+        ensureForArticle: vi.fn(async () => { throw new Error("image quota exceeded"); }),
+      } as unknown as HeroImageService,
+    });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+
+    await test.service.runManualOnce();
+
+    expect(keyword.status).toBe("paused");
+    expect(test.articleRows).toHaveLength(0);
+    expect(test.events.at(-1)).toMatchObject({ event_type: "generation_failed" });
+    expect(String(test.events.at(-1)?.message)).toContain("Hero image generation/upload failed");
   });
 
   it("does not treat a legacy source prefix as authorization without a durable request event", async () => {

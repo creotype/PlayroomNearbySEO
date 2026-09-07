@@ -10,9 +10,9 @@
 - [x] Make argument-free `/generate` reserve the topmost `ready` keyword by physical row order, using that row's locale and content settings.
 - [x] Mark the reserved keyword `used` after generation even when QA fails; pause it only on a technical generation failure.
 - [x] Enforce dry-run and hash-bound human approval.
-- [ ] Create a Google Cloud service account, share its email onto the Sheet, and mount its JSON credential on the server.
-- [ ] Capture the Telegram review-group ID and store the non-secret ID in `settings.telegram_chat_id`.
-- [ ] Configure an OpenAI API key and confirm the allowed model.
+- [x] Create a Google Cloud service account, share its email onto the Sheet, and prepare its JSON credential for the server.
+- [x] Capture the Telegram review-group ID and store the non-secret ID in `settings.telegram_chat_id`.
+- [x] Configure an OpenAI API key and confirm article and image model access.
 
 ## P0 — staging acceptance
 
@@ -30,9 +30,9 @@
 
 ## P1 — production launch
 
-- [ ] Set production frontend base URL and production Ghost target.
-- [ ] Choose generation cadence and fill `generation_cron`.
-- [ ] Set publication windows and owner review SLA.
+- [x] Set production frontend base URL and production Ghost target.
+- [x] Implement durable Monday/Friday 10:00 Europe/Belgrade generation slots with an actionable empty-queue warning.
+- [x] Enforce a 48-hour card-based review SLA and schedule human/timeout approvals for 10:00 local.
 - [ ] Deploy one Docker replica with restart policy, logs, and `/readyz` monitoring.
 - [ ] Add daily recovery for stale `generating`/`publishing` rows.
 - [ ] Turn on `security_ready`, then `technical_seo_ready`, then generation; enable publication last.
@@ -41,7 +41,7 @@
 ## P2 — follow-up automation
 
 - [ ] Social-post generation from published articles.
-- [ ] Automatic feature-image generation and Ghost asset upload.
+- [x] Automatic feature-image generation and Ghost asset upload.
 - [ ] Search Console indexing/coverage feedback.
 - [ ] Rank and traffic feedback into keyword priorities.
 - [ ] Multiple approver roles, deadlines, reminders, and escalation.

@@ -17,6 +17,11 @@ export type GhostUser = {
   roles?: Array<{ name: string }>;
 };
 
+export type GhostImage = {
+  url: string;
+  ref?: string;
+};
+
 export type GhostPostInput = {
   title: string;
   slug: string;
@@ -35,6 +40,7 @@ export type GhostPostInput = {
 type GhostEnvelope = {
   posts?: GhostPost[];
   users?: GhostUser[];
+  images?: GhostImage[];
   errors?: Array<{ message?: string; type?: string; context?: string }>;
 };
 
@@ -97,6 +103,30 @@ export class GhostAdminClient {
     return post;
   }
 
+  async uploadImage(input: {
+    bytes: Uint8Array;
+    filename: string;
+    contentType: string;
+    ref?: string;
+  }): Promise<GhostImage> {
+    if (input.bytes.byteLength === 0) throw new Error("Ghost image upload received an empty file");
+    if (input.bytes.byteLength > 20 * 1024 * 1024) {
+      throw new Error("Ghost image upload exceeds the 20 MB application limit");
+    }
+    const body = new FormData();
+    body.append("file", new Blob([input.bytes], { type: input.contentType }), input.filename);
+    body.append("purpose", "image");
+    if (input.ref) body.append("ref", input.ref);
+    const response = await this.#request<GhostEnvelope>("images/upload/", {
+      method: "POST",
+      body,
+      signal: AbortSignal.timeout(60_000),
+    });
+    const image = response.images?.[0];
+    if (!image?.url) throw new Error("Ghost image upload response contained no URL");
+    return image;
+  }
+
   async updatePost(
     id: string,
     input: GhostPostInput & { updated_at: string },
@@ -116,13 +146,14 @@ export class GhostAdminClient {
     allowedStatuses: number[] = [],
   ): Promise<T> {
     const token = await this.#createToken();
+    const isMultipart = typeof FormData !== "undefined" && init?.body instanceof FormData;
     const response = await fetch(`${this.#baseUrl}/${path}`, {
       ...init,
       headers: {
         Accept: "application/json",
         "Accept-Version": this.#apiVersion,
         Authorization: `Ghost ${token}`,
-        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...(init?.body && !isMultipart ? { "Content-Type": "application/json" } : {}),
         ...init?.headers,
       },
     });

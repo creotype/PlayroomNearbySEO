@@ -19,6 +19,7 @@ import {
 import type { GeneratedArticle, OpenAiArticleGenerator } from "../generation/openai-generator.js";
 import { KeyedMutex } from "../lib/keyed-mutex.js";
 import type { AuditEvent, GoogleSheetsStore } from "../sheets/google-sheets.js";
+import type { HeroImageService } from "./hero-image-service.js";
 import { QualityGate } from "./quality-gate.js";
 
 const CLAIMED_STATUS = "assigned";
@@ -104,11 +105,12 @@ export class GenerationService {
     private readonly logger: Logger,
     private readonly qualityGate: QualityGate = new QualityGate(store, config),
     private readonly workflowMutex: KeyedMutex = new KeyedMutex(),
+    private readonly heroImages?: HeroImageService,
   ) {}
 
   /** Scheduled queue. The Sheet generation_enabled flag is an absolute gate. */
-  async runOnce(): Promise<void> {
-    await this.#runQueue("scheduled");
+  async runOnce(preferredKeywordId?: string): Promise<void> {
+    await this.#runQueue("scheduled", preferredKeywordId);
   }
 
   /** Telegram queue. It has separate server and Sheet kill switches. */
@@ -340,7 +342,7 @@ export class GenerationService {
 
       const now = new Date().toISOString();
       const generatedFields = generatedArticleFields(generated);
-      const candidate = {
+      let candidate = {
         ...article,
         ...generatedFields,
         status: "needs_review",
@@ -349,12 +351,15 @@ export class GenerationService {
         manual_required: false,
         updated_at: now,
       } as Article;
+      const heroImageFields = await this.#prepareHeroImage(candidate);
+      candidate = { ...candidate, ...heroImageFields } as Article;
       const quality = await this.#evaluateGeneratedCandidate(candidate, generated.qa_blockers);
       const revisionCount = numberCell(article.revision_count) + 1;
       const updated = await this.store.patchArticleAndAppendEvent(
         article.article_id,
         {
           ...generatedFields,
+          ...heroImageFields,
           status: "needs_review",
           qa_status: quality.blockers.length === 0 ? "pass" : "fail",
           qa_blockers: quality.blockers.join(","),
@@ -397,7 +402,7 @@ export class GenerationService {
     });
   }
 
-  async #runQueue(queue: "manual" | "scheduled"): Promise<void> {
+  async #runQueue(queue: "manual" | "scheduled", preferredKeywordId?: string): Promise<void> {
     if (this.#running || !this.generator) return;
     this.#running = true;
     try {
@@ -446,6 +451,12 @@ export class GenerationService {
         const recoveries = keywords.filter((candidate) =>
           [CLAIMED_STATUS, "generating"].includes(stringCell(candidate.status)),
         );
+        const preferred = queue === "scheduled" && preferredKeywordId
+          ? keywords.find(
+              (candidate) =>
+                stringCell(candidate.keyword_id).toLowerCase() === preferredKeywordId.trim().toLowerCase(),
+            )
+          : undefined;
         let selected: SheetRecord | undefined;
         if (activeReviews.length > 1) {
           return undefined;
@@ -455,6 +466,8 @@ export class GenerationService {
           selected = recoveries.find(
             (candidate) => stringCell(candidate.article_id).toLowerCase() === activeArticleId,
           );
+        } else if (preferred) {
+          selected = preferred;
         } else if (inFlightCandidates.length > 0) {
           const inFlight = inFlightCandidates[0]!;
           selected = recoveries.find((candidate) => candidate.__rowNumber === inFlight.__rowNumber);
@@ -575,6 +588,15 @@ export class GenerationService {
       created_at: now,
       updated_at: now,
     };
+    try {
+      Object.assign(
+        values,
+        await this.#prepareHeroImage({ ...values, __rowNumber: 0 } as Article),
+      );
+    } catch (error) {
+      await this.#failKeyword(keyword, error);
+      return;
+    }
     try {
       const quality = await this.#evaluateGeneratedCandidate(
         { ...values, __rowNumber: 0 } as Article,
@@ -763,6 +785,20 @@ export class GenerationService {
       blockers: [...new Set([...deterministic.blockers, ...modelBlockers])].sort(),
       manualRequired: modelBlockers.some(isSemanticGeneratedQaBlocker),
     };
+  }
+
+  async #prepareHeroImage(article: Article): Promise<Record<string, CellValue>> {
+    if (!this.heroImages) return {};
+    try {
+      const image = await this.heroImages.ensureForArticle(article);
+      return {
+        feature_image_url: image.url,
+        feature_image_alt: image.alt,
+      };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(`Hero image generation/upload failed; article was not published: ${detail}`);
+    }
   }
 }
 

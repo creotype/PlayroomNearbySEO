@@ -1,13 +1,18 @@
 import type { Server } from "node:http";
 import type { Logger } from "pino";
 import type { AppConfig } from "./config.js";
+import { isValidIanaTimeZone } from "./config.js";
+import { stringCell } from "./domain/article.js";
+import { OpenAiHeroImageGenerator } from "./generation/openai-hero-image.js";
 import { OpenAiArticleGenerator } from "./generation/openai-generator.js";
 import { GhostAdminClient } from "./ghost/client.js";
 import { startHealthServer, type ReadinessState } from "./health.js";
 import { KeyedMutex } from "./lib/keyed-mutex.js";
 import { GoogleSheetsStore } from "./sheets/google-sheets.js";
 import { ApprovalService } from "./services/approval-service.js";
+import { EditorialAutomationService } from "./services/editorial-automation-service.js";
 import { GenerationService } from "./services/generation-service.js";
+import { HeroImageService } from "./services/hero-image-service.js";
 import { PublicationService } from "./services/publication-service.js";
 import { QualityGate } from "./services/quality-gate.js";
 import { ReviewNotifier } from "./services/review-notifier.js";
@@ -16,10 +21,16 @@ import { createTelegramBot, telegramCommandMenu, waitForTelegramIdle, type SeoBo
 
 export type RunningApp = {
   shutdown: (signal?: string) => Promise<void>;
+  /** Resolves only when a long-running subsystem has stopped unexpectedly. */
+  terminalFailure: Promise<Error>;
 };
 
 export async function startApp(config: AppConfig, logger: Logger): Promise<RunningApp> {
   const readiness: ReadinessState = { ready: false, checks: {} };
+  let reportTerminalFailure!: (error: Error) => void;
+  const terminalFailure = new Promise<Error>((resolve) => {
+    reportTerminalFailure = resolve;
+  });
   const store = new GoogleSheetsStore(config);
   const ghost = new GhostAdminClient({
     url: config.ghostAdminUrl,
@@ -28,9 +39,26 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
   });
   const workflowMutex = new KeyedMutex();
   const qualityGate = new QualityGate(store, config);
-  const approvals = new ApprovalService(store, qualityGate, workflowMutex);
+  const approvals = new ApprovalService(store, qualityGate, workflowMutex, {
+    timeZone: config.editorialTimeZone ?? "Europe/Belgrade",
+    publicationTime: config.publicationTime ?? "10:00",
+  });
   const generator = config.openAiApiKey
     ? new OpenAiArticleGenerator(config.openAiApiKey, config.openAiModel)
+    : undefined;
+  const heroImages = config.openAiApiKey
+    ? new HeroImageService(
+        new OpenAiHeroImageGenerator(
+          config.openAiApiKey,
+          config.openAiImageModel,
+          config.openAiImageSize,
+          config.openAiImageQuality,
+        ),
+        ghost,
+        config.heroImageCacheDir,
+        logger,
+        `${config.targetEnvironment}:${config.ghostAdminUrl}`,
+      )
     : undefined;
   const generation = new GenerationService(
     store,
@@ -39,13 +67,27 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
     logger,
     qualityGate,
     workflowMutex,
+    heroImages,
   );
   const bot = createTelegramBot({ config, store, approvals, generation, logger });
   const publication = new PublicationService(store, ghost, config, logger, workflowMutex);
   const notifier = new ReviewNotifier(store, bot, config, logger);
+  const editorial = new EditorialAutomationService(
+    store,
+    generation,
+    qualityGate,
+    bot,
+    config,
+    logger,
+    workflowMutex,
+  );
   const scheduler = new Scheduler(config.pollIntervalMs, logger);
   scheduler.add("manual-generator", () => generation.runManualOnce());
-  scheduler.add("scheduled-generator", () => generation.runOnce());
+  if (config.editorialAutomationEnabled) {
+    scheduler.add("editorial-automation", () => editorial.runOnce());
+  } else {
+    scheduler.add("scheduled-generator", () => generation.runOnce());
+  }
   scheduler.add("publisher", () => publication.runOnce());
   scheduler.add("review-notifier", () => notifier.runOnce());
 
@@ -58,16 +100,19 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
       onStart: (info) => logger.info({ bot: info.username }, "Telegram long polling started"),
     })
     .catch((error: unknown) => {
+      const failure = error instanceof Error ? error : new Error(String(error));
       readiness.ready = false;
       readiness.checks.telegram = {
         ok: false,
-        detail: error instanceof Error ? error.message : String(error),
+        detail: failure.message,
       };
       logger.fatal({ err: readiness.checks.telegram.detail }, "Telegram long polling stopped");
+      reportTerminalFailure(failure);
     });
 
   let stopping = false;
   return {
+    terminalFailure,
     shutdown: async (signal = "shutdown") => {
       if (stopping) return;
       stopping = true;
@@ -142,8 +187,10 @@ export async function verifyGhost(ghost: GhostAdminClient): Promise<void> {
 
 async function verifySheets(store: GoogleSheetsStore, config: AppConfig): Promise<void> {
   await store.verifySchema();
-  if (!config.allowTelegramGeneration) return;
   const settings = await store.getSettings();
+  const timeZone = stringCell(settings.get("timezone")) || config.editorialTimeZone || "Europe/Belgrade";
+  if (!isValidIanaTimeZone(timeZone)) throw new Error(`settings.timezone is not a valid IANA timezone: ${timeZone}`);
+  if (!config.allowTelegramGeneration) return;
   if (!settings.has("telegram_generation_enabled")) {
     throw new Error("settings.telegram_generation_enabled is required when Telegram generation is enabled");
   }

@@ -441,6 +441,24 @@ describe("ReviewNotifier publication outcomes", () => {
     expect(test.sendMessage).not.toHaveBeenCalled();
     expect(test.appendEvent).not.toHaveBeenCalled();
   });
+
+  it("notifies the final public link for a trusted review-timeout approval", async () => {
+    const automaticApproval = telegramApprovalEvent({
+      event_id: "evt-approved-timeout",
+      actor_type: "system",
+      actor_id: "auto-review-timeout",
+      provider: "system",
+      provider_object_id: "review-timeout:hash",
+    });
+    const published = publicationEvent("published", { event_id: "evt-published-timeout" });
+    const test = publicationNotifierHarness({ events: [automaticApproval, published] });
+
+    await test.notifier.runOnce();
+
+    expect(test.sendMessage).toHaveBeenCalledTimes(1);
+    expect(String(test.sendMessage.mock.calls[0]?.[1] ?? "")).toContain(canonicalPublicUrl);
+    expect(test.appendEvent).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("ReviewNotifier review cards", () => {

@@ -8,11 +8,13 @@ const logger = createLogger(config.logLevel);
 const app = await startApp(config, logger);
 let shutdownRequested = false;
 
-function shutdownAndExit(source: string): void {
+function shutdownAndExit(source: string, exitCode = 0): void {
   if (shutdownRequested) return;
   shutdownRequested = true;
-  void app.shutdown(source).finally(() => process.exit(0));
+  void app.shutdown(source).finally(() => process.exit(exitCode));
 }
+
+void app.terminalFailure.then(() => shutdownAndExit("terminal-failure", 1));
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {

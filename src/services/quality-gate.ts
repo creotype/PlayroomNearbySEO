@@ -43,6 +43,11 @@ export class QualityGate {
     const meta = stringCell(article.meta_description);
     if (meta.length < 80 || meta.length > 160) blockers.add("invalid_meta_description");
 
+    const featureImageUrl = stringCell(article.feature_image_url);
+    if (!featureImageUrl) blockers.add("missing_feature_image");
+    else if (!isHttpUrl(featureImageUrl)) blockers.add("invalid_feature_image_url");
+    if (!stringCell(article.feature_image_alt)) blockers.add("missing_feature_image_alt");
+
     const sources = parseListCell(article.source_urls);
     if (sources.length === 0 || sources.some((url) => !isHttpUrl(url))) blockers.add("missing_source_url");
     if (sources.some(hasTrackingParameters)) blockers.add("tracking_parameters_in_source_url");

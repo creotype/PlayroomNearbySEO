@@ -1,13 +1,16 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import type { AppConfig } from "../config.js";
-import type { Article } from "../domain/article.js";
+import type { Article, CellValue } from "../domain/article.js";
 import { articleContentHash, booleanCell, dateCell, stringCell } from "../domain/article.js";
 import { assertTransition } from "../domain/transitions.js";
 import type { GhostAdminClient, GhostPost } from "../ghost/client.js";
 import { buildGhostPayload, ghostArticleSlug, publicArticleUrl } from "../ghost/payload.js";
 import { KeyedMutex } from "../lib/keyed-mutex.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
+import { nextPublicationAt, parseLocalClockTime } from "./editorial-clock.js";
+
+const DEFAULT_PUBLICATION_GRACE_MINUTES = 15;
 
 export class PublicationService {
   constructor(
@@ -16,6 +19,7 @@ export class PublicationService {
     private readonly config: AppConfig,
     private readonly logger: Logger,
     private readonly mutex: KeyedMutex,
+    private readonly clock: () => Date = () => new Date(),
   ) {}
 
   async runOnce(): Promise<void> {
@@ -47,7 +51,15 @@ export class PublicationService {
     const article = await this.store.findArticle(articleId);
     if (!article || !["approved", "scheduled"].includes(article.status)) return;
     const scheduledAt = parseScheduledDate(article, timeZone);
-    if (article.status === "approved" && scheduledAt && scheduledAt.getTime() > Date.now()) {
+    const currentHash = articleContentHash(article);
+    const approvedHash = await this.#latestApprovedHash(article.article_id);
+    if (!approvedHash || approvedHash !== currentHash || stringCell(article.content_hash) !== currentHash) {
+      await this.#markConflict(article, currentHash, approvedHash);
+      return;
+    }
+
+    const now = this.clock();
+    if (article.status === "approved" && scheduledAt && scheduledAt.getTime() > now.getTime()) {
       assertTransition("approved", "scheduled");
       const now = new Date().toISOString();
       await this.store.patchArticle(article.article_id, { status: "scheduled", updated_at: now });
@@ -56,12 +68,12 @@ export class PublicationService {
       });
       return;
     }
-    if (article.status === "scheduled" && scheduledAt && scheduledAt.getTime() > Date.now()) return;
-
-    const currentHash = articleContentHash(article);
-    const approvedHash = await this.#latestApprovedHash(article.article_id);
-    if (!approvedHash || approvedHash !== currentHash || stringCell(article.content_hash) !== currentHash) {
-      await this.#markConflict(article, currentHash, approvedHash);
+    if (article.status === "scheduled" && scheduledAt && scheduledAt.getTime() > now.getTime()) return;
+    if (
+      scheduledAt &&
+      now.getTime() - scheduledAt.getTime() > publicationGraceMs(await this.store.getSettings())
+    ) {
+      await this.#rescheduleMissedWindow(article, currentHash, scheduledAt, now, timeZone, "scheduled");
       return;
     }
 
@@ -95,7 +107,68 @@ export class PublicationService {
     }
   }
 
+  async #rescheduleMissedWindow(
+    article: Article,
+    previousHash: string,
+    previousSchedule: Date,
+    now: Date,
+    timeZone: string,
+    targetStatus: "approved" | "scheduled",
+  ): Promise<void> {
+    if (article.status !== targetStatus) assertTransition(article.status, targetStatus);
+    const settings = await this.store.getSettings();
+    const publicationTime = parseLocalClockTime(
+      settings.get("publication_time") as CellValue | undefined,
+      this.config.publicationTime,
+    );
+    const nextSchedule = nextPublicationAt(now, timeZone, publicationTime);
+    const nextScheduleIso = nextSchedule.toISOString();
+    const candidate = {
+      ...article,
+      status: targetStatus,
+      scheduled_publish_at: nextScheduleIso,
+    } as Article;
+    const nextHash = articleContentHash(candidate);
+    const updatedAt = now.toISOString();
+    await this.store.patchArticleAndAppendEvent(
+      article.article_id,
+      {
+        status: targetStatus,
+        scheduled_publish_at: nextScheduleIso,
+        content_hash: nextHash,
+        updated_at: updatedAt,
+      },
+      {
+        event_id: stableRescheduleEventId(
+          article.article_id,
+          article.status,
+          targetStatus,
+          previousSchedule,
+          nextSchedule,
+        ),
+        article_id: article.article_id,
+        event_type: "publication_rescheduled",
+        from_status: article.status,
+        to_status: targetStatus,
+        actor_type: "system",
+        actor_id: "publisher-rescheduler",
+        provider: "system",
+        provider_object_id: `missed-window:${previousSchedule.toISOString()}`,
+        message: "Missed publication window rescheduled to the next configured local time",
+        payload_json: JSON.stringify({
+          hash: nextHash,
+          previous_hash: previousHash,
+          previous_scheduled_at: previousSchedule.toISOString(),
+          scheduled_publish_at: nextScheduleIso,
+          detected_at: updatedAt,
+        }),
+        created_at: updatedAt,
+      },
+    );
+  }
+
   async #upsertAndPublish(article: Article, expectedHash: string): Promise<GhostPost> {
+    assertHeroImageReady(article);
     const expectedSlug = ghostArticleSlug(article);
     const storedId = stringCell(article.ghost_post_id);
     let post: GhostPost | undefined;
@@ -138,9 +211,10 @@ export class PublicationService {
   async #recoverPublishing(articleId: string, timeZone: string): Promise<void> {
     const article = await this.store.findArticle(articleId);
     if (!article || article.status !== "publishing") return;
+    const now = this.clock();
     const claimedAt = dateCell(article.updated_at, timeZone);
     const staleAfterMs = Math.max(this.config.pollIntervalMs * 4, 5 * 60_000);
-    if (claimedAt && Date.now() - claimedAt.getTime() < staleAfterMs) return;
+    if (claimedAt && now.getTime() - claimedAt.getTime() < staleAfterMs) return;
 
     const currentHash = articleContentHash(article);
     const approvedHash = await this.#latestApprovedHash(article.article_id);
@@ -181,11 +255,28 @@ export class PublicationService {
       await this.#failPublishing(article, `Stored Ghost post ${storedId} no longer exists`);
       return;
     }
+    if (ghostPost.status === "published") {
+      await this.#finalizePublished(article, ghostPost, currentHash);
+      return;
+    }
+    const scheduledAt = parseScheduledDate(article, timeZone);
+    if (
+      ghostPost.status === "draft" &&
+      scheduledAt &&
+      now.getTime() - scheduledAt.getTime() > publicationGraceMs(await this.store.getSettings())
+    ) {
+      await this.#rescheduleMissedWindow(
+        article,
+        currentHash,
+        scheduledAt,
+        now,
+        timeZone,
+        "approved",
+      );
+      return;
+    }
     try {
-      const published =
-        ghostPost.status === "published"
-          ? ghostPost
-          : await this.#upsertAndPublish(article, currentHash);
+      const published = await this.#upsertAndPublish(article, currentHash);
       await this.#finalizePublished(article, published, currentHash);
     } catch (error) {
       await this.#failPublishing(article, sanitizeError(error));
@@ -264,7 +355,17 @@ export class PublicationService {
   async #latestApprovedHash(articleId: string): Promise<string | undefined> {
     const events = await this.store.listEvents(articleId);
     for (const event of events.toReversed()) {
-      if (stringCell(event.event_type) !== "approved") continue;
+      const eventType = stringCell(event.event_type);
+      if (eventType !== "approved" && eventType !== "publication_rescheduled") continue;
+      if (
+        eventType === "publication_rescheduled" &&
+        !(
+          stringCell(event.actor_id) === "publisher-rescheduler" &&
+          stringCell(event.provider) === "system"
+        )
+      ) {
+        continue;
+      }
       try {
         const payload = JSON.parse(stringCell(event.payload_json)) as { hash?: unknown };
         if (typeof payload.hash === "string") return payload.hash;
@@ -376,12 +477,49 @@ function sanitizeError(error: unknown): string {
   return message.replace(/Ghost\s+[A-Za-z0-9._-]+/g, "Ghost [REDACTED]").slice(0, 500);
 }
 
+function assertHeroImageReady(article: Article): void {
+  const imageUrl = stringCell(article.feature_image_url);
+  if (!imageUrl) {
+    throw new Error("Hero image is missing; publication is blocked until generation/upload succeeds");
+  }
+  const alt = stringCell(article.feature_image_alt);
+  if (!alt) {
+    throw new Error("Hero image alt text is missing; publication is blocked until it is added");
+  }
+  try {
+    const parsed = new URL(imageUrl);
+    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("unsupported protocol");
+  } catch {
+    throw new Error("Hero image URL is invalid; publication is blocked until it is fixed");
+  }
+}
+
 function asCell(value: unknown): string | number | boolean | null | undefined {
   return ["string", "number", "boolean"].includes(typeof value)
     ? (value as string | number | boolean)
     : value === null
       ? null
       : undefined;
+}
+
+function publicationGraceMs(settings: Map<string, CellValue>): number {
+  const configured = Number(settings.get("publication_grace_minutes"));
+  const minutes = Number.isFinite(configured) && configured > 0
+    ? Math.min(configured, 60)
+    : DEFAULT_PUBLICATION_GRACE_MINUTES;
+  return minutes * 60_000;
+}
+
+function stableRescheduleEventId(
+  articleId: string,
+  fromStatus: string,
+  toStatus: string,
+  from: Date,
+  to: Date,
+): string {
+  const source = `${articleId}:${fromStatus}:${toStatus}:${from.toISOString()}:${to.toISOString()}`;
+  const hash = createHash("sha256").update(source).digest("hex").slice(0, 24);
+  return `evt-publication-rescheduled-${hash}`;
 }
 
 export type PublicPageVerification = { ok: boolean; status?: number; message: string };

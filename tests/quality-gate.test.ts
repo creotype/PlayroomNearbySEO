@@ -29,6 +29,8 @@ function article(overrides: Partial<Article> = {}): Article {
       "Praktični saveti za izbor igraonice u Beogradu, uz jasna pitanja o programu, prostoru i organizaciji proslave.",
     source_urls: "https://example.com/source",
     internal_links: internalUrl,
+    feature_image_url: "https://example.com/content/images/hero.webp",
+    feature_image_alt: "Tematska ilustracija: izbor igraonice",
     quality_score: 9,
     qa_status: "pass",
     qa_blockers: "",
@@ -106,5 +108,15 @@ describe("QualityGate content integrity", () => {
       }),
     );
     expect(result.blockers).toContain("meta_description_incomplete");
+  });
+
+  it("blocks approval when the hero image or its alt text is missing", async () => {
+    const result = await gate().evaluate(article({
+      feature_image_url: "",
+      feature_image_alt: "",
+    }));
+    expect(result.blockers).toEqual(
+      expect.arrayContaining(["missing_feature_image", "missing_feature_image_alt"]),
+    );
   });
 });

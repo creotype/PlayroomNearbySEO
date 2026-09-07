@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { Article } from "../domain/article.js";
-import { articleContentHash, stringCell } from "../domain/article.js";
+import { articleContentHash, dateCell, stringCell } from "../domain/article.js";
 import { assertTransition } from "../domain/transitions.js";
 import { KeyedMutex } from "../lib/keyed-mutex.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { QualityGate, QualityResult } from "./quality-gate.js";
+import { nextPublicationAt, parseLocalClockTime } from "./editorial-clock.js";
 
 export type TelegramActor = {
   id: number;
@@ -19,11 +20,18 @@ export type ApprovalResult =
   | { outcome: "blocked"; article: Article; quality: QualityResult }
   | { outcome: "invalid_status"; article: Article };
 
+export type ApprovalSchedulePolicy = {
+  timeZone: string;
+  publicationTime: string;
+  clock?: () => Date;
+};
+
 export class ApprovalService {
   constructor(
     private readonly store: GoogleSheetsStore,
     private readonly qualityGate: QualityGate,
     private readonly mutex: KeyedMutex,
+    private readonly schedulePolicy?: ApprovalSchedulePolicy,
   ) {}
 
   async approve(articleId: string, actor: TelegramActor): Promise<ApprovalResult> {
@@ -41,7 +49,12 @@ export class ApprovalService {
         return { outcome: "blocked", article, quality: await this.qualityGate.evaluate(article) };
       }
 
-      const currentHash = articleContentHash(article);
+      const nowDate = this.schedulePolicy?.clock?.() ?? new Date();
+      const scheduledPublishAt = await this.#scheduledPublishAt(article, nowDate);
+      const approvalCandidate = scheduledPublishAt
+        ? { ...article, scheduled_publish_at: scheduledPublishAt }
+        : article;
+      const currentHash = articleContentHash(approvalCandidate);
       const matchingApproval = events.some((event) => {
         if (stringCell(event.event_type) !== "approved") return false;
         return readEventHash(stringCell(event.payload_json)) === currentHash;
@@ -53,7 +66,7 @@ export class ApprovalService {
 
       const quality = await this.qualityGate.evaluate(article);
       if (!quality.passed) {
-        const now = new Date().toISOString();
+        const now = nowDate.toISOString();
         const updated = await this.store.patchArticleAndAppendEvent(article.article_id, {
           qa_status: "fail",
           qa_blockers: quality.blockers.join(","),
@@ -76,7 +89,7 @@ export class ApprovalService {
       }
 
       assertTransition(article.status, "approved");
-      const now = new Date().toISOString();
+      const now = nowDate.toISOString();
       const approvalEvent = {
         event_id: randomUUID(),
         article_id: article.article_id,
@@ -104,6 +117,7 @@ export class ApprovalService {
           content_hash: currentHash,
           approved_by: `telegram:${actor.id}`,
           approved_at: now,
+          ...(scheduledPublishAt ? { scheduled_publish_at: scheduledPublishAt } : {}),
           last_error: "",
           updated_at: now,
         },
@@ -151,6 +165,17 @@ export class ApprovalService {
     const article = await this.store.findArticle(articleId);
     if (!article) throw new Error(`Article not found: ${articleId}`);
     return article;
+  }
+
+  async #scheduledPublishAt(article: Article, now: Date): Promise<string | undefined> {
+    if (!this.schedulePolicy) return undefined;
+    const settings = await this.store.getSettings();
+    const timeZone = stringCell(settings.get("timezone")) || this.schedulePolicy.timeZone;
+    const publicationTime = stringCell(settings.get("publication_time")) || this.schedulePolicy.publicationTime;
+    const existing = dateCell(article.scheduled_publish_at, timeZone);
+    const notBefore = existing && existing.getTime() > now.getTime() ? existing : now;
+    const time = parseLocalClockTime(undefined, publicationTime);
+    return nextPublicationAt(notBefore, timeZone, time).toISOString();
   }
 }
 

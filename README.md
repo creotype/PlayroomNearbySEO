@@ -28,8 +28,11 @@ pretend those production attestations are complete.
 - Ghost 5.x JWT authentication, localized slugs (`-en`, `-rs`), HTML sanitization, draft-first upsert, optimistic `updated_at` lock, and public-page verification.
 - A durable Telegram publication outcome: after Ghost and the public page are verified, the review group receives the canonical article link exactly once per publication event; failures receive an actionable Sheet link instead.
 - OpenAI Responses API generation with web research and strict structured output.
+- A versioned Playroom hero-image pipeline using `gpt-image-2`: one topic-specific orange/yellow landscape WebP is generated before review, uploaded to Ghost, and attached as `feature_image` with localized alt text. The binary and upload result are cached durably, while missing/broken image data fails publication closed.
 - Append-only audit events, single-process per-article locking, health endpoints, Docker build, and unit tests.
 - Recovery for stale `publishing` claims, including reconciliation when Ghost was updated before a process crash.
+- Durable Monday/Friday editorial slots at 10:00 Europe/Belgrade. Each slot generates at most one article; an empty queue produces one actionable Telegram warning with the exact `keywords` link.
+- A 48-hour review SLA measured from the delivered review card. If no one approves or regenerates the article, a trusted system approval schedules it for the first 10:00 after the deadline; QA blockers still stop publication.
 
 ## Telegram commands
 
@@ -39,6 +42,12 @@ pretend those production attestations are complete.
 - `/help`
 
 Only one article can be in manual generation or review at a time. While a previous article is being generated or still awaits review, another `/generate` is rejected with a pointer to the existing work. `/regenerate editor feedback` immediately rewrites that sole active review article, and bare `/approve` approves it; sending either command as a direct reply selects the visible card explicitly. Editor feedback is mandatory for regeneration, while `/approve` accepts no arguments. There is no ARTICLE-ID fallback or inline action keyboard. Regeneration replaces the same review row only after OpenAI succeeds, keeps the old draft on failure, increments `revision_count`, and never reopens an approved or published article. Workflow commands from private chats or groups other than the configured review group are rejected. `/help` explains the three available actions.
+
+With `EDITORIAL_AUTOMATION_ENABLED=true`, durable weekly slots replace the legacy continuously-polled scheduled generator. Defaults are Monday and Friday (`1,5`) at `10:00` in `Europe/Belgrade`. A missed slot is caught up after restart, and an unresolved review keeps the slot pending instead of creating a second card. Completion is recorded in the append-only `events` sheet, so ordinary polls and restarts do not repeat it.
+
+The review timer starts only after Telegram accepts the card and its message ID/timestamp are stored in the article row. A successful `/regenerate` refreshes that row and resets the full review window. Manual approvals and timeout approvals both publish at 10:00 local: manual approval chooses the next available 10:00, while timeout approval chooses the first 10:00 after the 48-hour deadline. The approved hash includes that exact schedule. Timeout approval is a narrowly trusted `system:auto-review-timeout` audit event.
+
+The publisher accepts ordinary polling delay for 15 minutes after 10:00. If a VPS outage misses that bounded window, an already scheduled article is atomically moved to the next future `publication_time`; a `publication_rescheduled` audit event carries the newly authorized content hash. It is never published immediately at an arbitrary restart time. The optional Sheet setting `publication_grace_minutes` can tune the grace from 1 to a hard maximum of 60 minutes.
 
 `/generate` accepts no arguments. It reserves the physically topmost row on `keywords` whose status is `ready`; row order is the manual priority, so the numeric `priority` value is ignored for this dequeue. Keyword, locale, and content settings come from that existing row. A malformed top row is never skipped silently: Telegram names the row and invalid fields and links directly to the relevant Sheet range. After OpenAI returns an article, the keyword becomes `used` even if article QA fails; a technical generation failure instead moves it to `paused` without an automatic paid retry. The generated article still requires Telegram review and never bypasses QA or approval. Manual generation requires both `ALLOW_TELEGRAM_GENERATION=true` in the server environment and `telegram_generation_enabled=true` in the Sheet. Scheduled generation remains independently controlled by `generation_enabled`, but the same single-active-article gate prevents it from producing a second review card. Any arguments passed to `/generate` are rejected.
 
@@ -53,9 +62,35 @@ Required secrets:
 - either `GOOGLE_APPLICATION_CREDENTIALS` or `GOOGLE_SERVICE_ACCOUNT_JSON`
 - `OPENAI_API_KEY` to enable generation
 
+Article and image generation share `OPENAI_API_KEY`. Image defaults are intentionally explicit and may be overridden without changing code:
+
+```dotenv
+OPENAI_IMAGE_MODEL=gpt-image-2
+OPENAI_IMAGE_SIZE=1536x1024
+OPENAI_IMAGE_QUALITY=high
+HERO_IMAGE_CACHE_DIR=/app/data/hero-images
+```
+
+`OPENAI_IMAGE_SIZE` must be a valid landscape GPT Image resolution. Mount `HERO_IMAGE_CACHE_DIR` on persistent storage in Docker. Without that volume, a container replacement can repeat a paid generation; with it, generation and the returned Ghost URL survive restarts. The canonical visual rules and hard safety constraints live in [prompts/HERO_IMAGE_GUIDE.md](prompts/HERO_IMAGE_GUIDE.md). Do not edit them without incrementing the prompt version in code.
+
 The Google service account must be explicitly shared onto the spreadsheet as an editor. The Google authorization used interactively in Codex cannot be reused by the deployed process.
 
-The configured Ghost URL is the instance root, not the raw API path:
+Editorial server defaults are configured with:
+
+```dotenv
+EDITORIAL_AUTOMATION_ENABLED=true
+EDITORIAL_TIME_ZONE=Europe/Belgrade
+EDITORIAL_RUN_DAYS=1,5
+EDITORIAL_RUN_TIME=10:00
+AUTO_PUBLISH_AFTER_REVIEW=true
+REVIEW_DEADLINE_HOURS=48
+PUBLICATION_TIME=10:00
+```
+
+The Sheet can override these without a redeploy through `editorial_automation_enabled`, `editorial_run_days`, `editorial_run_time`, `auto_publish_after_review`, `review_deadline_hours`, and `publication_time` in `settings`. For compatibility, `auto_publish_without_approval` and `review_window_hours` are used when their newer aliases are absent. The existing `generation_enabled` and publication gates remain absolute switches. Weekdays use `0=Sunday ... 6=Saturday`.
+
+The configured Ghost URL is the instance root, not the raw API path. Production uses
+`https://playroom-kids.app/internal`; staging uses the example below:
 
 ```dotenv
 GHOST_ADMIN_URL=https://beaver.run.place/internal
@@ -72,7 +107,9 @@ npm run build
 npm run dev
 ```
 
-On the configured Windows workstation, run `scripts/install-windows.ps1` once. It builds the service and the lightweight tray controller, creates a `Playroom SEO Bot` desktop shortcut, and does not add Windows-login autostart. Opening the shortcut starts the controller and bot. The tray menu exposes Start, Stop, Restart, and Exit; Stop and Exit request graceful service shutdown before any forced fallback.
+`scripts/install-windows.ps1` is retained only for isolated local development. Do not run the
+Windows tray instance with the production Telegram token: production has exactly one long-poller
+in the VPS container.
 
 Health endpoints:
 
@@ -81,7 +118,7 @@ Health endpoints:
 
 ## Deployment
 
-Run exactly one replica initially. Telegram long polling and the current in-process locks assume a single writer. Mount the Google service-account JSON as a Docker secret, inject the remaining secrets through the server's secret store, and keep `DRY_RUN=true` for the first staging pass.
+Run exactly one replica. Telegram long polling and the current in-process locks assume a single writer. The production VPS recipe is in [deploy/vps/README.md](deploy/vps/README.md): it creates one private Docker network, publishes no port, applies CPU/memory/PID/security limits, persists `/app/data/hero-images`, rotates logs, and installs a watchdog scoped only to `playroom-seo-bot`.
 
 The current `/internal/` Ghost is not truly private: public Ghost pages, sitemap, and RSS are reachable even though `robots.txt` disallows crawling. Keep `technical_seo_ready=false` until canonical, hreflang, RU routing, and exposure decisions are resolved.
 
