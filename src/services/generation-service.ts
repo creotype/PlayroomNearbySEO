@@ -82,6 +82,12 @@ export type RegenerationRequest = {
   expectedContentHash?: string;
   /** Automatic repair may only spend against a draft that still fails QA. */
   requireQaFailure?: boolean;
+  /**
+   * The current manual flag was written by an interrupted automatic-repair
+   * terminal, rather than by a human or the quality gate. This narrowly lets
+   * the recovered system attempt replace that flag with its fresh QA result.
+   */
+  recoverSystemManualGate?: boolean;
 };
 
 export type RegenerationResult =
@@ -391,7 +397,9 @@ export class GenerationService {
       const heroImageFields = await this.#prepareHeroImage(candidate);
       candidate = { ...candidate, ...heroImageFields } as Article;
       const quality = await this.#evaluateGeneratedCandidate(candidate, generated.qa_blockers);
-      const stickyManualRequired = provider === "system" && booleanCell(article.manual_required);
+      const stickyManualRequired = provider === "system" &&
+        booleanCell(article.manual_required) &&
+        !request.recoverSystemManualGate;
       const manualRequired = quality.manualRequired || stickyManualRequired;
       const blockers = stickyManualRequired && !quality.blockers.includes("manual_required")
         ? [...quality.blockers, "manual_required"].sort()

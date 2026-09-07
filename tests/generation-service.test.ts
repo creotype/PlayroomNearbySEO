@@ -1155,6 +1155,31 @@ describe("article regeneration", () => {
     expect(String(test.articleRows[0]?.qa_blockers)).toContain("manual_required");
   });
 
+  it("lets a recovered automatic attempt replace only its system-created manual gate", async () => {
+    const test = setup({
+      articles: [reviewArticle({ status: "failed_qa", manual_required: true })],
+      settings: settings({ generation_enabled: true }),
+    });
+
+    const result = await test.service.regenerateArticle({
+      ...regenerationRequest,
+      actorId: "auto-qa-repair",
+      actorName: "Automatic QA repair",
+      actorType: "system",
+      provider: "system",
+      providerObjectId: "recovered-system-gate",
+      recoverSystemManualGate: true,
+    });
+
+    expect(result).toMatchObject({ outcome: "regenerated" });
+    expect(test.articleRows[0]).toMatchObject({
+      status: "needs_review",
+      qa_status: "pass",
+      qa_blockers: "",
+      manual_required: false,
+    });
+  });
+
   it("rejects an automatic repair before spending when its expected draft hash is stale", async () => {
     const article = reviewArticle({ status: "failed_qa", manual_required: false });
     const expectedContentHash = articleContentHash(article);

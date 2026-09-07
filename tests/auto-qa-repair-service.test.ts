@@ -14,9 +14,10 @@ import type {
   RegenerationRequest,
   RegenerationResult,
 } from "../src/services/generation-service.js";
+import { ReviewNotifier } from "../src/services/review-notifier.js";
 import type { SeoBot } from "../src/telegram/bot.js";
 
-type RegenerationMode = "pass" | "fail" | "blocked" | "stale" | "throw";
+type RegenerationMode = "pass" | "fail" | "blocked" | "stale" | "throw" | "prepaid_throw";
 
 function repairArticle(overrides: Partial<SheetRecord> = {}): Article {
   const article = {
@@ -86,8 +87,15 @@ function setup(options: {
       ["telegram_chat_id", options.chatId === null ? "" : (options.chatId ?? -5484259760)],
     ]),
     listArticles,
+    listKeywords: async () => [],
     findArticle: async (articleId: string) =>
       articles.find((candidate) => candidate.article_id === articleId),
+    patchArticle: async (articleId: string, patch: Record<string, CellValue>) => {
+      const candidate = articles.find((row) => row.article_id === articleId);
+      if (!candidate) throw new Error(`Missing article ${articleId}`);
+      Object.assign(candidate, patch);
+      return candidate;
+    },
     listEvents: async (articleId: string) =>
       events.filter((event) => event.article_id === articleId),
     patchArticleAndAppendEvent,
@@ -99,7 +107,7 @@ function setup(options: {
   const regenerateArticle = vi.fn(async (request: RegenerationRequest): Promise<RegenerationResult> => {
     startedWasDurable.push(events.some((event) => event.event_type === "auto_qa_repair_started"));
     manualFlagAtCall.push(article.manual_required ?? false);
-    if (mode === "throw") throw new Error("upstream secret detail");
+    if (mode === "prepaid_throw") throw new Error("sheets quota before paid ledger");
     if (mode === "blocked") {
       return { outcome: "blocked", reason: "generator_not_configured", article };
     }
@@ -114,6 +122,18 @@ function setup(options: {
       });
       return { outcome: "blocked", reason: "stale_article", article };
     }
+    append({
+      event_id: `evt-regeneration-attempt-${events.length}`,
+      article_id: article.article_id,
+      event_type: "regeneration_attempt_started",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "system",
+      provider_object_id: `system:${request.providerObjectId}`,
+      payload_json: JSON.stringify({ base_hash: articleContentHash(article) }),
+      created_at: "2026-09-07T08:00:30.000Z",
+    });
+    if (mode === "throw") throw new Error("upstream secret detail");
 
     Object.assign(article, mode === "pass"
       ? {
@@ -176,6 +196,9 @@ function setup(options: {
     events,
     listArticles,
     patchArticleAndAppendEvent,
+    store,
+    bot,
+    config,
     regenerateArticle,
     editMessageText,
     sendMessage,
@@ -230,6 +253,7 @@ describe("AutoQaRepairService", () => {
       input_hash: inputHash,
       attempt: 1,
       max_attempts: 1,
+      manual_required_before_attempt: false,
     });
     expect(test.editMessageText).toHaveBeenCalledTimes(1);
     expect(test.editMessageText).toHaveBeenCalledWith(
@@ -277,7 +301,59 @@ describe("AutoQaRepairService", () => {
     expect(test.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("does not replay an ambiguous paid call after a restart", async () => {
+  it("resumes an outer start when no paid-attempt ledger was written", async () => {
+    const article = repairArticle({ status: "failed_qa", telegram_message_id: 60 });
+    const inputHash = articleContentHash(article);
+    const started: SheetRecord = {
+      __rowNumber: 20,
+      event_id: "evt-auto-started-before-quota-error",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_started",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "openai",
+      provider_object_id: "auto-qa-repair:prepaid-recovery",
+      payload_json: JSON.stringify({
+        input_hash: inputHash,
+        hash: inputHash,
+        attempt: 1,
+      }),
+      created_at: "2026-09-07T08:00:00.000Z",
+    };
+    const test = setup({ article, events: [started] });
+
+    await test.service.runOnce();
+    await test.service.runOnce();
+
+    expect(test.regenerateArticle).toHaveBeenCalledTimes(1);
+    expect(test.article).toMatchObject({ status: "needs_review", qa_status: "pass" });
+    expect(eventsOf(test, "auto_qa_repair_recovery_progress")).toHaveLength(1);
+    expect(eventsOf(test, "auto_qa_repair_completed")).toHaveLength(1);
+    expect(eventsOf(test, "auto_qa_repair_exhausted")).toHaveLength(0);
+  });
+
+  it("retries safely after a pre-paid Sheets error and records only one paid attempt", async () => {
+    const test = setup();
+    test.regenerateArticle.mockRejectedValueOnce(new Error("sheets quota before paid ledger"));
+
+    await test.service.runOnce();
+
+    expect(test.regenerateArticle).toHaveBeenCalledTimes(1);
+    expect(eventsOf(test, "regeneration_attempt_started")).toHaveLength(0);
+    expect(eventsOf(test, "auto_qa_repair_exhausted")).toHaveLength(0);
+    expect(test.article).toMatchObject({ qa_status: "fail", manual_required: false });
+
+    await test.service.runOnce();
+    await test.service.runOnce();
+
+    expect(test.regenerateArticle).toHaveBeenCalledTimes(2);
+    expect(eventsOf(test, "regeneration_attempt_started")).toHaveLength(1);
+    expect(eventsOf(test, "auto_qa_repair_completed")).toHaveLength(1);
+    expect(eventsOf(test, "auto_qa_repair_exhausted")).toHaveLength(0);
+    expect(test.article).toMatchObject({ status: "needs_review", qa_status: "pass" });
+  });
+
+  it("does not replay an ambiguous paid call after its inner ledger exists", async () => {
     const article = repairArticle({ status: "failed_qa", telegram_message_id: 60 });
     const inputHash = articleContentHash(article);
     const started: SheetRecord = {
@@ -292,7 +368,19 @@ describe("AutoQaRepairService", () => {
       payload_json: JSON.stringify({ input_hash: inputHash, hash: inputHash, attempt: 1 }),
       created_at: "2026-09-07T08:00:00.000Z",
     };
-    const test = setup({ article, events: [started] });
+    const paidAttempt: SheetRecord = {
+      __rowNumber: 21,
+      event_id: "evt-inner-paid-attempt-before-crash",
+      article_id: article.article_id,
+      event_type: "regeneration_attempt_started",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "system",
+      provider_object_id: "system:auto-qa-repair:crashed-operation",
+      payload_json: JSON.stringify({ base_hash: inputHash }),
+      created_at: "2026-09-07T08:00:01.000Z",
+    };
+    const test = setup({ article, events: [started, paidAttempt] });
 
     await test.service.runOnce();
     await test.service.runOnce();
@@ -307,6 +395,220 @@ describe("AutoQaRepairService", () => {
       started_event_id: "evt-auto-started-before-crash",
     });
     expect(test.editMessageText).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers an already-notified false exhaustion on the same message and reaches the final card", async () => {
+    const article = repairArticle({
+      status: "failed_qa",
+      manual_required: true,
+      telegram_message_id: 60,
+    });
+    const inputHash = articleContentHash(article);
+    const started: SheetRecord = {
+      __rowNumber: 20,
+      event_id: "evt-auto-started-quota-recovery",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_started",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "openai",
+      provider_object_id: "auto-qa-repair:quota-recovery",
+      payload_json: JSON.stringify({
+        input_hash: inputHash,
+        hash: inputHash,
+        attempt: 1,
+      }),
+      created_at: "2026-09-07T08:00:00.000Z",
+    };
+    const exhausted: SheetRecord = {
+      __rowNumber: 21,
+      event_id: "evt-false-exhausted-after-quota",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_exhausted",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "system",
+      provider_object_id: "auto-qa-repair:quota-recovery",
+      payload_json: JSON.stringify({
+        input_hash: inputHash,
+        output_hash: inputHash,
+        detail: "interrupted_after_attempt_started",
+        started_event_id: started.event_id,
+        qa_blockers: "article_too_short",
+      }),
+      created_at: "2026-09-07T08:01:00.000Z",
+    };
+    const notified: SheetRecord = {
+      __rowNumber: 22,
+      event_id: "evt-false-exhausted-notified",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_notified",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "telegram",
+      provider_object_id: "60",
+      payload_json: JSON.stringify({ terminal_event_id: exhausted.event_id, message_id: 60 }),
+      created_at: "2026-09-07T08:01:01.000Z",
+    };
+    const test = setup({ article, events: [started, exhausted, notified] });
+
+    await test.service.runOnce();
+
+    expect(test.regenerateArticle).toHaveBeenCalledOnce();
+    expect(test.regenerateArticle).toHaveBeenCalledWith(expect.objectContaining({
+      recoverSystemManualGate: true,
+    }));
+    expect(test.manualFlagAtCall).toEqual([true]);
+    expect(test.article).toMatchObject({
+      status: "needs_review",
+      qa_status: "pass",
+      manual_required: false,
+      telegram_message_id: 60,
+    });
+    expect(eventsOf(test, "auto_qa_repair_recovery_progress")).toHaveLength(1);
+    expect(eventsOf(test, "auto_qa_repair_completed")).toHaveLength(1);
+    expect(test.editMessageText).toHaveBeenCalledTimes(1);
+    expect(String(test.editMessageText.mock.calls[0]?.[2])).toContain("Ничего делать пока не нужно");
+
+    const notifier = new ReviewNotifier(
+      test.store,
+      test.bot,
+      test.config,
+      test.logger,
+    );
+    await notifier.runOnce();
+
+    expect(test.editMessageText).toHaveBeenCalledTimes(2);
+    const finalCard = String(test.editMessageText.mock.calls[1]?.[2]);
+    expect(finalCard).toContain("SEO draft");
+    expect(finalCard).toContain("Внутренняя проверка пройдена");
+    expect(finalCard).not.toContain("article_too_short");
+  });
+
+  it("reconciles a failed H2 committed after a false exhaustion without buying another attempt", async () => {
+    const article = repairArticle({ status: "failed_qa", manual_required: true, revision_count: 0 });
+    const inputHash = articleContentHash(article);
+    Object.assign(article, {
+      title: "Druga verzija koja i dalje zahteva ručnu proveru",
+      body_markdown: "Izmenjen sadržaj drugog pokušaja.".repeat(40),
+      qa_status: "fail",
+      qa_blockers: "missing_authoritative_source",
+      manual_required: true,
+      revision_count: 1,
+      content_hash: "",
+    });
+    const outputHash = articleContentHash(article);
+    expect(outputHash).not.toBe(inputHash);
+
+    const providerObjectId = "auto-qa-repair:committed-failed-h2";
+    const started: SheetRecord = {
+      __rowNumber: 20,
+      event_id: "evt-auto-started-failed-h2",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_started",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "openai",
+      provider_object_id: providerObjectId,
+      payload_json: JSON.stringify({ input_hash: inputHash, attempt: 1 }),
+      created_at: "2026-09-07T08:00:00.000Z",
+    };
+    const falseTerminal: SheetRecord = {
+      __rowNumber: 21,
+      event_id: "evt-false-exhausted-failed-h2",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_exhausted",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "system",
+      provider_object_id: providerObjectId,
+      payload_json: JSON.stringify({
+        input_hash: inputHash,
+        output_hash: inputHash,
+        detail: "interrupted_after_attempt_started",
+        started_event_id: started.event_id,
+        qa_blockers: "quality_score_below_threshold",
+      }),
+      created_at: "2026-09-07T08:00:01.000Z",
+    };
+    const oldNotification: SheetRecord = {
+      __rowNumber: 22,
+      event_id: "evt-old-false-exhausted-notification",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_notified",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "telegram",
+      provider_object_id: "60",
+      payload_json: JSON.stringify({ terminal_event_id: falseTerminal.event_id, message_id: 60 }),
+      created_at: "2026-09-07T08:00:02.000Z",
+    };
+    const recoveryProgress: SheetRecord = {
+      __rowNumber: 23,
+      event_id: "evt-recovery-progress-failed-h2",
+      article_id: article.article_id,
+      event_type: "auto_qa_repair_recovery_progress",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "telegram",
+      provider_object_id: "60",
+      payload_json: JSON.stringify({ started_event_id: started.event_id, input_hash: inputHash }),
+      created_at: "2026-09-07T08:00:03.000Z",
+    };
+    const paidAttempt: SheetRecord = {
+      __rowNumber: 24,
+      event_id: "evt-paid-attempt-failed-h2",
+      article_id: article.article_id,
+      event_type: "regeneration_attempt_started",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "system",
+      provider_object_id: `system:${providerObjectId}`,
+      payload_json: JSON.stringify({ base_hash: inputHash }),
+      created_at: "2026-09-07T08:00:04.000Z",
+    };
+    const regenerated: SheetRecord = {
+      __rowNumber: 25,
+      event_id: "evt-regenerated-failed-h2",
+      article_id: article.article_id,
+      event_type: "regenerated",
+      actor_type: "system",
+      actor_id: "auto-qa-repair",
+      provider: "system",
+      provider_object_id: `system:${providerObjectId}`,
+      payload_json: JSON.stringify({ previous_hash: inputHash, revision_count: 1 }),
+      created_at: "2026-09-07T08:00:05.000Z",
+    };
+    const test = setup({
+      article,
+      events: [
+        started,
+        falseTerminal,
+        oldNotification,
+        recoveryProgress,
+        paidAttempt,
+        regenerated,
+      ],
+    });
+
+    await test.service.runOnce();
+    await test.service.runOnce();
+
+    expect(test.regenerateArticle).not.toHaveBeenCalled();
+    const realTerminals = eventsOf(test, "auto_qa_repair_exhausted").filter((event) =>
+      payload(event).detail !== "interrupted_after_attempt_started",
+    );
+    expect(realTerminals).toHaveLength(1);
+    expect(payload(realTerminals[0]!)).toMatchObject({
+      input_hash: inputHash,
+      output_hash: outputHash,
+      outcome: "exhausted",
+    });
+    expect(eventsOf(test, "auto_qa_repair_notified")).toHaveLength(2);
+    expect(test.editMessageText).toHaveBeenCalledTimes(1);
+    const warning = String(test.editMessageText.mock.calls[0]?.[2]);
+    expect(warning).toContain("Не удалось исправить статью автоматически");
+    expect(warning).not.toContain("missing_authoritative_source");
   });
 
   it("records an exhausted terminal state when generation throws without exposing details", async () => {
