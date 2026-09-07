@@ -453,17 +453,31 @@ function legacyCallbackUpdate(action: "approve" | "regenerate" | "status") {
 }
 
 describe("minimal Telegram review workflow", () => {
-  it("/help documents only generation, current-article regeneration, and approval", async () => {
+  it("/help documents commands, editorial automation, review SLA, QA, and publication timing", async () => {
     const test = botHarness();
     await test.bot.handleUpdate(commandUpdate("help"));
 
-    const help = String(sentMessagePayload(test)?.text ?? "");
+    const payload = sentMessagePayload(test);
+    const help = String(payload?.text ?? "");
     expect(help).toContain("/generate");
     expect(help).toContain("/regenerate");
     expect(help).toContain("/approve");
     expect(help.toLowerCase()).toContain("коммент");
     expect(help.toLowerCase()).toMatch(/одн.*стать/);
     expect(help.toLowerCase()).toMatch(/approve.*без.*текст/);
+    expect(help.toLowerCase()).toContain("понедельникам");
+    expect(help.toLowerCase()).toContain("пятницам");
+    expect(help).toContain("10:00");
+    expect(help).toContain("48 часов");
+    expect(help).toContain("QA");
+    expect(help.toLowerCase()).toContain("картин");
+    expect(help).toContain("Ghost");
+    expect(help.toLowerCase()).toContain("технической ошибке");
+    expect(help.toLowerCase()).toContain("нужную строку таблицы");
+    expect(help).toContain("https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000002");
+    expect(help.length).toBeLessThanOrEqual(4096);
+    expect(payload?.parse_mode).toBe("HTML");
+    expect(payload?.link_preview_options).toEqual({ is_disabled: true });
     expect(help).not.toContain("/seo_");
     expect(help).not.toContain("/status");
     expect(help).not.toContain("/cancel");
