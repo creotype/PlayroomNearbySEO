@@ -33,9 +33,9 @@
 - [x] Set production frontend base URL and production Ghost target.
 - [x] Implement durable Monday/Friday 10:00 Europe/Belgrade generation slots with an actionable empty-queue warning.
 - [x] Enforce a 48-hour card-based review SLA and schedule human/timeout approvals for 10:00 local.
-- [ ] Deploy one Docker replica with restart policy, logs, and `/readyz` monitoring.
+- [x] Deploy one isolated Docker replica on the shared VPS with restart policy, bounded logs, `/readyz` monitoring, and a narrowly scoped health watchdog.
 - [ ] Add daily recovery for stale `generating`/`publishing` rows.
-- [ ] Turn on `security_ready`, then `technical_seo_ready`, then generation; enable publication last.
+- [x] Turn on `security_ready`, then `technical_seo_ready`, then generation; enable publication last.
 - [ ] Review the first ten posts manually and tune prompts/QA thresholds from observed failures.
 
 ## P2 — follow-up automation
