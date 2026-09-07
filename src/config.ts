@@ -63,7 +63,7 @@ const envSchema = z
     TARGET_ENVIRONMENT: z.enum(["staging", "production"]).default("staging"),
     PORT: integerFromEnv.default(8080),
     LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
-    POLL_INTERVAL_MS: integerFromEnv.min(5_000).default(15_000),
+    POLL_INTERVAL_MS: integerFromEnv.min(5_000).default(60_000),
     DRY_RUN: booleanFromEnv.default(true),
     ALLOW_GHOST_PUBLISH: booleanFromEnv.default(false),
     ALLOW_TELEGRAM_GENERATION: booleanFromEnv.default(false),

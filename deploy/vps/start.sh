@@ -72,6 +72,7 @@ docker run --detach \
   --env AUTO_PUBLISH_AFTER_REVIEW=true \
   --env REVIEW_DEADLINE_HOURS=48 \
   --env PUBLICATION_TIME=10:00 \
+  --env POLL_INTERVAL_MS=60000 \
   --env OPENAI_IMAGE_MODEL=gpt-image-2 \
   --env OPENAI_IMAGE_SIZE=1536x1024 \
   --env OPENAI_IMAGE_QUALITY=high \

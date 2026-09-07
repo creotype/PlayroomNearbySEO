@@ -26,6 +26,7 @@ describe("loadConfig", () => {
     expect(config.autoPublishAfterReview).toBe(true);
     expect(config.reviewDeadlineHours).toBe(48);
     expect(config.publicationTime).toBe("10:00");
+    expect(config.pollIntervalMs).toBe(60_000);
   });
 
   it("requires an explicit Google runtime identity", () => {

@@ -45,6 +45,8 @@ Only one article can be in manual generation or review at a time. While a previo
 
 With `EDITORIAL_AUTOMATION_ENABLED=true`, durable weekly slots replace the legacy continuously-polled scheduled generator. Defaults are Monday and Friday (`1,5`) at `10:00` in `Europe/Belgrade`. A missed slot is caught up after restart, and an unresolved review keeps the slot pending instead of creating a second card. Completion is recorded in the append-only `events` sheet, so ordinary polls and restarts do not repeat it.
 
+The VPS runs one combined background cycle per minute to stay within Google Sheets per-user read quotas. Telegram acknowledges commands immediately; queued generation, publication and final-link delivery can begin on the next cycle.
+
 The review timer starts only after Telegram accepts the card and its message ID/timestamp are stored in the article row. A successful `/regenerate` refreshes that row and resets the full review window. Manual approvals and timeout approvals both publish at 10:00 local: manual approval chooses the next available 10:00, while timeout approval chooses the first 10:00 after the 48-hour deadline. The approved hash includes that exact schedule. Timeout approval is a narrowly trusted `system:auto-review-timeout` audit event.
 
 The publisher accepts ordinary polling delay for 15 minutes after 10:00. If a VPS outage misses that bounded window, an already scheduled article is atomically moved to the next future `publication_time`; a `publication_rescheduled` audit event carries the newly authorized content hash. It is never published immediately at an arbitrary restart time. The optional Sheet setting `publication_grace_minutes` can tune the grace from 1 to a hard maximum of 60 minutes.
