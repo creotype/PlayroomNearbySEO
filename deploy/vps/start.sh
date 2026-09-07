@@ -14,6 +14,11 @@ DATA_DIR="$DEPLOY_ROOT/data"
 CONTAINER_NAME="playroom-seo-bot"
 NETWORK_NAME="playroom-seo-net"
 SECRETS_GROUP="playroom-seo-secrets"
+DEPLOY_LOCK="/run/lock/playroom-seo-bot.lock"
+
+command -v flock >/dev/null 2>&1 || { echo "Missing flock (util-linux)" >&2; exit 69; }
+exec 9>"$DEPLOY_LOCK"
+flock -x 9
 
 test -f "$RUNTIME_ENV" || { echo "Missing $RUNTIME_ENV" >&2; exit 66; }
 test -f "$GOOGLE_CREDENTIALS" || { echo "Missing $GOOGLE_CREDENTIALS" >&2; exit 66; }
