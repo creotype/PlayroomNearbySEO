@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { AppConfig } from "../src/config.js";
 import type { Article, CellValue, SheetRecord } from "../src/domain/article.js";
+import {
+  LEGACY_SERBIAN_HOME_URL,
+  PRODUCTION_SERBIAN_HOME_URL,
+} from "../src/domain/internal-links.js";
 import type { GoogleSheetsStore } from "../src/sheets/google-sheets.js";
 import { QualityGate } from "../src/services/quality-gate.js";
 
@@ -63,6 +67,32 @@ function gate(settings: Record<string, CellValue> = {}): QualityGate {
   return new QualityGate(store as unknown as GoogleSheetsStore, config);
 }
 
+function productionGate(allowedUrl = LEGACY_SERBIAN_HOME_URL): QualityGate {
+  const store = {
+    getSettings: async () =>
+      new Map<string, CellValue>([
+        ["qa_min_score", 8],
+        ["enabled_locales", "sr,en"],
+        ["ru_enabled", false],
+      ]),
+    listLinks: async () =>
+      [
+        {
+          __rowNumber: 10,
+          environment: "production",
+          locale: "sr",
+          url: allowedUrl,
+          status: "active",
+          allow_internal_link: true,
+        },
+      ] as SheetRecord[],
+  };
+  return new QualityGate(
+    store as unknown as GoogleSheetsStore,
+    { targetEnvironment: "production" } as AppConfig,
+  );
+}
+
 describe("QualityGate content integrity", () => {
   it("passes a clean article using Sheet-native pass status", async () => {
     await expect(gate().evaluate(article())).resolves.toEqual({
@@ -118,5 +148,38 @@ describe("QualityGate content integrity", () => {
     expect(result.blockers).toEqual(
       expect.arrayContaining(["missing_feature_image", "missing_feature_image_alt"]),
     );
+  });
+
+  it("accepts only the canonical Serbian home CTA even when Sheet still contains the legacy URL", async () => {
+    const body = `${Array.from({ length: 510 }, () => "savet").join(" ")}\n\n` +
+      `[Istražite Playroom](${PRODUCTION_SERBIAN_HOME_URL})`;
+    await expect(productionGate().evaluate(article({
+      body_markdown: body,
+      internal_links: PRODUCTION_SERBIAN_HOME_URL,
+    }))).resolves.toEqual({ passed: true, blockers: [], score: 9 });
+  });
+
+  it("rejects the obsolete Serbian home URL even when it is active in Sheet", async () => {
+    const body = `${Array.from({ length: 510 }, () => "savet").join(" ")}\n\n` +
+      `[Istražite Playroom](${LEGACY_SERBIAN_HOME_URL})`;
+    const result = await productionGate().evaluate(article({
+      body_markdown: body,
+      internal_links: LEGACY_SERBIAN_HOME_URL,
+    }));
+    expect(result.blockers).toEqual(expect.arrayContaining([
+      "external_url_in_body",
+      "invalid_internal_link",
+      "internal_link_not_in_body",
+    ]));
+  });
+
+  it("requires the canonical Serbian CTA near the end of the article", async () => {
+    const body = `[Istražite Playroom](${PRODUCTION_SERBIAN_HOME_URL})\n\n` +
+      Array.from({ length: 510 }, () => "savet").join(" ");
+    const result = await productionGate(PRODUCTION_SERBIAN_HOME_URL).evaluate(article({
+      body_markdown: body,
+      internal_links: PRODUCTION_SERBIAN_HOME_URL,
+    }));
+    expect(result.blockers).toContain("internal_link_not_in_body");
   });
 });

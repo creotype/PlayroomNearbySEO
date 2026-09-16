@@ -6,6 +6,10 @@ import {
   parseListCell,
   stringCell,
 } from "../domain/article.js";
+import {
+  canonicalInternalUrl,
+  PRODUCTION_SERBIAN_HOME_URL,
+} from "../domain/internal-links.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 
 export type QualityResult = {
@@ -57,7 +61,7 @@ export class QualityGate {
     const allowedLinks = new Set(
       links
         .filter((row) => isAllowedLink(row, article.locale, this.config.targetEnvironment))
-        .map((row) => normalizeUrl(stringCell(row.url))),
+        .map((row) => normalizeUrl(canonicalInternalUrl(article.locale, stringCell(row.url)))),
     );
     for (const url of requestedInternalLinks) {
       if (!allowedLinks.has(normalizeUrl(url))) blockers.add("invalid_internal_link");
@@ -70,6 +74,15 @@ export class QualityGate {
     const markdownLinks = new Set(extractMarkdownLinkUrls(article.body_markdown).map(normalizeUrl));
     for (const url of requestedInternalLinks) {
       if (!markdownLinks.has(normalizeUrl(url))) blockers.add("internal_link_not_in_body");
+    }
+    if (this.config.targetEnvironment === "production" && article.locale === "sr") {
+      const canonicalSerbianHome = normalizeUrl(PRODUCTION_SERBIAN_HOME_URL);
+      const requestedLinks = new Set(requestedInternalLinks.map(normalizeUrl));
+      const finalSectionLinks = new Set(
+        extractMarkdownLinkUrls(article.body_markdown.trimEnd().slice(-1_500)).map(normalizeUrl),
+      );
+      if (!requestedLinks.has(canonicalSerbianHome)) blockers.add("invalid_internal_link");
+      if (!finalSectionLinks.has(canonicalSerbianHome)) blockers.add("internal_link_not_in_body");
     }
     if (/\]\s*\.\s*\(\s*https?:\/\//iu.test(article.body_markdown)) {
       blockers.add("malformed_markdown_link");

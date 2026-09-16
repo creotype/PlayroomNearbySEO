@@ -2,6 +2,10 @@ import type OpenAI from "openai";
 import { describe, expect, it, vi } from "vitest";
 import type { SheetRecord } from "../src/domain/article.js";
 import {
+  LEGACY_SERBIAN_HOME_URL,
+  PRODUCTION_SERBIAN_HOME_URL,
+} from "../src/domain/internal-links.js";
+import {
   buildArticlePrompt,
   buildRevisionAuditPrompt,
   type ArticleGenerationInput,
@@ -121,6 +125,18 @@ describe("article revision prompt", () => {
     expect(prompt.system).toContain("Fail only for a material, specific violation");
     expect(prompt.system).toContain("do not all have to be repeated");
   });
+
+  it("normalizes the Serbian allow-list and requires the canonical final CTA", () => {
+    const input = revisionInput();
+    input.keyword.locale = "sr";
+    input.allowedLinks[0]!.locale = "sr";
+    input.allowedLinks[0]!.url = LEGACY_SERBIAN_HOME_URL;
+    const prompt = buildArticlePrompt(input);
+
+    expect(prompt.user).toContain(PRODUCTION_SERBIAN_HOME_URL);
+    expect(prompt.user).toContain("final call to action");
+    expect(prompt.user).not.toContain(LEGACY_SERBIAN_HOME_URL);
+  });
 });
 
 describe("bounded revision compliance audit", () => {
@@ -217,5 +233,27 @@ describe("bounded revision compliance audit", () => {
 
     await expect(generator.generate(input)).resolves.toEqual(first);
     expect(parse).toHaveBeenCalledOnce();
+  });
+
+  it("canonicalizes a legacy Serbian CTA returned by the model", async () => {
+    const input = revisionInput();
+    delete input.revision;
+    input.keyword.locale = "sr";
+    input.allowedLinks[0]!.locale = "sr";
+    input.allowedLinks[0]!.url = LEGACY_SERBIAN_HOME_URL;
+    const first = {
+      ...generated("legacy-serbian-link"),
+      body_markdown: `${generated("legacy-serbian-link").body_markdown}\n\n` +
+        `[Istražite Playroom](${LEGACY_SERBIAN_HOME_URL})`,
+      internal_links: [LEGACY_SERBIAN_HOME_URL],
+    };
+    const { client, parse } = mockClient([first]);
+    const generator = new OpenAiArticleGenerator("sk-test-value", "gpt-test", client);
+
+    const result = await generator.generate(input);
+    expect(parse).toHaveBeenCalledOnce();
+    expect(result.internal_links).toEqual([PRODUCTION_SERBIAN_HOME_URL]);
+    expect(result.body_markdown).toContain(`](${PRODUCTION_SERBIAN_HOME_URL})`);
+    expect(result.body_markdown).not.toContain(LEGACY_SERBIAN_HOME_URL);
   });
 });

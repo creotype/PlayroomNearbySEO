@@ -3,6 +3,11 @@ import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
 import type { SheetRecord } from "../domain/article.js";
 import { booleanCell, parseListCell, stringCell } from "../domain/article.js";
+import {
+  canonicalInternalUrl,
+  canonicalizeInternalUrlsInMarkdown,
+  PRODUCTION_SERBIAN_HOME_URL,
+} from "../domain/internal-links.js";
 import { GENERATED_QA_BLOCKER_CODES } from "../domain/quality.js";
 
 export const generatedQaBlockerSchema = z.enum(GENERATED_QA_BLOCKER_CODES);
@@ -81,6 +86,8 @@ export function buildArticlePrompt(input: ArticleGenerationInput): ArticlePrompt
   const guardrails = applicableGuardrails(input);
   const allowedLinks = applicableLinks(input);
   if (!allowedLinks) throw new Error(`No approved internal links for locale ${locale}`);
+  const requiresSerbianHomeCta = locale.toLowerCase() === "sr" &&
+    allowedLinks.includes(PRODUCTION_SERBIAN_HOME_URL);
 
   const feedback = stringCell(input.revision?.feedback);
   const researchNotes = stringCell(input.keyword.research_notes);
@@ -154,6 +161,11 @@ export function buildArticlePrompt(input: ArticleGenerationInput): ArticlePrompt
       "",
       "Allowed internal links (use at least one):",
       allowedLinks,
+      ...(requiresSerbianHomeCta
+        ? [
+            `The final call to action must link exactly to ${PRODUCTION_SERBIAN_HOME_URL}. Place this CTA near the end of the article.`,
+          ]
+        : []),
       "List in internal_links only approved URLs that are actually present in body_markdown as valid Markdown links.",
       ...revisionContext,
     ].join("\n"),
@@ -174,7 +186,8 @@ export class OpenAiArticleGenerator {
   }
 
   async generate(input: ArticleGenerationInput): Promise<GeneratedArticle> {
-    let generated = await this.#write(buildArticlePrompt(input));
+    const locale = stringCell(input.keyword.locale);
+    let generated = await this.#write(buildArticlePrompt(input), locale);
     if (!input.revision) return generated;
 
     let audit = await this.#auditRevision(input, generated);
@@ -188,7 +201,7 @@ export class OpenAiArticleGenerator {
         auditRequirements: uniqueAuditRequirements(audit),
       },
     };
-    generated = await this.#write(buildArticlePrompt(correctionInput));
+    generated = await this.#write(buildArticlePrompt(correctionInput), locale);
     audit = await this.#auditRevision(correctionInput, generated);
     if (revisionAuditPassed(audit)) return generated;
 
@@ -200,7 +213,7 @@ export class OpenAiArticleGenerator {
     };
   }
 
-  async #write(prompt: ArticlePrompt): Promise<GeneratedArticle> {
+  async #write(prompt: ArticlePrompt, locale: string): Promise<GeneratedArticle> {
     const response = await this.#client.responses.parse({
       model: this.model,
       tools: [{ type: "web_search_preview", search_context_size: "medium" }],
@@ -217,7 +230,10 @@ export class OpenAiArticleGenerator {
       text: { format: zodTextFormat(generatedArticleResponseSchema, "seo_article") },
     });
     if (!response.output_parsed) throw new Error("OpenAI returned no parsed article");
-    return generatedArticleSchema.parse(response.output_parsed);
+    return canonicalizeGeneratedInternalLinks(
+      generatedArticleSchema.parse(response.output_parsed),
+      locale,
+    );
   }
 
   async #auditRevision(
@@ -301,8 +317,23 @@ function applicableLinks(input: ArticleGenerationInput): string {
   return input.allowedLinks
     .filter((link) => stringCell(link.status) === "active" && booleanCell(link.allow_internal_link))
     .filter((link) => ["all", locale].includes(stringCell(link.locale)))
-    .map((link) => `- ${stringCell(link.anchor_text)}: ${stringCell(link.url)}`)
+    .map((link) =>
+      `- ${stringCell(link.anchor_text)}: ${canonicalInternalUrl(locale, stringCell(link.url))}`
+    )
     .join("\n");
+}
+
+function canonicalizeGeneratedInternalLinks(
+  generated: GeneratedArticle,
+  locale: string,
+): GeneratedArticle {
+  return {
+    ...generated,
+    body_markdown: canonicalizeInternalUrlsInMarkdown(locale, generated.body_markdown),
+    internal_links: [
+      ...new Set(generated.internal_links.map((url) => canonicalInternalUrl(locale, url))),
+    ],
+  };
 }
 
 function uniqueAuditRequirements(audit: RevisionCompliance): string[] {
