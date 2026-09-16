@@ -79,13 +79,15 @@ function botHarness(
   manualResult: Record<string, unknown> = queuedGenerationResult,
   options: {
     reviewArticles?: Article[];
+    nonReviewArticles?: Article[];
     approvalResult?: Record<string, unknown>;
+    regenerationResult?: Record<string, unknown>;
     failSendMessageCalls?: number[];
   } = {},
 ) {
   const requestManualGeneration = vi.fn(async () => manualResult);
   const article = reviewArticle();
-  const regenerateArticle = vi.fn(async () => ({
+  const regenerateArticle = vi.fn(async () => options.regenerationResult ?? ({
     outcome: "regenerated" as const,
     article,
   }));
@@ -99,7 +101,12 @@ function botHarness(
       (candidate) => Number(candidate.telegram_message_id) === messageId,
     ),
   );
-  const listArticles = vi.fn(async () => options.reviewArticles ?? [article]);
+  const listArticles = vi.fn(async (statuses?: readonly string[]) => {
+    if (statuses?.some((status) => ["approved", "scheduled", "publishing", "conflict"].includes(status))) {
+      return options.nonReviewArticles ?? [];
+    }
+    return options.reviewArticles ?? [article];
+  });
   const store = {
     getSettings: async () => new Map(),
     listArticles,
@@ -638,23 +645,32 @@ describe("minimal Telegram review workflow", () => {
     });
   });
 
-  it("bare /approve does not call ApprovalService for a sole failed_qa article", async () => {
+  it("deduplicates /approve through ApprovalService while a failed-QA article is being repaired", async () => {
     const failedArticle = reviewArticle({
       __rowNumber: 7,
       article_id: "SEO-TG-APPROVE-FAILED-QA",
       status: "failed_qa",
+      qa_status: "fail",
+      qa_blockers: "invalid_internal_link",
       telegram_message_id: "",
     });
-    const test = botHarness(queuedGenerationResult, { reviewArticles: [failedArticle] });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [failedArticle],
+      approvalResult: {
+        outcome: "blocked",
+        article: failedArticle,
+        quality: { passed: false, blockers: ["invalid_internal_link"], score: 9 },
+      },
+    });
 
     await test.bot.handleUpdate(commandUpdate("approve"));
 
     expect(test.listArticles).toHaveBeenCalledWith(["needs_review", "failed_qa"]);
     expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
-    expect(test.approve).not.toHaveBeenCalled();
+    expect(test.approve).toHaveBeenCalledWith("SEO-TG-APPROVE-FAILED-QA", expect.any(Object));
     const text = String(sentMessagePayload(test)?.text ?? "");
-    expect(text).toContain("SEO-TG-APPROVE-FAILED-QA");
-    expect(text).toContain("/regenerate");
+    expect(text).toContain("автоматическую доработку");
+    expect(text).toContain("повторять /approve не нужно");
   });
 
   it("fails closed when bare /approve has no active review article", async () => {
@@ -663,11 +679,52 @@ describe("minimal Telegram review workflow", () => {
     await test.bot.handleUpdate(commandUpdate("approve"));
 
     expect(test.listArticles).toHaveBeenCalledWith(["needs_review", "failed_qa"]);
+    expect(test.listArticles).toHaveBeenCalledWith(["approved", "scheduled", "publishing", "conflict"]);
     expect(test.approve).not.toHaveBeenCalled();
     expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
     const text = String(sentMessagePayload(test)?.text ?? "");
     expect(text.toLowerCase()).toMatch(/нет|не наш[её]л|активн/);
     expect(text).toContain("/generate");
+  });
+
+  it("reports the real in-flight status instead of claiming there is no article", async () => {
+    const approved = reviewArticle({
+      __rowNumber: 503,
+      article_id: "SEO-TG-IN-FLIGHT",
+      status: "approved",
+    });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [],
+      nonReviewArticles: [approved],
+    });
+
+    await test.bot.handleUpdate(commandUpdate("approve"));
+
+    expect(test.approve).not.toHaveBeenCalled();
+    const text = String(sentMessagePayload(test)?.text ?? "");
+    expect(text).toContain("SEO-TG-IN-FLIGHT");
+    expect(text).toContain("уже согласована");
+    expect(text).not.toContain("Нет статьи");
+  });
+
+  it("does not announce a successful regeneration for an inconsistent review state", async () => {
+    const inconsistent = reviewArticle({
+      status: "needs_review",
+      qa_status: "pass",
+      qa_blockers: "invalid_internal_link",
+      manual_required: false,
+    });
+    const test = botHarness(queuedGenerationResult, {
+      regenerationResult: { outcome: "regenerated", article: inconsistent },
+    });
+
+    await test.bot.handleUpdate(commandUpdate("regenerate", "исправь ссылку"));
+
+    const replies = test.apiCalls
+      .filter((call) => call.method === "sendMessage")
+      .map((call) => String((call.payload as { text?: string }).text ?? ""));
+    expect(replies.at(-1)).toContain("ещё требует доработки");
+    expect(replies.at(-1)).not.toContain("прошла внутреннюю проверку");
   });
 
   it("fails closed and points to every conflicting row when bare /approve sees multiple active reviews", async () => {

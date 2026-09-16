@@ -4,6 +4,8 @@ import { assertTransition, canTransition } from "../src/domain/transitions.js";
 describe("article transitions", () => {
   it("allows human review to approval and publishing claim", () => {
     expect(canTransition("needs_review", "approved")).toBe(true);
+    expect(canTransition("needs_review", "failed_qa")).toBe(true);
+    expect(canTransition("failed_qa", "approved")).toBe(true);
     expect(canTransition("approved", "publishing")).toBe(true);
     expect(canTransition("publishing", "published")).toBe(true);
   });

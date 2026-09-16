@@ -18,6 +18,7 @@ export type ApprovalResult =
   | { outcome: "approved"; article: Article }
   | { outcome: "already_approved"; article: Article }
   | { outcome: "blocked"; article: Article; quality: QualityResult }
+  | { outcome: "stale_article"; article: Article }
   | { outcome: "invalid_status"; article: Article };
 
 export type ApprovalSchedulePolicy = {
@@ -46,9 +47,15 @@ export class ApprovalService {
         return { outcome: "already_approved", article };
       }
       if (duplicateEvent && stringCell(duplicateEvent.event_type) === "approval_blocked") {
-        return { outcome: "blocked", article, quality: await this.qualityGate.evaluate(article) };
+        return {
+          outcome: "blocked",
+          article,
+          quality: readBlockedQuality(stringCell(duplicateEvent.payload_json)) ??
+            await this.qualityGate.evaluate(article),
+        };
       }
 
+      const reviewHash = articleContentHash(article);
       const nowDate = this.schedulePolicy?.clock?.() ?? new Date();
       const scheduledPublishAt = await this.#scheduledPublishAt(article, nowDate);
       const approvalCandidate = scheduledPublishAt
@@ -62,12 +69,36 @@ export class ApprovalService {
       if (["approved", "scheduled", "publishing", "published"].includes(article.status) && matchingApproval) {
         return { outcome: "already_approved", article };
       }
-      if (article.status !== "needs_review") return { outcome: "invalid_status", article };
+      if (article.status !== "needs_review" && article.status !== "failed_qa") {
+        return { outcome: "invalid_status", article };
+      }
 
-      const quality = await this.qualityGate.evaluate(article);
+      const matchingBlock = article.status === "failed_qa"
+        ? events.find(
+            (event) =>
+              stringCell(event.event_type) === "approval_blocked" &&
+              readEventHash(stringCell(event.payload_json)) === reviewHash,
+          )
+        : undefined;
+
+      // manual_required means a human must make the final decision. Reaching
+      // this method through an authenticated /approve is that decision; all
+      // deterministic content and link checks still run unchanged.
+      const quality = await this.qualityGate.evaluate({ ...article, manual_required: false });
+      const latest = await this.#requiredArticle(article.article_id);
+      if (!sameApprovalSnapshot(article, latest)) {
+        return { outcome: "stale_article", article: latest };
+      }
+
       if (!quality.passed) {
+        // Re-evaluate on every new command because settings and link_inventory
+        // can be fixed without changing articleContentHash, but do not create a
+        // second blocker event for the same unchanged draft.
+        if (matchingBlock) return { outcome: "blocked", article, quality };
+        if (article.status !== "failed_qa") assertTransition(article.status, "failed_qa");
         const now = nowDate.toISOString();
         const updated = await this.store.patchArticleAndAppendEvent(article.article_id, {
+          status: "failed_qa",
           qa_status: "fail",
           qa_blockers: quality.blockers.join(","),
           updated_at: now,
@@ -76,13 +107,17 @@ export class ApprovalService {
           article_id: article.article_id,
           event_type: "approval_blocked",
           from_status: article.status,
-          to_status: article.status,
+          to_status: "failed_qa",
           actor_type: "telegram_user",
           actor_id: String(actor.id),
           provider: "telegram",
           provider_object_id: commandId,
           message: "Approval blocked by QA",
-          payload_json: JSON.stringify({ blockers: quality.blockers, score: quality.score }),
+          payload_json: JSON.stringify({
+            hash: reviewHash,
+            blockers: quality.blockers,
+            score: quality.score,
+          }),
           created_at: now,
         });
         return { outcome: "blocked", article: updated, quality };
@@ -114,6 +149,7 @@ export class ApprovalService {
           status: "approved",
           qa_status: "pass",
           qa_blockers: "",
+          manual_required: false,
           content_hash: currentHash,
           approved_by: `telegram:${actor.id}`,
           approved_at: now,
@@ -190,4 +226,28 @@ function readEventHash(payload: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function readBlockedQuality(payload: string): QualityResult | undefined {
+  try {
+    const parsed = JSON.parse(payload) as { blockers?: unknown; score?: unknown };
+    if (!Array.isArray(parsed.blockers) || !parsed.blockers.every((item) => typeof item === "string")) {
+      return undefined;
+    }
+    const score = Number(parsed.score);
+    if (!Number.isFinite(score)) return undefined;
+    return { passed: false, blockers: parsed.blockers, score };
+  } catch {
+    return undefined;
+  }
+}
+
+function sameApprovalSnapshot(expected: Article, actual: Article): boolean {
+  return actual.status === expected.status &&
+    articleContentHash(actual) === articleContentHash(expected) &&
+    stringCell(actual.qa_status) === stringCell(expected.qa_status) &&
+    stringCell(actual.qa_blockers) === stringCell(expected.qa_blockers) &&
+    stringCell(actual.quality_score) === stringCell(expected.quality_score) &&
+    stringCell(actual.manual_required) === stringCell(expected.manual_required) &&
+    stringCell(actual.revision_count) === stringCell(expected.revision_count);
 }

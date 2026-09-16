@@ -124,14 +124,14 @@ export function createTelegramBot(options: {
         await replyAmbiguousActiveArticles(ctx, activeReviews!, config.spreadsheetId);
         return;
       }
-      await ctx.reply("❓ Нет статьи, ожидающей согласования. Сначала дождитесь карточки после /generate.");
-      return;
-    }
-    if (article.status === "failed_qa") {
-      await ctx.reply(
-        `🛠 <b>${escapeHtml(article.article_id)}</b> ещё проходит внутреннюю доработку. Пока согласовывать её не нужно; если бот попросит ручную правку — отправьте <code>/regenerate ваш комментарий</code>.`,
-        { parse_mode: "HTML" },
+      const inFlight = latestArticle(
+        await store.listArticles(["approved", "scheduled", "publishing", "conflict"]),
       );
+      if (inFlight) {
+        await replyNonReviewApprovalStatus(ctx, inFlight, config.spreadsheetId);
+        return;
+      }
+      await ctx.reply("❓ Нет статьи, ожидающей согласования. Сначала дождитесь карточки после /generate.");
       return;
     }
     const result = await approvals.approve(article.article_id, actorFromContext(ctx));
@@ -203,6 +203,32 @@ export function createTelegramBot(options: {
 
 function soleActiveReviewArticle(articles: Article[]): Article | undefined {
   return articles.length === 1 ? articles[0] : undefined;
+}
+
+function latestArticle(articles: Article[]): Article | undefined {
+  return [...articles].sort((left, right) => right.__rowNumber - left.__rowNumber)[0];
+}
+
+async function replyNonReviewApprovalStatus(
+  ctx: Context,
+  article: Article,
+  spreadsheetId: string,
+): Promise<void> {
+  if (article.status === "conflict") {
+    await ctx.reply(
+      [
+        `⚠️ <b>${escapeHtml(article.article_id)}</b>: публикация остановлена, потому что строку изменили после согласования.`,
+        "Повторный /approve ничего не исправит. Не меняйте системные поля status и qa_* вручную; откройте строку и верните на проверку содержательные правки.",
+        `<a href="${articleSheetUrl(spreadsheetId, article.__rowNumber)}">Открыть статью в Google Sheets</a>`,
+      ].join("\n"),
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+    );
+    return;
+  }
+  await ctx.reply(
+    `ℹ️ <b>${escapeHtml(article.article_id)}</b> уже согласована и находится в статусе <code>${escapeHtml(article.status)}</code>. Повторять /approve не нужно.`,
+    { parse_mode: "HTML" },
+  );
 }
 
 async function replyAmbiguousActiveArticles(
@@ -319,9 +345,18 @@ async function replyApprovalResult(ctx: Context, result: ApprovalResult): Promis
     return;
   }
   if (result.outcome === "blocked") {
+    const text = booleanCell(result.article.manual_required)
+      ? `🛠 <b>${escapeHtml(result.article.article_id)}</b> остановлена после автоматической доработки. Отправьте <code>/regenerate ваш комментарий</code> — /approve пока повторять не нужно.`
+      : `🛠 <b>${escapeHtml(result.article.article_id)}</b>: финальная проверка нашла проблему. Я уже поставил статью на автоматическую доработку — повторять /approve не нужно. Дождитесь обновлённой карточки и затем отправьте /approve один раз.`;
     await ctx.reply(
-      "🛠 Статья ещё не готова к согласованию. Я не отправлю её на публикацию, пока внутренняя проверка не будет пройдена.",
+      text,
       { parse_mode: "HTML" },
+    );
+    return;
+  }
+  if (result.outcome === "stale_article") {
+    await ctx.reply(
+      "↻ Строка изменилась прямо во время проверки. Я ничего не перезаписал; отправьте /approve ещё раз после завершения правок.",
     );
     return;
   }
@@ -430,7 +465,10 @@ async function replyRegenerationResult(ctx: Context, result: RegenerationResult)
     });
     return;
   }
-  const passed = stringCell(result.article.qa_status) === "pass" && !booleanCell(result.article.manual_required);
+  const passed = result.article.status === "needs_review" &&
+    stringCell(result.article.qa_status) === "pass" &&
+    !stringCell(result.article.qa_blockers) &&
+    !booleanCell(result.article.manual_required);
   await ctx.reply(
     passed
       ? `✅ <b>${escapeHtml(result.article.article_id)}</b> исправлена и прошла внутреннюю проверку. Карточка обновится автоматически.`
