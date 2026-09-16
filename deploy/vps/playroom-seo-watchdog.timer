@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Playroom SEO bot Docker health
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1min
+AccuracySec=15s
+Unit=playroom-seo-watchdog.service
+
+[Install]
+WantedBy=timers.target

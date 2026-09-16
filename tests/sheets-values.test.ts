@@ -13,4 +13,8 @@ describe("prepareSheetValue", () => {
     const value = "=IMPORTXML(\"https://example.com\", \"//x\")";
     expect(prepareSheetValue("feedback", value)).toBe(value);
   });
+
+  it("preserves a numeric Google serial supplied as text", () => {
+    expect(prepareSheetValue("scheduled_publish_at", "46253.5")).toBeCloseTo(46253.5, 8);
+  });
 });

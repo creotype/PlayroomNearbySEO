@@ -10,6 +10,18 @@ export type GhostPost = {
   published_at?: string | null;
 };
 
+export type GhostUser = {
+  id: string;
+  name: string;
+  status: string;
+  roles?: Array<{ name: string }>;
+};
+
+export type GhostImage = {
+  url: string;
+  ref?: string;
+};
+
 export type GhostPostInput = {
   title: string;
   slug: string;
@@ -22,9 +34,18 @@ export type GhostPostInput = {
   feature_image?: string;
   feature_image_alt?: string;
   published_at?: string;
+  authors?: Array<{ id: string }>;
 };
 
-type GhostEnvelope = { posts?: GhostPost[]; errors?: Array<{ message?: string; type?: string }> };
+type GhostEnvelope = {
+  posts?: GhostPost[];
+  users?: GhostUser[];
+  images?: GhostImage[];
+  errors?: Array<{ message?: string; type?: string; context?: string }>;
+};
+
+const SAFE_GET_ATTEMPTS = 3;
+const SAFE_GET_RETRY_BASE_MS = 250;
 
 export class GhostAdminClient {
   readonly #baseUrl: string;
@@ -48,9 +69,18 @@ export class GhostAdminClient {
     return response.site;
   }
 
+  async readCurrentUser(): Promise<GhostUser | undefined> {
+    const response = await this.#request<GhostEnvelope>(
+      "users/me/?include=roles",
+      undefined,
+      [404],
+    );
+    return response.users?.[0];
+  }
+
   async findPostBySlug(slug: string): Promise<GhostPost | undefined> {
     const response = await this.#request<GhostEnvelope>(
-      `posts/slug/${encodeURIComponent(slug)}/?formats=html,lexical`,
+      `posts/slug/${encodeURIComponent(slug)}/?fields=id,title,slug,status,url,updated_at,published_at`,
       undefined,
       [404],
     );
@@ -59,7 +89,7 @@ export class GhostAdminClient {
 
   async readPost(id: string): Promise<GhostPost | undefined> {
     const response = await this.#request<GhostEnvelope>(
-      `posts/${encodeURIComponent(id)}/?formats=html,lexical`,
+      `posts/${encodeURIComponent(id)}/?fields=id,title,slug,status,url,updated_at,published_at`,
       undefined,
       [404],
     );
@@ -74,6 +104,30 @@ export class GhostAdminClient {
     const post = response.posts?.[0];
     if (!post) throw new Error("Ghost create response contained no post");
     return post;
+  }
+
+  async uploadImage(input: {
+    bytes: Uint8Array;
+    filename: string;
+    contentType: string;
+    ref?: string;
+  }): Promise<GhostImage> {
+    if (input.bytes.byteLength === 0) throw new Error("Ghost image upload received an empty file");
+    if (input.bytes.byteLength > 20 * 1024 * 1024) {
+      throw new Error("Ghost image upload exceeds the 20 MB application limit");
+    }
+    const body = new FormData();
+    body.append("file", new Blob([input.bytes], { type: input.contentType }), input.filename);
+    body.append("purpose", "image");
+    if (input.ref) body.append("ref", input.ref);
+    const response = await this.#request<GhostEnvelope>("images/upload/", {
+      method: "POST",
+      body,
+      signal: AbortSignal.timeout(60_000),
+    });
+    const image = response.images?.[0];
+    if (!image?.url) throw new Error("Ghost image upload response contained no URL");
+    return image;
   }
 
   async updatePost(
@@ -95,16 +149,33 @@ export class GhostAdminClient {
     allowedStatuses: number[] = [],
   ): Promise<T> {
     const token = await this.#createToken();
-    const response = await fetch(`${this.#baseUrl}/${path}`, {
+    const isMultipart = typeof FormData !== "undefined" && init?.body instanceof FormData;
+    const requestInit: RequestInit = {
       ...init,
       headers: {
         Accept: "application/json",
         "Accept-Version": this.#apiVersion,
         Authorization: `Ghost ${token}`,
-        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...(init?.body && !isMultipart ? { "Content-Type": "application/json" } : {}),
         ...init?.headers,
       },
-    });
+    };
+    const method = (requestInit.method ?? "GET").toUpperCase();
+    const maxAttempts = method === "GET" ? SAFE_GET_ATTEMPTS : 1;
+    let response: Response | undefined;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        response = await fetch(`${this.#baseUrl}/${path}`, requestInit);
+      } catch (error) {
+        if (attempt >= maxAttempts || !isTransientFetchError(error)) throw error;
+        await sleep(SAFE_GET_RETRY_BASE_MS * 2 ** (attempt - 1));
+        continue;
+      }
+      if (!isTransientStatus(response.status) || attempt >= maxAttempts) break;
+      if (response.body) await response.body.cancel().catch(() => undefined);
+      await sleep(retryDelayMs(response, attempt));
+    }
+    if (!response) throw new Error("Ghost API request produced no response");
     if (allowedStatuses.includes(response.status)) return {} as T;
     const raw = await response.text();
     let parsed: GhostEnvelope | undefined;
@@ -114,7 +185,10 @@ export class GhostAdminClient {
       parsed = undefined;
     }
     if (!response.ok) {
-      const reason = parsed?.errors?.map((error) => error.message).filter(Boolean).join("; ");
+      const reason = parsed?.errors
+        ?.map((error) => [error.message, error.context].filter(Boolean).join(" — "))
+        .filter(Boolean)
+        .join("; ");
       throw new Error(`Ghost API ${response.status}: ${reason || "request failed"}`);
     }
     return (parsed ?? JSON.parse(raw)) as T;
@@ -129,4 +203,30 @@ export class GhostAdminClient {
       .setAudience("/admin/")
       .sign(this.#secret);
   }
+}
+
+function isTransientStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function isTransientFetchError(error: unknown): boolean {
+  if (error instanceof TypeError) return true;
+  if (!(error instanceof Error)) return false;
+  return ["AbortError", "TimeoutError"].includes(error.name);
+}
+
+function retryDelayMs(response: Response, attempt: number): number {
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, 5_000);
+    const date = Date.parse(retryAfter);
+    if (Number.isFinite(date)) return Math.min(Math.max(date - Date.now(), 0), 5_000);
+  }
+  return SAFE_GET_RETRY_BASE_MS * 2 ** (attempt - 1);
+}
+
+async function sleep(milliseconds: number): Promise<void> {
+  if (milliseconds <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
