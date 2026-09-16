@@ -14,7 +14,7 @@ const allowedTransitions: Record<ArticleStatus, ReadonlySet<ArticleStatus>> = {
   published: new Set(["needs_review"]),
   failed_generation: new Set(["brief_ready", "generating", "cancelled"]),
   failed_qa: new Set(["qa_pending", "revision_requested", "approved", "cancelled"]),
-  failed_publish: new Set(["approved", "publishing", "cancelled"]),
+  failed_publish: new Set(["approved", "publishing", "needs_review", "conflict", "cancelled"]),
   conflict: new Set(["needs_review", "cancelled"]),
   cancelled: new Set(["backlog"]),
 };

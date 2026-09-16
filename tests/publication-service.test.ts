@@ -67,6 +67,9 @@ function approvedArticle(): Article {
     internal_links: "https://example.com/rs/blog",
     feature_image_url: "https://example.com/content/images/playroom-hero.webp",
     feature_image_alt: "Tematska ilustracija: izbor igraonice",
+    qa_status: "pass",
+    qa_blockers: "",
+    manual_required: false,
     scheduled_publish_at: "",
     ghost_post_id: "",
     updated_at: "2026-08-19T11:04:00.000Z",
@@ -234,6 +237,15 @@ describe("PublicationService concurrency hardening", () => {
       appendEvent: async (event: Record<string, unknown>) => {
         events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
       },
+      patchArticleAndAppendEvent: async (
+        _id: string,
+        patch: Record<string, unknown>,
+        event: Record<string, unknown>,
+      ) => {
+        current = { ...current, ...patch } as Article;
+        events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+        return current;
+      },
     } as unknown as GoogleSheetsStore;
     const ghost = {
       findPostBySlug: async () => {
@@ -264,6 +276,15 @@ describe("PublicationService concurrency hardening", () => {
       },
       appendEvent: async (event: Record<string, unknown>) => {
         events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+      },
+      patchArticleAndAppendEvent: async (
+        _id: string,
+        patch: Record<string, unknown>,
+        event: Record<string, unknown>,
+      ) => {
+        current = { ...current, ...patch } as Article;
+        events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+        return current;
       },
     } as unknown as GoogleSheetsStore;
     const ghost = {
@@ -437,6 +458,18 @@ describe("PublicationService concurrency hardening", () => {
           current = { ...current, status: "cancelled" } as Article;
         }
       },
+      patchArticleAndAppendEvent: async (
+        _id: string,
+        patch: Record<string, unknown>,
+        event: Record<string, unknown>,
+      ) => {
+        current = { ...current, ...patch } as Article;
+        events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+        if (event.event_type === "publishing_started") {
+          current = { ...current, status: "cancelled" } as Article;
+        }
+        return current;
+      },
     } as unknown as GoogleSheetsStore;
     const publisher = new PublicationService(store, ghost.client, config, logger, new KeyedMutex());
 
@@ -516,8 +549,13 @@ describe("PublicationService concurrency hardening", () => {
       vi.unstubAllGlobals();
     }
 
-    expect(atomicWrites).toHaveLength(1);
-    const atomicWrite = atomicWrites[0]!;
+    expect(atomicWrites).toHaveLength(2);
+    expect(atomicWrites[0]?.event).toMatchObject({
+      event_type: "publishing_started",
+      from_status: "approved",
+      to_status: "publishing",
+    });
+    const atomicWrite = atomicWrites.find(({ event }) => event.event_type === "published")!;
     expect(atomicWrite.patch).toMatchObject({
       status: "published",
       ghost_post_id: published.id,
@@ -588,11 +626,17 @@ describe("PublicationService concurrency hardening", () => {
 
     await new PublicationService(store, ghost, config, logger, new KeyedMutex()).runOnce();
 
-    expect(atomicWrites).toHaveLength(1);
-    expect(atomicWrites[0]?.patch).toMatchObject({
+    expect(atomicWrites).toHaveLength(2);
+    expect(atomicWrites[0]?.event).toMatchObject({
+      event_type: "publishing_started",
+      from_status: "approved",
+      to_status: "publishing",
+    });
+    const failedWrite = atomicWrites.find(({ event }) => event.event_type === "publish_failed")!;
+    expect(failedWrite.patch).toMatchObject({
       status: "failed_publish",
     });
-    expect(atomicWrites[0]?.event).toMatchObject({
+    expect(failedWrite.event).toMatchObject({
       article_id: current.article_id,
       event_type: "publish_failed",
       from_status: "publishing",
@@ -839,7 +883,7 @@ describe("PublicationService concurrency hardening", () => {
     });
   });
 
-  it("reschedules a stale publishing claim with a Ghost draft instead of publishing off-window", async () => {
+  it("reschedules a stale scheduled claim even when an older manual request has the same hash", async () => {
     let current = {
       ...approvedArticle(),
       status: "publishing",
@@ -849,7 +893,34 @@ describe("PublicationService concurrency hardening", () => {
       updated_at: "2026-09-07T08:00:20.000Z",
     } as Article;
     current.content_hash = articleContentHash(current);
-    const events: SheetRecord[] = [approvalEvent(current)];
+    const events: SheetRecord[] = [
+      approvalEvent(current),
+      {
+        __rowNumber: 3,
+        event_id: "historical-manual-request",
+        article_id: current.article_id,
+        event_type: "manual_publish_requested",
+        from_status: "scheduled",
+        to_status: "publishing",
+        actor_type: "telegram_user",
+        actor_id: "42",
+        provider: "telegram",
+        provider_object_id: "telegram:message:-100:old",
+        payload_json: JSON.stringify({ hash: articleContentHash(current) }),
+      },
+      {
+        __rowNumber: 4,
+        event_id: "newer-scheduled-claim",
+        article_id: current.article_id,
+        event_type: "publishing_started",
+        from_status: "scheduled",
+        to_status: "publishing",
+        actor_type: "system",
+        actor_id: "publisher",
+        provider: "ghost",
+        payload_json: JSON.stringify({ hash: articleContentHash(current) }),
+      },
+    ];
     const writes: Array<{ patch: Record<string, unknown>; event: Record<string, unknown> }> = [];
     const store = {
       getSettings: async () => new Map<string, string | boolean>([
@@ -967,6 +1038,494 @@ describe("PublicationService concurrency hardening", () => {
     expect(events.some((event) => event.event_type === "publication_rescheduled")).toBe(false);
   });
 });
+
+describe("PublicationService.publishNow", () => {
+  it("publishes a future-scheduled approved version immediately and deduplicates the command", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "scheduled",
+      scheduled_publish_at: "2026-09-17T08:00:00.000Z",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const originalSchedule = current.scheduled_publish_at;
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const createPost = vi.fn(async () => draftPost(current));
+    const updatePost = vi.fn(async (_id: string, _input: Record<string, unknown>) =>
+      publishedPost(current));
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const ghost = {
+      findPostBySlug: vi.fn(async () => undefined),
+      readCurrentUser: vi.fn(async () => undefined),
+      createPost,
+      readPost: vi.fn(async () => draftPost(current)),
+      updatePost,
+    } as unknown as GhostAdminClient;
+    const publicUrl = "https://example.com/rs/blog/kako-izabrati-igraonicu";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(`<link rel="canonical" href="${publicUrl}">`, { status: 200 }),
+      ),
+    );
+
+    try {
+      const publisher = new PublicationService(store, ghost, config, logger, new KeyedMutex());
+      const first = await publisher.publishNow(current.article_id, actor);
+      const duplicate = await publisher.publishNow(current.article_id, actor);
+
+      expect(first).toMatchObject({ outcome: "published", article: { status: "published" } });
+      expect(duplicate).toMatchObject({ outcome: "already_published" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(createPost).toHaveBeenCalledOnce();
+    expect(updatePost).toHaveBeenCalledOnce();
+    expect(current.scheduled_publish_at).toBe(originalSchedule);
+    const requests = events.filter((event) => event.event_type === "manual_publish_requested");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      from_status: "scheduled",
+      to_status: "publishing",
+      actor_type: "telegram_user",
+      actor_id: "42",
+      provider: "telegram",
+      provider_object_id: "telegram:message:-100:10",
+    });
+    expect(JSON.parse(String(requests[0]?.payload_json))).toMatchObject({
+      hash: articleContentHash({ ...current, status: "scheduled" } as Article),
+      display_name: "Owner",
+      scheduled_publish_at: originalSchedule,
+    });
+  });
+
+  it("retries a failed publication with its bound Ghost draft after all gates pass", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "failed_publish",
+      ghost_post_id: "ghost-post-manual",
+      scheduled_publish_at: "2026-09-17T08:00:00.000Z",
+      last_error: "Temporary Ghost 503",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const updatePost = vi.fn(async (_id: string, _input: Record<string, unknown>) =>
+      publishedPost(current));
+    const ghost = {
+      readPost: vi.fn(async () => draftPost(current)),
+      updatePost,
+    } as unknown as GhostAdminClient;
+    const publicUrl = "https://example.com/rs/blog/kako-izabrati-igraonicu";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(`<link rel="canonical" href="${publicUrl}">`, { status: 200 }),
+      ),
+    );
+
+    try {
+      const result = await new PublicationService(
+        store,
+        ghost,
+        config,
+        logger,
+        new KeyedMutex(),
+      ).publishNow(current.article_id, { ...actor, providerObjectId: "message:-100:11" });
+      expect(result).toMatchObject({ outcome: "published", article: { status: "published" } });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(updatePost).toHaveBeenCalledOnce();
+    expect(events.find((event) => event.event_type === "manual_publish_requested")).toMatchObject({
+      from_status: "failed_publish",
+      to_status: "publishing",
+      provider_object_id: "telegram:message:-100:11",
+    });
+  });
+
+  it("idempotently updates the bound post after a lost successful response", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "failed_publish",
+      ghost_post_id: "ghost-post-manual",
+      last_error: "Ghost response was lost",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const updatePost = vi.fn(async (_id: string, _input: Record<string, unknown>) =>
+      publishedPost(current));
+    const ghost = {
+      readPost: vi.fn(async () => publishedPost(current)),
+      updatePost,
+    } as unknown as GhostAdminClient;
+    const publicUrl = "https://example.com/rs/blog/kako-izabrati-igraonicu";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(`<link rel="canonical" href="${publicUrl}">`, { status: 200 }),
+      ),
+    );
+
+    try {
+      const result = await new PublicationService(
+        store,
+        ghost,
+        config,
+        logger,
+        new KeyedMutex(),
+      ).publishNow(current.article_id, { ...actor, providerObjectId: "message:-100:12" });
+      expect(result).toMatchObject({ outcome: "published", article: { status: "published" } });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(ghost.readPost).toHaveBeenCalledTimes(2);
+    expect(updatePost).toHaveBeenCalledOnce();
+    expect(updatePost.mock.calls[0]?.[0]).toBe("ghost-post-manual");
+    expect(updatePost.mock.calls[0]?.[1]).toMatchObject({ status: "published" });
+  });
+
+  it("updates a bound published post with the current reapproved Sheet content", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "failed_publish",
+      ghost_post_id: "ghost-post-manual",
+      body_markdown: "## Ispravljena verzija\n\nFreshly reapproved body from Google Sheets.",
+      last_error: "Previous publication response was lost",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const updatePost = vi.fn(async (_id: string, _input: Record<string, unknown>) =>
+      publishedPost(current));
+    const ghost = {
+      readPost: vi.fn(async () => publishedPost(current)),
+      updatePost,
+    } as unknown as GhostAdminClient;
+    const publicUrl = "https://example.com/rs/blog/kako-izabrati-igraonicu";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(`<link rel="canonical" href="${publicUrl}">`, { status: 200 }),
+      ),
+    );
+
+    try {
+      const result = await new PublicationService(
+        store,
+        ghost,
+        config,
+        logger,
+        new KeyedMutex(),
+      ).publishNow(current.article_id, { ...actor, providerObjectId: "message:-100:reapproved" });
+      expect(result).toMatchObject({ outcome: "published", article: { status: "published" } });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(updatePost).toHaveBeenCalledOnce();
+    expect(updatePost.mock.calls[0]?.[0]).toBe("ghost-post-manual");
+    expect(updatePost.mock.calls[0]?.[1]).toMatchObject({
+      status: "published",
+      html: expect.stringContaining("Freshly reapproved body from Google Sheets."),
+    });
+  });
+
+  it("fails closed when a failed unbound row collides with an existing Ghost slug", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "failed_publish",
+      ghost_post_id: "",
+      last_error: "Temporary Ghost error",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const createPost = vi.fn();
+    const updatePost = vi.fn();
+    const ghost = {
+      findPostBySlug: vi.fn(async () => draftPost(current)),
+      createPost,
+      updatePost,
+    } as unknown as GhostAdminClient;
+
+    const result = await new PublicationService(
+      store,
+      ghost,
+      config,
+      logger,
+      new KeyedMutex(),
+    ).publishNow(current.article_id, { ...actor, providerObjectId: "message:-100:13" });
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      article: { status: "failed_publish" },
+    });
+    expect(result.outcome === "failed" ? result.message : "").toContain(
+      "already exists without matching ghost_post_id",
+    );
+    expect(createPost).not.toHaveBeenCalled();
+    expect(updatePost).not.toHaveBeenCalled();
+  });
+
+  it("does not retry failed Ghost work for an exact duplicate Telegram command", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "failed_publish",
+      last_error: "Temporary Ghost 503",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [
+      approvalEvent(current),
+      {
+        __rowNumber: 3,
+        event_id: "manual-failed-command",
+        article_id: current.article_id,
+        event_type: "manual_publish_requested",
+        from_status: "scheduled",
+        to_status: "publishing",
+        actor_type: "telegram_user",
+        actor_id: "42",
+        provider: "telegram",
+        provider_object_id: "telegram:message:-100:10",
+        payload_json: JSON.stringify({ hash: articleContentHash(current) }),
+      },
+    ];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const ghost = ghostSpy();
+
+    const result = await new PublicationService(
+      store,
+      ghost.client,
+      config,
+      logger,
+      new KeyedMutex(),
+    ).publishNow(current.article_id, actor);
+
+    expect(result).toMatchObject({ outcome: "failed", message: "Temporary Ghost 503" });
+    expect(events.filter((event) => event.event_type === "manual_publish_requested")).toHaveLength(1);
+    expect(ghost.calls).not.toHaveBeenCalled();
+  });
+
+  it("surfaces missing trusted approval before a dirty QA state and never calls Ghost", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "scheduled",
+      scheduled_publish_at: "2026-09-17T08:00:00.000Z",
+      qa_status: "fail",
+      qa_blockers: "quality_score_below_threshold",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const ghost = ghostSpy();
+
+    const result = await new PublicationService(
+      store,
+      ghost.client,
+      config,
+      logger,
+      new KeyedMutex(),
+    ).publishNow(current.article_id, actor);
+
+    expect(result).toMatchObject({
+      outcome: "blocked",
+      reason: "missing_trusted_approval",
+      article: { status: "conflict" },
+    });
+    expect(events.some((event) => event.event_type === "manual_publish_requested")).toBe(false);
+    expect(ghost.calls).not.toHaveBeenCalled();
+  });
+
+  it("blocks a dirty QA state before recording a request or touching Ghost", async () => {
+    let current = {
+      ...approvedArticle(),
+      qa_status: "fail",
+      qa_blockers: "quality_score_below_threshold",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const ghost = ghostSpy();
+
+    const result = await new PublicationService(
+      store,
+      ghost.client,
+      config,
+      logger,
+      new KeyedMutex(),
+    ).publishNow(current.article_id, actor);
+
+    expect(result).toMatchObject({
+      outcome: "blocked",
+      reason: "qa_not_passed",
+      article: { status: "conflict" },
+    });
+    expect(events.some((event) => event.event_type === "manual_publish_requested")).toBe(false);
+    expect(ghost.calls).not.toHaveBeenCalled();
+  });
+
+  it("detects an edit made during the atomic claim and stops before Ghost", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "scheduled",
+      scheduled_publish_at: "2026-09-17T08:00:00.000Z",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const ghost = ghostSpy();
+    const baseStore = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const store = {
+      ...baseStore,
+      patchArticleAndAppendEvent: async (
+        _articleId: string,
+        patch: Record<string, unknown>,
+        event: Record<string, unknown>,
+      ) => {
+        const updated = { ...current, ...patch } as Article;
+        current = updated;
+        events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+        if (event.event_type === "manual_publish_requested") {
+          current = { ...current, body_markdown: `${current.body_markdown}\n\nNaknadna izmena.` } as Article;
+        }
+        return updated;
+      },
+    } as unknown as GoogleSheetsStore;
+
+    const result = await new PublicationService(
+      store,
+      ghost.client,
+      config,
+      logger,
+      new KeyedMutex(),
+    ).publishNow(current.article_id, actor);
+
+    expect(result).toMatchObject({
+      outcome: "blocked",
+      reason: "content_changed",
+      article: { status: "conflict" },
+    });
+    expect(events.filter((event) => event.event_type === "manual_publish_requested")).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ event_type: "publication_conflict" });
+    expect(ghost.calls).not.toHaveBeenCalled();
+  });
+
+  it("resumes a stale trusted manual request instead of restoring tomorrow's schedule", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "publishing",
+      scheduled_publish_at: "2026-09-17T08:00:00.000Z",
+      updated_at: "2026-09-16T08:00:00.000Z",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [
+      approvalEvent(current),
+      {
+        __rowNumber: 3,
+        event_id: "manual-request-1",
+        article_id: current.article_id,
+        event_type: "manual_publish_requested",
+        from_status: "scheduled",
+        to_status: "publishing",
+        actor_type: "telegram_user",
+        actor_id: "42",
+        provider: "telegram",
+        provider_object_id: "telegram:message:-100:10",
+        payload_json: JSON.stringify({ hash: articleContentHash(current) }),
+      },
+    ];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const ghost = {
+      findPostBySlug: vi.fn(async () => undefined),
+      readCurrentUser: vi.fn(async () => undefined),
+      createPost: vi.fn(async () => draftPost(current)),
+      readPost: vi.fn(async () => draftPost(current)),
+      updatePost: vi.fn(async () => publishedPost(current)),
+    } as unknown as GhostAdminClient;
+    const publicUrl = "https://example.com/rs/blog/kako-izabrati-igraonicu";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(`<link rel="canonical" href="${publicUrl}">`, { status: 200 }),
+      ),
+    );
+
+    try {
+      await new PublicationService(
+        store,
+        ghost,
+        config,
+        logger,
+        new KeyedMutex(),
+        () => new Date("2026-09-16T13:00:00.000Z"),
+      ).runOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(current.status).toBe("published");
+    expect(current.scheduled_publish_at).toBe("2026-09-17T08:00:00.000Z");
+    expect(events.some((event) => event.event_type === "publishing_recovered")).toBe(false);
+    expect(events.some((event) => event.event_type === "publication_rescheduled")).toBe(false);
+  });
+});
+
+function mutablePublicationStore(
+  read: () => Article,
+  write: (article: Article) => void,
+  events: SheetRecord[],
+): GoogleSheetsStore {
+  return {
+    getSettings: async () => enabledSettings(),
+    listArticles: async () => [{ ...read() }],
+    findArticle: async () => read(),
+    listEvents: async () => events,
+    patchArticle: async (_id: string, patch: Record<string, unknown>) => {
+      const updated = { ...read(), ...patch } as Article;
+      write(updated);
+      return updated;
+    },
+    appendEvent: async (event: Record<string, unknown>) => {
+      events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+    },
+    patchArticleAndAppendEvent: async (
+      _id: string,
+      patch: Record<string, unknown>,
+      event: Record<string, unknown>,
+    ) => {
+      const updated = { ...read(), ...patch } as Article;
+      write(updated);
+      if (!events.some((existing) => existing.event_id === event.event_id)) {
+        events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+      }
+      return updated;
+    },
+  } as unknown as GoogleSheetsStore;
+}
+
+function draftPost(article: Article) {
+  return {
+    id: "ghost-post-manual",
+    title: article.title,
+    slug: "kako-izabrati-igraonicu-rs",
+    status: "draft" as const,
+    url: "https://example.com/internal/ghost-post-manual/",
+    updated_at: "2026-09-16T13:01:00.000Z",
+    published_at: null,
+  };
+}
+
+function publishedPost(article: Article) {
+  return {
+    ...draftPost(article),
+    status: "published" as const,
+    updated_at: "2026-09-16T13:02:00.000Z",
+    published_at: "2026-09-16T13:02:00.000Z",
+  };
+}
 
 describe("verifyPublicPage", () => {
   const publicUrl = "https://example.com/rs/blog/kako-izabrati-igraonicu";

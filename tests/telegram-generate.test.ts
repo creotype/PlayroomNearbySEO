@@ -5,6 +5,7 @@ import type { Article } from "../src/domain/article.js";
 import type { GoogleSheetsStore } from "../src/sheets/google-sheets.js";
 import type { ApprovalService } from "../src/services/approval-service.js";
 import type { GenerationService } from "../src/services/generation-service.js";
+import type { PublicationService } from "../src/services/publication-service.js";
 import {
   createTelegramBot,
   parseGenerateCommand,
@@ -30,14 +31,15 @@ describe("/generate command parser", () => {
     },
   );
 
-  it("exposes exactly the four owner-facing commands", () => {
+  it("exposes exactly the five owner-facing commands", () => {
     expect(telegramCommandMenu.map(({ command }) => command)).toEqual([
       "generate",
       "regenerate",
       "approve",
+      "publish",
       "help",
     ]);
-    expect(telegramCommandMenu).toHaveLength(4);
+    expect(telegramCommandMenu).toHaveLength(5);
     expect(telegramCommandMenu.every(({ command }) => !command.startsWith("seo_"))).toBe(true);
   });
 });
@@ -82,6 +84,7 @@ function botHarness(
     nonReviewArticles?: Article[];
     approvalResult?: Record<string, unknown>;
     regenerationResult?: Record<string, unknown>;
+    publicationResult?: Record<string, unknown>;
     failSendMessageCalls?: number[];
   } = {},
 ) {
@@ -95,9 +98,16 @@ function botHarness(
     outcome: "approved" as const,
     article: { ...article, status: "approved" },
   }));
+  const publishNow = vi.fn(async (_articleId: string) => options.publicationResult ?? ({
+    outcome: "published" as const,
+    article: { ...article, status: "published" },
+  }));
   const findArticle = vi.fn(async (articleId: string) => articleId === article.article_id ? article : undefined);
   const findArticleByTelegramMessageId = vi.fn(
-    async (messageId: number) => (options.reviewArticles ?? [article]).find(
+    async (messageId: number) => [
+      ...(options.reviewArticles ?? [article]),
+      ...(options.nonReviewArticles ?? []),
+    ].find(
       (candidate) => Number(candidate.telegram_message_id) === messageId,
     ),
   );
@@ -118,6 +128,7 @@ function botHarness(
     store,
     approvals: { approve } as unknown as ApprovalService,
     generation: { requestManualGeneration, regenerateArticle } as unknown as GenerationService,
+    publication: { publishNow } as unknown as Pick<PublicationService, "publishNow">,
     logger: { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
   });
   bot.botInfo = {
@@ -158,6 +169,7 @@ function botHarness(
     requestManualGeneration,
     regenerateArticle,
     approve,
+    publishNow,
     findArticle,
     findArticleByTelegramMessageId,
     listArticles,
@@ -469,6 +481,8 @@ describe("minimal Telegram review workflow", () => {
     expect(help).toContain("/generate");
     expect(help).toContain("/regenerate");
     expect(help).toContain("/approve");
+    expect(help).toContain("/publish");
+    expect(help).toContain("опубликовать согласованную статью сейчас");
     expect(help.toLowerCase()).toContain("коммент");
     expect(help.toLowerCase()).toMatch(/одн.*стать/);
     expect(help.toLowerCase()).toMatch(/approve.*без.*текст/);
@@ -705,6 +719,229 @@ describe("minimal Telegram review workflow", () => {
     expect(text).toContain("SEO-TG-IN-FLIGHT");
     expect(text).toContain("уже согласована");
     expect(text).not.toContain("Нет статьи");
+  });
+
+  it("publishes the sole scheduled article immediately and leaves the final URL to ReviewNotifier", async () => {
+    const scheduled = reviewArticle({
+      __rowNumber: 503,
+      article_id: "SEO-TG-PUBLISH-NOW",
+      status: "scheduled",
+      scheduled_publish_at: "2026-09-17T08:00:00.000Z",
+    });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [],
+      nonReviewArticles: [scheduled],
+      publicationResult: { outcome: "published", article: { ...scheduled, status: "published" } },
+    });
+
+    await test.bot.handleUpdate(commandUpdate("publish"));
+
+    expect(test.listArticles).toHaveBeenCalledWith(["approved", "scheduled", "failed_publish"]);
+    expect(test.publishNow).toHaveBeenCalledWith("SEO-TG-PUBLISH-NOW", {
+      id: 42,
+      displayName: "Owner",
+      providerObjectId: "message:-5484259760:78",
+    });
+    const replies = test.apiCalls.filter((call) => call.method === "sendMessage");
+    expect(replies).toHaveLength(1);
+    const text = String((replies[0]?.payload as { text?: string })?.text ?? "");
+    expect(text).toContain("Проверяю");
+    expect(text).toContain("публикую");
+    expect(text).toContain("SEO-TG-PUBLISH-NOW");
+    expect(text).toContain("результат и ссылку");
+    expect(text).not.toMatch(/https?:\/\//u);
+  });
+
+  it("publishes the article mapped by the replied-to review card", async () => {
+    const scheduled = reviewArticle({
+      article_id: "SEO-TG-REPLIED-PUBLISH",
+      status: "scheduled",
+      telegram_message_id: 93,
+    });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [],
+      nonReviewArticles: [scheduled],
+      publicationResult: { outcome: "published", article: { ...scheduled, status: "published" } },
+    });
+
+    await test.bot.handleUpdate(commandUpdate("publish", "", { replyMessageId: 93 }));
+
+    expect(test.findArticleByTelegramMessageId).toHaveBeenCalledWith(93);
+    expect(test.listArticles).not.toHaveBeenCalled();
+    expect(test.publishNow).toHaveBeenCalledWith("SEO-TG-REPLIED-PUBLISH", expect.any(Object));
+  });
+
+  it("retries the sole failed publication with a new audited /publish command", async () => {
+    const failed = reviewArticle({
+      __rowNumber: 18,
+      article_id: "SEO-TG-PUBLISH-RETRY",
+      status: "failed_publish",
+      last_error: "Ghost returned 503",
+    });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [],
+      nonReviewArticles: [failed],
+      publicationResult: { outcome: "published", article: { ...failed, status: "published", last_error: "" } },
+    });
+
+    await test.bot.handleUpdate(commandUpdate("publish", "", { messageId: 91 }));
+
+    expect(test.listArticles).toHaveBeenCalledWith(["approved", "scheduled", "failed_publish"]);
+    expect(test.publishNow).toHaveBeenCalledWith("SEO-TG-PUBLISH-RETRY", {
+      id: 42,
+      displayName: "Owner",
+      providerObjectId: "message:-5484259760:91",
+    });
+    const replies = test.apiCalls.filter((call) => call.method === "sendMessage");
+    expect(replies).toHaveLength(1);
+    expect(String((replies[0]?.payload as { text?: string }).text ?? "")).toContain("Проверяю");
+  });
+
+  it("does not guess when more than one article is ready for immediate publication", async () => {
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [],
+      nonReviewArticles: [
+        reviewArticle({ __rowNumber: 8, article_id: "SEO-PUBLISH-A", status: "approved" }),
+        reviewArticle({ __rowNumber: 9, article_id: "SEO-PUBLISH-B", status: "scheduled" }),
+      ],
+    });
+
+    await test.bot.handleUpdate(commandUpdate("publish"));
+
+    expect(test.publishNow).not.toHaveBeenCalled();
+    const text = String(sentMessagePayload(test)?.text ?? "");
+    expect(text).toContain("несколько статей для отправки в Ghost");
+    expect(text).toContain("SEO-PUBLISH-A");
+    expect(text).toContain("SEO-PUBLISH-B");
+    expect(text).toContain("/publish");
+  });
+
+  it("rejects /publish arguments before selecting or publishing an article", async () => {
+    const test = botHarness(queuedGenerationResult, { reviewArticles: [], nonReviewArticles: [] });
+
+    await test.bot.handleUpdate(commandUpdate("publish", "SEO-TG-1"));
+
+    expect(test.listArticles).not.toHaveBeenCalled();
+    expect(test.findArticleByTelegramMessageId).not.toHaveBeenCalled();
+    expect(test.publishNow).not.toHaveBeenCalled();
+    expect(String(sentMessagePayload(test)?.text ?? "")).toContain("только /publish");
+  });
+
+  it("explains a stale approval after an immediate publication request", async () => {
+    const scheduled = reviewArticle({
+      __rowNumber: 31,
+      article_id: "SEO-TG-EDITED-AFTER-APPROVAL",
+      status: "scheduled",
+    });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [],
+      nonReviewArticles: [scheduled],
+      publicationResult: {
+        outcome: "blocked",
+        article: { ...scheduled, status: "needs_review" },
+        reason: "content_changed",
+      },
+    });
+
+    await test.bot.handleUpdate(commandUpdate("publish"));
+
+    expect(test.publishNow).toHaveBeenCalledTimes(1);
+    const texts = test.apiCalls
+      .filter((call) => call.method === "sendMessage")
+      .map((call) => String((call.payload as { text?: string }).text ?? ""));
+    expect(texts).toHaveLength(2);
+    expect(texts[1]).toContain("Текст изменился после согласования");
+    expect(texts[1]).toContain("/approve");
+    expect(texts[1]).toContain("gid=910000001&range=A31:AO31");
+  });
+
+  it("reports a missing trusted approval directly because ReviewNotifier cannot own that outcome", async () => {
+    const scheduled = reviewArticle({
+      __rowNumber: 32,
+      article_id: "SEO-TG-NO-TRUSTED-APPROVAL",
+      status: "scheduled",
+    });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [],
+      nonReviewArticles: [scheduled],
+      publicationResult: {
+        outcome: "blocked",
+        article: { ...scheduled, status: "conflict" },
+        reason: "missing_trusted_approval",
+      },
+    });
+
+    await test.bot.handleUpdate(commandUpdate("publish"));
+
+    const texts = test.apiCalls
+      .filter((call) => call.method === "sendMessage")
+      .map((call) => String((call.payload as { text?: string }).text ?? ""));
+    expect(texts).toHaveLength(2);
+    expect(texts[1]).toContain("нет подтверждённого согласования из Telegram");
+    expect(texts[1]).toContain("/approve");
+    expect(texts[1]).toContain("gid=910000001&range=A32:AO32");
+  });
+
+  it("leaves a content-change conflict to ReviewNotifier instead of duplicating its warning", async () => {
+    const scheduled = reviewArticle({
+      __rowNumber: 33,
+      article_id: "SEO-TG-CONTENT-CONFLICT",
+      status: "scheduled",
+    });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [],
+      nonReviewArticles: [scheduled],
+      publicationResult: {
+        outcome: "blocked",
+        article: { ...scheduled, status: "conflict" },
+        reason: "content_changed",
+      },
+    });
+
+    await test.bot.handleUpdate(commandUpdate("publish"));
+
+    expect(test.publishNow).toHaveBeenCalledTimes(1);
+    const replies = test.apiCalls.filter((call) => call.method === "sendMessage");
+    expect(replies).toHaveLength(1);
+    expect(String((replies[0]?.payload as { text?: string }).text ?? "")).toContain("результат и ссылку");
+  });
+
+  it("reports an in-progress manual publication without inventing a second final link", async () => {
+    const scheduled = reviewArticle({ article_id: "SEO-TG-PUBLISHING", status: "scheduled" });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [],
+      nonReviewArticles: [scheduled],
+      publicationResult: { outcome: "already_requested", article: { ...scheduled, status: "publishing" } },
+    });
+
+    await test.bot.handleUpdate(commandUpdate("publish"));
+
+    const texts = test.apiCalls
+      .filter((call) => call.method === "sendMessage")
+      .map((call) => String((call.payload as { text?: string }).text ?? ""));
+    expect(texts).toHaveLength(2);
+    expect(texts[1]).toContain("уже отправляется");
+    expect(texts[1]).not.toMatch(/https?:\/\//u);
+  });
+
+  it("leaves a failed publication outcome to the exactly-once ReviewNotifier message", async () => {
+    const scheduled = reviewArticle({ article_id: "SEO-TG-PUBLISH-FAIL", status: "scheduled" });
+    const test = botHarness(queuedGenerationResult, {
+      reviewArticles: [],
+      nonReviewArticles: [scheduled],
+      publicationResult: {
+        outcome: "failed",
+        article: { ...scheduled, status: "failed_publish", last_error: "Ghost returned 503" },
+        message: "Ghost returned 503",
+      },
+    });
+
+    await test.bot.handleUpdate(commandUpdate("publish"));
+
+    expect(test.publishNow).toHaveBeenCalledTimes(1);
+    const replies = test.apiCalls.filter((call) => call.method === "sendMessage");
+    expect(replies).toHaveLength(1);
+    expect(String((replies[0]?.payload as { text?: string }).text ?? "")).toContain("результат и ссылку");
   });
 
   it("does not announce a successful regeneration for an inconsistent review state", async () => {

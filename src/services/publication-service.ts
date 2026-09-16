@@ -1,16 +1,32 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 import type { AppConfig } from "../config.js";
-import type { Article, CellValue } from "../domain/article.js";
+import type { Article, CellValue, SheetRecord } from "../domain/article.js";
 import { articleContentHash, booleanCell, dateCell, stringCell } from "../domain/article.js";
 import { assertTransition } from "../domain/transitions.js";
 import type { GhostAdminClient, GhostPost } from "../ghost/client.js";
 import { buildGhostPayload, ghostArticleSlug, publicArticleUrl } from "../ghost/payload.js";
 import { KeyedMutex } from "../lib/keyed-mutex.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
+import type { TelegramActor } from "./approval-service.js";
 import { nextPublicationAt, parseLocalClockTime } from "./editorial-clock.js";
 
 const DEFAULT_PUBLICATION_GRACE_MINUTES = 15;
+
+export type ManualPublicationBlockReason =
+  | "publishing_disabled"
+  | "invalid_status"
+  | "qa_not_passed"
+  | "missing_trusted_approval"
+  | "content_changed"
+  | "approval_state_mismatch";
+
+export type ManualPublicationResult =
+  | { outcome: "published"; article: Article }
+  | { outcome: "already_published"; article: Article }
+  | { outcome: "already_requested"; article: Article }
+  | { outcome: "blocked"; article: Article; reason: ManualPublicationBlockReason }
+  | { outcome: "failed"; article: Article; message: string };
 
 export class PublicationService {
   constructor(
@@ -41,6 +57,160 @@ export class PublicationService {
         );
       }
     }
+  }
+
+  async publishNow(articleId: string, actor: TelegramActor): Promise<ManualPublicationResult> {
+    return this.mutex.runExclusive(articleId, async () => {
+      const article = await this.store.findArticle(articleId);
+      if (!article) throw new Error(`Article not found: ${articleId}`);
+      if (article.status === "published") return { outcome: "already_published", article };
+      if (article.status === "publishing") return { outcome: "already_requested", article };
+      if (!["approved", "scheduled", "failed_publish"].includes(article.status)) {
+        return { outcome: "blocked", article, reason: "invalid_status" };
+      }
+
+      const settings = await this.store.getSettings();
+      if (!this.#publishingIsEnabled(settings)) {
+        return { outcome: "blocked", article, reason: "publishing_disabled" };
+      }
+
+      const currentHash = articleContentHash(article);
+      const events = await this.store.listEvents(article.article_id);
+      const approvedHash = trustedApprovedHash(events);
+      if (!approvedHash) {
+        await this.#setConflict(
+          article,
+          "missing_trusted_approval",
+          "No trusted approval event authorizes publication",
+          {
+            current_hash: currentHash,
+            stored_hash: stringCell(article.content_hash) || null,
+          },
+        );
+        return {
+          outcome: "blocked",
+          article: (await this.store.findArticle(article.article_id)) ?? article,
+          reason: "missing_trusted_approval",
+        };
+      }
+      if (approvedHash !== currentHash) {
+        await this.#returnEditedArticleToReview(article, currentHash, approvedHash);
+        return {
+          outcome: "blocked",
+          article: (await this.store.findArticle(article.article_id)) ?? article,
+          reason: "content_changed",
+        };
+      }
+      if (stringCell(article.content_hash) !== currentHash) {
+        await this.#setConflict(
+          article,
+          "approval_state_mismatch",
+          "Stored approval state does not match the trusted approval event",
+          {
+            current_hash: currentHash,
+            approved_hash: approvedHash,
+            stored_hash: stringCell(article.content_hash) || null,
+          },
+        );
+        return {
+          outcome: "blocked",
+          article: (await this.store.findArticle(article.article_id)) ?? article,
+          reason: "approval_state_mismatch",
+        };
+      }
+
+      if (
+        stringCell(article.qa_status) !== "pass" ||
+        Boolean(stringCell(article.qa_blockers)) ||
+        booleanCell(article.manual_required)
+      ) {
+        await this.#setConflict(
+          article,
+          "qa_not_passed",
+          "Manual publication blocked because the approved article no longer has a clean QA state",
+        );
+        return {
+          outcome: "blocked",
+          article: (await this.store.findArticle(article.article_id)) ?? article,
+          reason: "qa_not_passed",
+        };
+      }
+
+      const commandId = telegramCommandId(actor.providerObjectId);
+      const duplicateRequest = events.some(
+        (event) =>
+          stringCell(event.event_type) === "manual_publish_requested" &&
+          stringCell(event.provider_object_id) === commandId,
+      );
+      if (duplicateRequest && article.status === "failed_publish") {
+        return {
+          outcome: "failed",
+          article,
+          message: stringCell(article.last_error) || "Ghost publication failed",
+        };
+      }
+      if (!duplicateRequest) {
+        const requestedAt = this.clock().toISOString();
+        assertTransition(article.status, "publishing");
+        await this.store.patchArticleAndAppendEvent(
+          article.article_id,
+          {
+            status: "publishing",
+            last_error: "",
+            updated_at: requestedAt,
+          },
+          {
+            event_id: randomUUID(),
+            article_id: article.article_id,
+            event_type: "manual_publish_requested",
+            from_status: article.status,
+            to_status: "publishing",
+            actor_type: "telegram_user",
+            actor_id: String(actor.id),
+            provider: "telegram",
+            provider_object_id: commandId,
+            message: `Immediate publication requested by ${actor.displayName}`,
+            payload_json: JSON.stringify({
+              hash: currentHash,
+              username: actor.username ?? null,
+              display_name: actor.displayName,
+              scheduled_publish_at: stringCell(article.scheduled_publish_at) || null,
+            }),
+            created_at: requestedAt,
+          },
+        );
+        await this.#publishClaimed(article, currentHash);
+      } else {
+        // An atomic request normally leaves the row in `publishing`, so this
+        // branch is only a recovery path for an older/interrupted request.
+        await this.#publishAuthorized(article, currentHash);
+      }
+      const result = (await this.store.findArticle(article.article_id)) ?? article;
+      if (result.status === "published") return { outcome: "published", article: result };
+      if (result.status === "failed_publish") {
+        return {
+          outcome: "failed",
+          article: result,
+          message: stringCell(result.last_error) || "Ghost publication failed",
+        };
+      }
+      if (result.status === "publishing") return { outcome: "already_requested", article: result };
+      if (result.status === "needs_review") {
+        return { outcome: "blocked", article: result, reason: "content_changed" };
+      }
+      if (result.status === "conflict") {
+        const blocker = stringCell(result.qa_blockers);
+        const reason: ManualPublicationBlockReason = blocker === "missing_trusted_approval"
+          ? "missing_trusted_approval"
+          : blocker === "approval_state_mismatch"
+            ? "approval_state_mismatch"
+            : blocker === "qa_not_passed"
+              ? "qa_not_passed"
+              : "content_changed";
+        return { outcome: "blocked", article: result, reason };
+      }
+      return { outcome: "blocked", article: result, reason: "invalid_status" };
+    });
   }
 
   #publishingIsEnabled(settings: Map<string, unknown>): boolean {
@@ -102,17 +272,38 @@ export class PublicationService {
       return;
     }
 
+    await this.#publishAuthorized(article, currentHash);
+  }
+
+  async #publishAuthorized(article: Article, currentHash: string): Promise<void> {
     assertTransition(article.status, "publishing");
     const startedAt = new Date().toISOString();
-    await this.store.patchArticle(article.article_id, {
-      status: "publishing",
-      last_error: "",
-      updated_at: startedAt,
-    });
-    await this.#event(article, "publishing_started", article.status, "publishing", "Publishing to Ghost", {
-      hash: currentHash,
-    });
+    await this.store.patchArticleAndAppendEvent(
+      article.article_id,
+      {
+        status: "publishing",
+        last_error: "",
+        updated_at: startedAt,
+      },
+      {
+        event_id: randomUUID(),
+        article_id: article.article_id,
+        event_type: "publishing_started",
+        from_status: article.status,
+        to_status: "publishing",
+        actor_type: "system",
+        actor_id: "publisher",
+        provider: "ghost",
+        message: "Publishing to Ghost",
+        payload_json: JSON.stringify({ hash: currentHash }),
+        created_at: startedAt,
+      },
+    );
 
+    await this.#publishClaimed(article, currentHash);
+  }
+
+  async #publishClaimed(article: Article, currentHash: string): Promise<void> {
     try {
       const claimed = await this.store.findArticle(article.article_id);
       if (!claimed || claimed.status !== "publishing") return;
@@ -247,6 +438,10 @@ export class PublicationService {
       await this.#markConflict(article, currentHash, approvedHash);
       return;
     }
+    const hasManualPublishIntent = await this.#hasTrustedManualPublishRequest(
+      article.article_id,
+      currentHash,
+    );
     const storedId = stringCell(article.ghost_post_id);
     if (!storedId) {
       const collision = await this.ghost.findPostBySlug(ghostArticleSlug(article));
@@ -257,6 +452,10 @@ export class PublicationService {
           "A Ghost post exists after a stale claim but is not bound by ghost_post_id",
           { ghost_post_id: collision.id, ghost_status: collision.status },
         );
+        return;
+      }
+      if (hasManualPublishIntent) {
+        await this.#publishClaimed(article, currentHash);
         return;
       }
       assertTransition("publishing", "approved");
@@ -287,6 +486,7 @@ export class PublicationService {
     const scheduledAt = parseScheduledDate(article, timeZone);
     if (
       ghostPost.status === "draft" &&
+      !hasManualPublishIntent &&
       scheduledAt &&
       now.getTime() - scheduledAt.getTime() > publicationGraceMs(await this.store.getSettings())
     ) {
@@ -379,38 +579,28 @@ export class PublicationService {
 
   async #latestApprovedHash(articleId: string): Promise<string | undefined> {
     const events = await this.store.listEvents(articleId);
+    return trustedApprovedHash(events);
+  }
+
+  async #hasTrustedManualPublishRequest(articleId: string, currentHash: string): Promise<boolean> {
+    const events = await this.store.listEvents(articleId);
     for (const event of events.toReversed()) {
       const eventType = stringCell(event.event_type);
-      if (eventType !== "approved" && eventType !== "publication_rescheduled") continue;
+      if (eventType !== "manual_publish_requested" && eventType !== "publishing_started") continue;
+      if (eventType === "publishing_started") return false;
       if (
-        eventType === "approved" &&
-        !(
-          stringCell(event.provider) === "telegram" ||
-          (
-            stringCell(event.provider) === "system" &&
-            stringCell(event.actor_id) === "auto-review-timeout"
-          )
-        )
-      ) {
-        continue;
-      }
-      if (
-        eventType === "publication_rescheduled" &&
-        !(
-          stringCell(event.actor_id) === "publisher-rescheduler" &&
-          stringCell(event.provider) === "system"
-        )
-      ) {
-        continue;
-      }
+        stringCell(event.to_status) !== "publishing" ||
+        stringCell(event.actor_type) !== "telegram_user" ||
+        stringCell(event.provider) !== "telegram"
+      ) return false;
       try {
         const payload = JSON.parse(stringCell(event.payload_json)) as { hash?: unknown };
-        if (typeof payload.hash === "string") return payload.hash;
+        return payload.hash === currentHash;
       } catch {
-        continue;
+        return false;
       }
     }
-    return undefined;
+    return false;
   }
 
   async #markConflict(
@@ -599,6 +789,45 @@ function stableRescheduleEventId(
   const source = `${articleId}:${fromStatus}:${toStatus}:${from.toISOString()}:${to.toISOString()}`;
   const hash = createHash("sha256").update(source).digest("hex").slice(0, 24);
   return `evt-publication-rescheduled-${hash}`;
+}
+
+function telegramCommandId(providerObjectId: string): string {
+  return `telegram:${providerObjectId}`;
+}
+
+function trustedApprovedHash(events: readonly SheetRecord[]): string | undefined {
+  for (const event of events.toReversed()) {
+    const eventType = stringCell(event.event_type);
+    if (eventType !== "approved" && eventType !== "publication_rescheduled") continue;
+    if (
+      eventType === "approved" &&
+      !(
+        stringCell(event.provider) === "telegram" ||
+        (
+          stringCell(event.provider) === "system" &&
+          stringCell(event.actor_id) === "auto-review-timeout"
+        )
+      )
+    ) {
+      continue;
+    }
+    if (
+      eventType === "publication_rescheduled" &&
+      !(
+        stringCell(event.actor_id) === "publisher-rescheduler" &&
+        stringCell(event.provider) === "system"
+      )
+    ) {
+      continue;
+    }
+    try {
+      const payload = JSON.parse(stringCell(event.payload_json)) as { hash?: unknown };
+      if (typeof payload.hash === "string") return payload.hash;
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
 }
 
 export type PublicPageVerification = { ok: boolean; status?: number; message: string };

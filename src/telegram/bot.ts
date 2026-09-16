@@ -10,6 +10,7 @@ import type {
   ManualGenerationResult,
   RegenerationResult,
 } from "../services/generation-service.js";
+import type { ManualPublicationResult, PublicationService } from "../services/publication-service.js";
 import {
   articleSheetUrl,
   escapeHtml,
@@ -31,9 +32,10 @@ export function createTelegramBot(options: {
   store: GoogleSheetsStore;
   approvals: ApprovalService;
   generation: GenerationService;
+  publication: Pick<PublicationService, "publishNow">;
   logger: Logger;
 }): SeoBot {
-  const { config, store, approvals, generation, logger } = options;
+  const { config, store, approvals, generation, publication, logger } = options;
   const bot = new Bot(config.telegramBotToken);
   const updateDrain = new UpdateDrain();
   updateDrains.set(bot, updateDrain);
@@ -59,6 +61,7 @@ export function createTelegramBot(options: {
         "/generate — вручную взять верхнюю ready-строку и создать статью",
         "/regenerate комментарий — переписать текущую статью по замечаниям",
         "/approve — согласовать текущую статью; отправляется без дополнительного текста",
+        "/publish — опубликовать согласованную статью сейчас или повторить её после технической ошибки",
         "",
         "<b>Автоматический режим</b>",
         "",
@@ -69,6 +72,7 @@ export function createTelegramBot(options: {
         "",
         "На проверку даётся 48 часов с момента появления карточки. Успешный /regenerate обновляет эту же карточку и запускает новые 48 часов.",
         "/approve или истечение 48 часов запускают финальную внутреннюю проверку и ставят готовую статью на ближайшие будущие 10:00. Публикация может быть в любой день, но назначается только на 10:00 по Белграду; технический запуск может занять до 15 минут.",
+        "Если ждать назначенного времени не нужно, после согласования отправьте /publish: бот ещё раз проверит статью и опубликует её сразу.",
         "Если черновик не проходит внутреннюю проверку, я сам запускаю одну доработку и пишу в чат, что занят исправлением. Технические причины в чат не вываливаю.",
         "Если автодоработка не помогла, публикация останется заблокированной: я дам понятную инструкцию и ссылку на строку. Тогда отправьте /regenerate и сразу напишите замечания.",
         "",
@@ -138,6 +142,54 @@ export function createTelegramBot(options: {
     await replyApprovalResult(ctx, result);
   });
 
+  bot.command("publish", async (ctx) => {
+    if (!(await authorizeReviewChat(ctx, config, store))) return;
+    if (commandArgs(ctx)) {
+      await ctx.reply("Отправьте только /publish — без ARTICLE-ID и другого текста.");
+      return;
+    }
+    const replyMessageId = ctx.message?.reply_to_message?.message_id;
+    const publishable = replyMessageId
+      ? undefined
+      : await store.listArticles(["approved", "scheduled", "failed_publish"]);
+    const article = replyMessageId
+      ? await store.findArticleByTelegramMessageId(replyMessageId)
+      : soleArticle(publishable ?? []);
+    if (!article) {
+      if (replyMessageId) {
+        await ctx.reply("❓ Это не карточка статьи. Ответьте /publish именно на сообщение с SEO draft.");
+        return;
+      }
+      if ((publishable?.length ?? 0) > 1) {
+        await replyAmbiguousPublishableArticles(ctx, publishable!, config.spreadsheetId);
+        return;
+      }
+      await replyNoPublishableArticle(ctx, store);
+      return;
+    }
+    try {
+      await ctx.reply(
+        `🚀 Проверяю <b>${escapeHtml(article.article_id)}</b> и, если всё в порядке, публикую в Ghost прямо сейчас. Повторять команду не нужно — результат и ссылку пришлю отдельным сообщением.`,
+        { parse_mode: "HTML" },
+      );
+    } catch (error) {
+      logger.warn(
+        { articleId: article.article_id, err: error instanceof Error ? error.message : String(error) },
+        "Could not send manual publication acknowledgement",
+      );
+    }
+    try {
+      const result = await publication.publishNow(article.article_id, actorFromContext(ctx));
+      await replyManualPublicationResult(ctx, result, config.spreadsheetId);
+    } catch (error) {
+      logger.error(
+        { articleId: article.article_id, err: error instanceof Error ? error.message : String(error) },
+        "Manual publication request failed",
+      );
+      await ctx.reply("⚠️ Не удалось запустить публикацию. Статья не потеряна; попробуйте ещё раз позже.");
+    }
+  });
+
   bot.command("regenerate", async (ctx) => {
     if (!(await authorizeReviewChat(ctx, config, store))) return;
     const feedback = commandArgs(ctx);
@@ -201,9 +253,11 @@ export function createTelegramBot(options: {
   return bot;
 }
 
-function soleActiveReviewArticle(articles: Article[]): Article | undefined {
+function soleArticle(articles: Article[]): Article | undefined {
   return articles.length === 1 ? articles[0] : undefined;
 }
+
+const soleActiveReviewArticle = soleArticle;
 
 function latestArticle(articles: Article[]): Article | undefined {
   return [...articles].sort((left, right) => right.__rowNumber - left.__rowNumber)[0];
@@ -255,6 +309,7 @@ export const telegramCommandMenu = [
   { command: "generate", description: "Сгенерировать следующую статью" },
   { command: "regenerate", description: "Переписать по комментарию" },
   { command: "approve", description: "Согласовать статью" },
+  { command: "publish", description: "Опубликовать согласованную сейчас" },
   { command: "help", description: "Как работает бот" },
 ] as const;
 
@@ -363,6 +418,122 @@ async function replyApprovalResult(ctx: Context, result: ApprovalResult): Promis
   await ctx.reply(
     `⛔ Текущий статус <code>${escapeHtml(result.article.status)}</code>; требуется <code>needs_review</code>.`,
     { parse_mode: "HTML" },
+  );
+}
+
+async function replyManualPublicationResult(
+  ctx: Context,
+  result: ManualPublicationResult,
+  spreadsheetId: string,
+): Promise<void> {
+  if (result.outcome === "published" || result.outcome === "failed") {
+    // ReviewNotifier owns the single definitive publication outcome and public
+    // URL. Sending success or failure here would duplicate its audited message.
+    return;
+  }
+  if (result.outcome === "already_requested") {
+    await ctx.reply(
+      `⏳ <b>${escapeHtml(result.article.article_id)}</b> уже отправляется в Ghost. Повторять /publish не нужно — дождитесь отдельного сообщения со ссылкой.`,
+      { parse_mode: "HTML" },
+    );
+    return;
+  }
+  if (result.outcome === "already_published") {
+    await ctx.reply(
+      `ℹ️ <b>${escapeHtml(result.article.article_id)}</b> уже опубликована. Бот не создавал повторную публикацию; готовая ссылка есть в сообщении о результате выше.`,
+      { parse_mode: "HTML" },
+    );
+    return;
+  }
+  const sheetUrl = articleSheetUrl(spreadsheetId, result.article.__rowNumber);
+  if (["qa_not_passed", "approval_state_mismatch"].includes(result.reason)) {
+    // These paths write a publication_conflict event. ReviewNotifier will send
+    // the one actionable error message on its next pass.
+    return;
+  }
+  if (result.reason === "content_changed" && result.article.status === "conflict") {
+    // A conflict outcome is also owned by ReviewNotifier. A normal edited
+    // article returns to needs_review and needs the immediate /approve hint.
+    return;
+  }
+  const reason = result.reason === "publishing_disabled"
+    ? "Ручная публикация сейчас выключена настройками. Обратитесь к техническому администратору."
+    : result.reason === "qa_not_passed"
+      ? "Статья ещё не прошла внутреннюю проверку. Исправьте её и согласуйте командой /approve."
+      : result.reason === "invalid_status"
+        ? `Статья находится в статусе ${escapeHtml(result.article.status)}. Сначала согласуйте готовый текст командой /approve.`
+        : result.reason === "content_changed"
+          ? "Текст изменился после согласования. Бот остановил публикацию: проверьте обновлённую карточку и снова отправьте /approve."
+          : result.reason === "missing_trusted_approval"
+            ? "У статьи нет подтверждённого согласования из Telegram. Верните её на проверку и отправьте /approve."
+            : "Сохранённое согласование не совпадает с текущей версией статьи. Проверьте карточку и снова отправьте /approve.";
+  await ctx.reply(
+    [
+      `⛔ <b>${escapeHtml(result.article.article_id)} не опубликована.</b>`,
+      reason,
+      `<a href="${sheetUrl}">Открыть статью в Google Sheets</a>`,
+    ].join("\n"),
+    { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+  );
+}
+
+async function replyNoPublishableArticle(ctx: Context, store: GoogleSheetsStore): Promise<void> {
+  const latest = latestArticle(await store.listArticles([
+    "needs_review",
+    "failed_qa",
+    "publishing",
+    "published",
+    "failed_publish",
+    "conflict",
+  ]));
+  if (!latest) {
+    await ctx.reply("❓ Нет согласованной статьи для публикации. Сначала создайте её через /generate и согласуйте через /approve.");
+    return;
+  }
+  if (["needs_review", "failed_qa"].includes(latest.status)) {
+    await ctx.reply(
+      `📝 <b>${escapeHtml(latest.article_id)}</b> ещё ждёт проверки. Сначала исправьте текст при необходимости и отправьте /approve.`,
+      { parse_mode: "HTML" },
+    );
+    return;
+  }
+  if (latest.status === "publishing") {
+    await ctx.reply(
+      `⏳ <b>${escapeHtml(latest.article_id)}</b> уже отправляется в Ghost. Повторять /publish не нужно — дождитесь отдельного сообщения со ссылкой.`,
+      { parse_mode: "HTML" },
+    );
+    return;
+  }
+  if (latest.status === "published") {
+    await ctx.reply(
+      `ℹ️ <b>${escapeHtml(latest.article_id)}</b> уже опубликована. Повторная публикация не требуется.`,
+      { parse_mode: "HTML" },
+    );
+    return;
+  }
+  await ctx.reply(
+    `⛔ <b>${escapeHtml(latest.article_id)}</b> сейчас нельзя опубликовать: статус <code>${escapeHtml(latest.status)}</code>. Проверьте строку статьи в Google Sheets.`,
+    { parse_mode: "HTML" },
+  );
+}
+
+async function replyAmbiguousPublishableArticles(
+  ctx: Context,
+  articles: Article[],
+  spreadsheetId: string,
+): Promise<void> {
+  const rows = articles
+    .map((candidate) =>
+      `<a href="${articleSheetUrl(spreadsheetId, candidate.__rowNumber)}">${escapeHtml(candidate.article_id)} · строка ${candidate.__rowNumber}</a>`,
+    )
+    .join("\n");
+  await ctx.reply(
+    [
+      "⛔ <b>В таблице несколько статей для отправки в Ghost.</b> Я не буду угадывать, какую публиковать или повторять.",
+      rows,
+      "Ответьте командой /publish на карточку нужной статьи.",
+    ].join("\n"),
+    { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
   );
 }
 
