@@ -118,6 +118,8 @@ describe("article revision prompt", () => {
     expect(prompt.user).toContain(`<editor_feedback>\n${feedback}\n</editor_feedback>`);
     expect(prompt.user).toContain("Belgrade and Novi Sad are both covered");
     expect(prompt.system).toContain("Do not trust the writer's quality_score");
+    expect(prompt.system).toContain("Fail only for a material, specific violation");
+    expect(prompt.system).toContain("do not all have to be repeated");
   });
 });
 
@@ -199,6 +201,11 @@ describe("bounded revision compliance audit", () => {
     const result = await generator.generate(revisionInput());
     expect(parse).toHaveBeenCalledTimes(4);
     expect(result.qa_blockers).toContain("editor_feedback_not_applied");
+    expect(result.revision_audit).toEqual({
+      compliant: false,
+      unmet_requirements: ["Wrong audience remains."],
+      contradictions: [],
+    });
   });
 
   it("does not spend audit calls for an initial article generation", async () => {

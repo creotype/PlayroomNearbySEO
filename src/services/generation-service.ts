@@ -489,6 +489,7 @@ export class GenerationService {
             editor_feedback: storedEditorFeedback || null,
             model: this.config.openAiModel,
             qa_blockers: blockers,
+            revision_audit: generated.revision_audit ?? null,
           }),
           created_at: now,
         },

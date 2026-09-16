@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { articleContentHash, stringCell } from "./domain/article.js";
+import { articleContentHash, booleanCell, stringCell, type SheetRecord } from "./domain/article.js";
 import { loadConfig } from "./config.js";
 import { OpenAiArticleGenerator } from "./generation/openai-generator.js";
 import { KeyedMutex } from "./lib/keyed-mutex.js";
@@ -9,7 +9,12 @@ import { GenerationService } from "./services/generation-service.js";
 import { QualityGate } from "./services/quality-gate.js";
 
 const articleId = process.argv[2]?.trim();
-if (!articleId) throw new Error("Usage: node dist/src/operator-regenerate.js <article-id>");
+const recoverSystemGate = process.argv.slice(3).includes("--recover-system-gate");
+if (!articleId) {
+  throw new Error(
+    "Usage: node dist/src/operator-regenerate.js <article-id> [--recover-system-gate]",
+  );
+}
 
 const config = loadConfig();
 if (!config.openAiApiKey) throw new Error("OPENAI_API_KEY is required");
@@ -21,8 +26,21 @@ if (!article) throw new Error(`Article not found: ${articleId}`);
 const feedback = stringCell(article.feedback);
 if (!feedback) throw new Error(`Article ${articleId} has no stored editor feedback`);
 const baseContentHash = articleContentHash(article);
+if (recoverSystemGate) {
+  const events = await store.listEvents(articleId);
+  if (!hasRecoverableSystemGate(article, events, baseContentHash)) {
+    throw new Error(`Article ${articleId} has no matching system-created exhausted QA gate`);
+  }
+}
 const repairKey = createHash("sha256")
-  .update(JSON.stringify({ articleId, baseContentHash, feedback, model: config.openAiModel, workflow: 1 }))
+  .update(JSON.stringify({
+    articleId,
+    baseContentHash,
+    feedback,
+    model: config.openAiModel,
+    recoverSystemGate,
+    workflow: 2,
+  }))
   .digest("hex")
   .slice(0, 24);
 
@@ -44,6 +62,7 @@ const result = await generation.regenerateArticle({
   actorType: "system",
   provider: "system",
   expectedContentHash: baseContentHash,
+  ...(recoverSystemGate ? { recoverSystemManualGate: true } : {}),
 });
 
 if (result.outcome === "blocked") {
@@ -58,4 +77,33 @@ if (result.outcome === "blocked") {
     qaBlockers: stringCell(result.article.qa_blockers),
     revisionCount: result.article.revision_count,
   }));
+}
+
+function hasRecoverableSystemGate(
+  article: SheetRecord,
+  events: SheetRecord[],
+  contentHash: string,
+): boolean {
+  if (
+    !booleanCell(article.manual_required) ||
+    stringCell(article.status) !== "failed_qa" ||
+    stringCell(article.qa_status) !== "fail"
+  ) {
+    return false;
+  }
+  const terminalIndex = events.findLastIndex((event) => {
+    if (stringCell(event.event_type) !== "auto_qa_repair_exhausted") return false;
+    try {
+      const payload = JSON.parse(stringCell(event.payload_json)) as Record<string, unknown>;
+      return payload.output_hash === contentHash &&
+        payload.qa_blockers === stringCell(article.qa_blockers);
+    } catch {
+      return false;
+    }
+  });
+  if (terminalIndex < 0) return false;
+  return events.slice(terminalIndex + 1).every((event) =>
+    stringCell(event.actor_type) === "system" &&
+    stringCell(event.event_type) === "auto_qa_repair_notified"
+  );
 }

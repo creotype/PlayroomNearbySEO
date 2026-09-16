@@ -30,7 +30,16 @@ const generatedArticleSchema = generatedArticleResponseSchema.extend({
   internal_links: z.array(z.string().url()).min(1),
 });
 
-export type GeneratedArticle = z.infer<typeof generatedArticleSchema>;
+export type RevisionAudit = {
+  compliant: boolean;
+  unmet_requirements: string[];
+  contradictions: string[];
+};
+
+export type GeneratedArticle = z.infer<typeof generatedArticleSchema> & {
+  /** Internal evidence for a failed independent revision audit; never sent to Ghost. */
+  revision_audit?: RevisionAudit;
+};
 
 export type ArticleGenerationInput = {
   keyword: SheetRecord;
@@ -187,6 +196,7 @@ export class OpenAiArticleGenerator {
     return {
       ...generated,
       qa_blockers: [...new Set([...generated.qa_blockers, feedbackBlocker])],
+      revision_audit: audit,
     };
   }
 
@@ -251,6 +261,10 @@ export function buildRevisionAuditPrompt(
       "Do not trust the writer's quality_score or qa_blockers. Inspect the candidate itself.",
       "Set compliant=true only when every explicit editor directive, canonical product fact, and mandatory guardrail is satisfied, including requested voice, audience, geography, structure, omissions, concision, and calls to action.",
       "A directive is unmet if the candidate keeps a statement the editor explicitly told it to remove, contradicts a product fact, merely softens the old wording, or omits a requested section.",
+      "Fail only for a material, specific violation supported by the candidate text. Do not fail merely because the copy could be polished further.",
+      "Treat subjective directions such as warmer, concise, less repetitive, and natural SEO as satisfied unless the candidate shows clear and substantial opposite behavior.",
+      "Canonical product facts and guardrails constrain claims that are made; they do not all have to be repeated in every article.",
+      "A sentence that explicitly negates a prohibited framing is not itself a violation of that prohibition.",
       "List each concrete unmet requirement and contradiction briefly. If and only if none remain, return compliant=true with empty arrays.",
     ].join("\n"),
     user: [
