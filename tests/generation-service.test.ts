@@ -1054,6 +1054,62 @@ function reviewArticle(overrides: Record<string, CellValue> = {}): SheetRecord {
 }
 
 describe("article regeneration", () => {
+  it("keeps the original keyword brief separate from binding editor feedback", async () => {
+    const longFeedback = [
+      "Rewrite from Playroom Nearby's own perspective.",
+      "Belgrade and Novi Sad are both available today.",
+      "Do not claim all listings are verified.",
+    ].join("\n");
+    const keyword = readyKeyword({
+      keyword_id: "KW-REV-1",
+      status: "used",
+      article_id: regenerationRequest.articleId,
+      secondary_keywords: "kids activities Serbia, family activities Novi Sad",
+      search_intent: "brand_information",
+      article_type: "brand_guide",
+      topic_angle: "Original product introduction angle",
+      research_notes: "Original immutable keyword research notes",
+    });
+    const test = setup({ articles: [reviewArticle()], keywords: [keyword] });
+
+    await test.service.regenerateArticle({ ...regenerationRequest, feedback: longFeedback });
+
+    expect(test.generate).toHaveBeenCalledWith(expect.objectContaining({
+      keyword: expect.objectContaining({
+        topic_angle: "Original product introduction angle",
+        research_notes: "Original immutable keyword research notes",
+        secondary_keywords: "kids activities Serbia, family activities Novi Sad",
+        search_intent: "brand_information",
+        article_type: "brand_guide",
+      }),
+      revision: expect.objectContaining({ feedback: longFeedback }),
+    }));
+    const attempt = test.events.find((event) => event.event_type === "regeneration_attempt_started");
+    expect(JSON.parse(String(attempt?.payload_json))).toMatchObject({ feedback: longFeedback });
+  });
+
+  it("falls back to the article brief when the original keyword row is unavailable", async () => {
+    const article = reviewArticle({
+      secondary_keywords: "fallback secondary phrase",
+      search_intent: "informational",
+      article_type: "guide",
+      topic: "Fallback article topic",
+    });
+    const test = setup({ articles: [article], keywords: [] });
+
+    await test.service.regenerateArticle(regenerationRequest);
+
+    expect(test.generate).toHaveBeenCalledWith(expect.objectContaining({
+      keyword: expect.objectContaining({
+        primary_keyword: article.primary_keyword,
+        secondary_keywords: "fallback secondary phrase",
+        search_intent: "informational",
+        article_type: "guide",
+        topic_angle: "Fallback article topic",
+      }),
+    }));
+  });
+
   it("replaces the same row only after successful generation and records one atomic revision", async () => {
     const original = reviewArticle();
     const test = setup({ articles: [original] });
@@ -1153,6 +1209,63 @@ describe("article regeneration", () => {
       manual_required: true,
     });
     expect(String(test.articleRows[0]?.qa_blockers)).toContain("manual_required");
+  });
+
+  it("queues editor-feedback failure for automatic repair without exposing a human gate", async () => {
+    const test = setup({
+      articles: [reviewArticle()],
+      qaBlockers: ["editor_feedback_not_applied"],
+    });
+
+    await test.service.regenerateArticle(regenerationRequest);
+
+    expect(test.articleRows[0]).toMatchObject({
+      status: "failed_qa",
+      qa_status: "fail",
+      qa_blockers: "editor_feedback_not_applied",
+      manual_required: false,
+    });
+  });
+
+  it("keeps another semantic defect as a human gate when feedback compliance also fails", async () => {
+    const test = setup({
+      articles: [reviewArticle()],
+      qaBlockers: ["editor_feedback_not_applied", "missing_authoritative_source"],
+    });
+
+    await test.service.regenerateArticle(regenerationRequest);
+
+    expect(test.articleRows[0]).toMatchObject({
+      status: "failed_qa",
+      qa_status: "fail",
+      manual_required: true,
+    });
+  });
+
+  it("preserves pristine human feedback when a system repair adds machine instructions", async () => {
+    const humanFeedback = "Write for parents and keep Belgrade and Novi Sad as current coverage.";
+    const test = setup({
+      articles: [reviewArticle({ feedback: humanFeedback, manual_required: false })],
+      settings: settings({ generation_enabled: true }),
+    });
+
+    await test.service.regenerateArticle({
+      ...regenerationRequest,
+      feedback: `The original feedback remains binding:\n${humanFeedback}\nAlso fix QA.`,
+      actorId: "auto-qa-repair",
+      actorName: "Automatic QA repair",
+      actorType: "system",
+      provider: "system",
+      providerObjectId: "preserve-human-feedback",
+    });
+
+    expect(test.articleRows[0]?.feedback).toBe(humanFeedback);
+    const regenerated = test.events.find((event) =>
+      event.event_type === "regenerated" && event.provider_object_id === "system:preserve-human-feedback"
+    );
+    expect(JSON.parse(String(regenerated?.payload_json))).toMatchObject({
+      editor_feedback: humanFeedback,
+    });
   });
 
   it("lets a recovered automatic attempt replace only its system-created manual gate", async () => {

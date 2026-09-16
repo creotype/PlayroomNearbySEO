@@ -48,7 +48,7 @@ const envSchema = z
     GHOST_ADMIN_API_KEY: z.string().regex(/^[a-f0-9]+:[a-f0-9]+$/i),
     GHOST_API_VERSION: z.string().regex(/^v\d+\.\d+$/).default("v5.0"),
     OPENAI_API_KEY: optionalString(z.string().min(20)),
-    OPENAI_MODEL: z.string().min(1).default("gpt-5-mini"),
+    OPENAI_MODEL: z.string().min(1).default("gpt-5.6-sol"),
     OPENAI_IMAGE_MODEL: z.string().regex(/^gpt-image-2(?:-\d{4}-\d{2}-\d{2})?$/u).default("gpt-image-2"),
     OPENAI_IMAGE_SIZE: landscapeImageSize.default("1536x1024"),
     OPENAI_IMAGE_QUALITY: z.enum(["low", "medium", "high", "auto"]).default("high"),

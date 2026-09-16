@@ -217,6 +217,20 @@ function payload(event: SheetRecord): Record<string, unknown> {
 }
 
 describe("AutoQaRepairService", () => {
+  it("carries the human editor's original feedback into automatic QA repair", async () => {
+    const editorFeedback = "Keep Belgrade and Novi Sad as current coverage and write for parents.";
+    const test = setup({ article: repairArticle({ feedback: editorFeedback }) });
+
+    await test.service.runOnce();
+
+    expect(test.regenerateArticle).toHaveBeenCalledWith(expect.objectContaining({
+      feedback: expect.stringContaining(editorFeedback),
+    }));
+    expect(String(test.regenerateArticle.mock.calls[0]?.[0].feedback)).toContain(
+      "original feedback below remains binding",
+    );
+  });
+
   it("persists one system attempt before the paid repair and leaves a passing result for review", async () => {
     const test = setup();
     const inputHash = articleContentHash(test.article);

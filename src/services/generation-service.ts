@@ -362,6 +362,12 @@ export class GenerationService {
         ...article,
         manual_required: false,
       });
+      const originalKeyword = await this.store.findKeyword(stringCell(article.keyword_id));
+      const keywordBrief = originalKeyword ?? article;
+      const feedback = stringCell(request.feedback);
+      const storedEditorFeedback = provider === "system" && stringCell(article.feedback)
+        ? stringCell(article.feedback)
+        : feedback;
       await this.store.appendEvent({
         event_id: attemptEventId,
         article_id: article.article_id,
@@ -376,21 +382,28 @@ export class GenerationService {
         payload_json: JSON.stringify({
           base_hash: articleContentHash(article),
           model: this.config.openAiModel,
+          feedback: feedback || null,
+          editor_feedback: storedEditorFeedback || null,
         }),
         created_at: new Date().toISOString(),
       });
       const generated = await this.generator!.generate({
         keyword: {
-          ...article,
-          topic_angle: stringCell(article.topic) || stringCell(article.primary_keyword),
-          research_notes: stringCell(request.feedback),
+          ...keywordBrief,
+          locale: article.locale,
+          primary_keyword: stringCell(article.primary_keyword) || stringCell(keywordBrief.primary_keyword),
+          topic_angle:
+            stringCell(keywordBrief.topic_angle) ||
+            stringCell(article.topic) ||
+            stringCell(article.primary_keyword),
+          research_notes: stringCell(keywordBrief.research_notes),
         },
         guardrails,
         allowedLinks,
         targetWords: numberCell(settings.get("default_article_length_words")) || 1_200,
         revision: {
           article,
-          ...(stringCell(request.feedback) ? { feedback: stringCell(request.feedback) } : {}),
+          ...(feedback ? { feedback } : {}),
           deterministicBlockers: currentQuality.blockers,
         },
       });
@@ -455,7 +468,7 @@ export class GenerationService {
           public_url: "",
           published_at: "",
           last_error: "",
-          ...(stringCell(request.feedback) ? { feedback: stringCell(request.feedback) } : {}),
+          ...(storedEditorFeedback ? { feedback: storedEditorFeedback } : {}),
           updated_at: now,
         },
         {
@@ -472,7 +485,8 @@ export class GenerationService {
           payload_json: JSON.stringify({
             previous_hash: articleContentHash(article),
             revision_count: revisionCount,
-            feedback: stringCell(request.feedback) || null,
+            feedback: feedback || null,
+            editor_feedback: storedEditorFeedback || null,
             model: this.config.openAiModel,
             qa_blockers: blockers,
           }),

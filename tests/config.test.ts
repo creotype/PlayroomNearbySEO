@@ -15,6 +15,7 @@ describe("loadConfig", () => {
     expect(config.allowGhostPublish).toBe(false);
     expect(config.allowTelegramGeneration).toBe(false);
     expect(config.targetEnvironment).toBe("staging");
+    expect(config.openAiModel).toBe("gpt-5.6-sol");
     expect(config.openAiImageModel).toBe("gpt-image-2");
     expect(config.openAiImageSize).toBe("1536x1024");
     expect(config.openAiImageQuality).toBe("high");

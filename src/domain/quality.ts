@@ -13,6 +13,7 @@ export const GENERATED_QA_BLOCKER_CODES = [
   "serbian_not_latin",
   "absolute_or_guaranteed_claim",
   "meta_description_incomplete",
+  "editor_feedback_not_applied",
 ] as const;
 
 export type GeneratedQaBlockerCode = (typeof GENERATED_QA_BLOCKER_CODES)[number];

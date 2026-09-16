@@ -15,6 +15,9 @@ describe("OpenAI article response schema", () => {
     expect(generatedQaBlockerSchema.parse("missing_authoritative_source")).toBe(
       "missing_authoritative_source",
     );
+    expect(generatedQaBlockerSchema.parse("editor_feedback_not_applied")).toBe(
+      "editor_feedback_not_applied",
+    );
     expect(() =>
       generatedQaBlockerSchema.parse(
         "Any fact about a specific playroom must have authoritative source_url",

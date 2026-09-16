@@ -49,7 +49,7 @@ type InterruptedRecovery = {
 };
 
 /**
- * Performs at most one paid system revision for each publishable article hash.
+ * Performs at most one bounded system regeneration workflow for each publishable article hash.
  *
  * The outer started event is committed before the GenerationService paid-attempt
  * ledger. A restart may safely resume while that inner ledger is absent. Once the
@@ -213,9 +213,18 @@ export class AutoQaRepairService {
     let result: RegenerationResult | undefined;
     let failure: unknown;
     try {
+      const originalEditorFeedback = stringCell(started.feedback);
+      const repairFeedback = originalEditorFeedback
+        ? [
+            "The editor's original feedback below remains binding and must be applied in full:",
+            originalEditorFeedback,
+            "",
+            "Also fix every current QA defect and return a complete, publication-safe article.",
+          ].join("\n")
+        : "Fix every current QA defect and return a complete, publication-safe article.";
       result = await this.generation.regenerateArticle({
         articleId: started.article_id,
-        feedback: "Fix every current QA defect and return a complete, publication-safe article.",
+        feedback: repairFeedback,
         actorId: ACTOR_ID,
         actorName: ACTOR_ID,
         providerObjectId: identity.providerObjectId,
