@@ -29,7 +29,7 @@ pretend those production attestations are complete.
 - Ghost 5.x JWT authentication, localized slugs (`-en`, `-rs`), HTML sanitization, draft-first upsert, optimistic `updated_at` lock, and public-page verification.
 - A durable Telegram publication outcome: after Ghost and the public page are verified, the review group receives the canonical article link exactly once per publication event; failures receive an actionable Sheet link instead.
 - OpenAI Responses API generation with web research and strict structured output. The OpenAI clients for article and image generation use `maxRetries=0`, so an ambiguous network/provider failure cannot silently become another paid request.
-- A versioned Playroom hero-image pipeline using `gpt-image-2`: one topic-specific orange/yellow landscape WebP is generated before review, uploaded to Ghost, and attached as `feature_image` with localized alt text. The binary and upload result are cached durably, while missing/broken image data fails publication closed.
+- A versioned Playroom hero-image pipeline using `gpt-image-2`: two canonical Leo mascot references anchor one topic-specific orange/yellow landscape WebP before review. The result is uploaded to Ghost and attached as `feature_image` with localized alt text. Reference fingerprints, the binary and the upload result are cached durably, while missing/broken references or image data fail generation closed.
 - Append-only audit events, single-process per-article locking, health endpoints, Docker build, and unit tests.
 - Recovery for stale `publishing` claims, including reconciliation when Ghost was updated before a process crash.
 - Durable Monday/Friday editorial slots at 10:00 Europe/Belgrade. Each slot generates at most one article; an empty queue produces one actionable Telegram warning with the exact `keywords` link.
@@ -76,7 +76,7 @@ HERO_IMAGE_CACHE_DIR=/app/data/hero-images
 
 Both OpenAI SDK clients are configured with `maxRetries=0`. One automatic QA repair is an explicit, separately audited editorial attempt; SDK/network retries are not part of that budget. If a paid request has an ambiguous technical outcome, the bot fails closed instead of silently issuing it again.
 
-`OPENAI_IMAGE_SIZE` must be a valid landscape GPT Image resolution. Mount `HERO_IMAGE_CACHE_DIR` on persistent storage in Docker. Without that volume, a container replacement can repeat a paid generation; with it, generation and the returned Ghost URL survive restarts. The canonical visual rules and hard safety constraints live in [prompts/HERO_IMAGE_GUIDE.md](prompts/HERO_IMAGE_GUIDE.md). Do not edit them without incrementing the prompt version in code.
+`OPENAI_IMAGE_SIZE` must be a valid landscape GPT Image resolution. Mount `HERO_IMAGE_CACHE_DIR` on persistent storage in Docker. Without that volume, a container replacement can repeat a paid generation; with it, generation and the returned Ghost URL survive restarts. The canonical Leo references live in `assets/mascot/leo/`; their ordered fingerprint is included in every cache key. The visual rules and hard safety constraints live in [prompts/HERO_IMAGE_GUIDE.md](prompts/HERO_IMAGE_GUIDE.md). Do not edit either the guide or references without incrementing the prompt version in code.
 
 The Google service account must be explicitly shared onto the spreadsheet as an editor. The Google authorization used interactively in Codex cannot be reused by the deployed process.
 

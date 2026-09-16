@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type OpenAI from "openai";
@@ -63,37 +63,57 @@ describe("hero image prompt", () => {
     expect(prompt).toContain(`Prompt version: ${HERO_IMAGE_PROMPT_VERSION}`);
     expect(prompt).toContain("Subject: izbor bezbedne igraonice");
     expect(prompt).toContain("dominant orange and yellow palette");
+    expect(prompt).toContain("Show exactly one Leo as the main character");
+    expect(prompt).toContain("Image 1 is the canonical identity reference for Leo");
+    expect(prompt).toContain("dark navy hoodie with hood down, white drawstrings");
+    expect(prompt).toContain("Graphics printed on the reference map are incidental");
+    expect(prompt).toContain("Leo's face must remain clearly visible and consistent");
     expect(prompt).toContain("Do not render any words, letters, numbers");
-    expect(prompt).toContain("Do not show identifiable faces");
+    expect(prompt).toContain("Do not show identifiable human faces");
+    expect(prompt).not.toContain("Do not show identifiable faces.");
   });
 
   it("uses a stable content/settings fingerprint", () => {
-    const settings = { model: "gpt-image-2", size: "1536x1024", quality: "high" };
+    const settings = {
+      model: "gpt-image-2",
+      size: "1536x1024",
+      quality: "high",
+      referenceSetHash: "leo-reference-v1",
+    };
     const first = heroImagePromptHash(promptInput(), settings);
     expect(heroImagePromptHash(promptInput(), settings)).toBe(first);
     expect(heroImagePromptHash({ ...promptInput(), topic: "rođendan" }, settings)).not.toBe(first);
+    expect(heroImagePromptHash(promptInput(), {
+      ...settings,
+      referenceSetHash: "leo-reference-v2",
+    })).not.toBe(first);
   });
 });
 
 describe("OpenAiHeroImageGenerator", () => {
-  it("requests one high-quality landscape WebP without calling a real API", async () => {
-    const generate = vi.fn(async () => ({
+  it("uses the ordered Leo references for one high-quality landscape WebP", async () => {
+    const referenceDir = await temporaryDirectory();
+    const referencePaths = await writeReferenceImages(referenceDir);
+    const edit = vi.fn(async (_request: Record<string, unknown>) => ({
       data: [{ b64_json: Buffer.from("generated-image").toString("base64") }],
     }));
-    const client = { images: { generate } } as unknown as Pick<OpenAI, "images">;
+    const generate = vi.fn();
+    const client = { images: { edit, generate } } as unknown as Pick<OpenAI, "images">;
     const generator = new OpenAiHeroImageGenerator(
       "test-key-never-sent",
       "gpt-image-2",
       "1536x1024",
       "high",
       client,
+      referencePaths,
     );
 
     const result = await generator.generate(promptInput());
 
     expect(Buffer.from(result.bytes).toString()).toBe("generated-image");
-    expect(generate).toHaveBeenCalledWith(expect.objectContaining({
+    expect(edit).toHaveBeenCalledWith(expect.objectContaining({
       model: "gpt-image-2",
+      image: expect.any(Array),
       n: 1,
       size: "1536x1024",
       quality: "high",
@@ -101,6 +121,66 @@ describe("OpenAiHeroImageGenerator", () => {
       output_compression: 90,
       background: "opaque",
     }));
+    const request = edit.mock.calls[0]?.[0] as { image: File[] } | undefined;
+    expect(request).not.toHaveProperty("input_fidelity");
+    expect(request?.image).toHaveLength(2);
+    expect(request?.image.map((image: File) => image.name)).toEqual([
+      "leo-primary.png",
+      "leo-map.png",
+    ]);
+    expect(request?.image.every((image: File) => image.type === "image/png")).toBe(true);
+    expect(generate).not.toHaveBeenCalled();
+  });
+
+  it("fingerprints the ordered reference bytes in the durable cache key", async () => {
+    const referenceDir = await temporaryDirectory();
+    const referencePaths = await writeReferenceImages(referenceDir);
+    const client = { images: { edit: vi.fn() } } as unknown as Pick<OpenAI, "images">;
+    const first = new OpenAiHeroImageGenerator(
+      "test-key-never-sent",
+      "gpt-image-2",
+      "1536x1024",
+      "high",
+      client,
+      referencePaths,
+    ).cacheKey(promptInput());
+    await writeFile(referencePaths[1]!, validPngBytes("changed-reference"));
+    const second = new OpenAiHeroImageGenerator(
+      "test-key-never-sent",
+      "gpt-image-2",
+      "1536x1024",
+      "high",
+      client,
+      referencePaths,
+    ).cacheKey(promptInput());
+
+    expect(second).not.toBe(first);
+  });
+
+  it("fails before a paid request when a Leo reference is missing or invalid", async () => {
+    const referenceDir = await temporaryDirectory();
+    const missing = path.join(referenceDir, "missing.png");
+    const invalid = path.join(referenceDir, "invalid.png");
+    await writeFile(invalid, Buffer.from("not-a-png"));
+    const client = { images: { edit: vi.fn() } } as unknown as Pick<OpenAI, "images">;
+
+    expect(() => new OpenAiHeroImageGenerator(
+      "test-key-never-sent",
+      "gpt-image-2",
+      "1536x1024",
+      "high",
+      client,
+      [missing],
+    )).toThrow("Leo reference image is missing");
+    expect(() => new OpenAiHeroImageGenerator(
+      "test-key-never-sent",
+      "gpt-image-2",
+      "1536x1024",
+      "high",
+      client,
+      [invalid],
+    )).toThrow("does not match its file format");
+    expect(client.images.edit).not.toHaveBeenCalled();
   });
 });
 
@@ -231,3 +311,18 @@ describe("HeroImageService", () => {
     expect(ghost.uploadImage).not.toHaveBeenCalled();
   });
 });
+
+async function writeReferenceImages(directory: string): Promise<string[]> {
+  const primary = path.join(directory, "leo-primary.png");
+  const map = path.join(directory, "leo-map.png");
+  await writeFile(primary, validPngBytes("primary-reference"));
+  await writeFile(map, validPngBytes("map-reference"));
+  return [primary, map];
+}
+
+function validPngBytes(label: string): Buffer {
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from(label, "utf8"),
+  ]);
+}
