@@ -1040,6 +1040,43 @@ describe("PublicationService concurrency hardening", () => {
 });
 
 describe("PublicationService.publishNow", () => {
+  it("identifies a failed slug preflight and redacts Ghost credentials", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "scheduled",
+      scheduled_publish_at: "2026-09-17T08:00:00.000Z",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const createPost = vi.fn();
+    const ghost = {
+      findPostBySlug: vi.fn(async () => {
+        throw new Error(`Ghost API 500: debug credential ${config.ghostAdminApiKey}`);
+      }),
+      createPost,
+    } as unknown as GhostAdminClient;
+
+    const result = await new PublicationService(
+      store,
+      ghost,
+      config,
+      logger,
+      new KeyedMutex(),
+    ).publishNow(current.article_id, actor);
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      article: { status: "failed_publish", ghost_post_id: "" },
+    });
+    if (result.outcome !== "failed") throw new Error("Expected failed publication");
+    expect(result.message).toContain("Ghost preflight slug lookup failed");
+    expect(result.message).toContain("Ghost API 500");
+    expect(result.message).toContain("[REDACTED]");
+    expect(result.message).not.toContain(config.ghostAdminApiKey);
+    expect(createPost).not.toHaveBeenCalled();
+  });
+
   it("publishes a future-scheduled approved version immediately and deduplicates the command", async () => {
     let current = {
       ...approvedArticle(),
@@ -1080,6 +1117,7 @@ describe("PublicationService.publishNow", () => {
     }
 
     expect(createPost).toHaveBeenCalledOnce();
+    expect(ghost.readPost).not.toHaveBeenCalled();
     expect(updatePost).toHaveBeenCalledOnce();
     expect(current.scheduled_publish_at).toBe(originalSchedule);
     const requests = events.filter((event) => event.event_type === "manual_publish_requested");
@@ -1145,6 +1183,86 @@ describe("PublicationService.publishNow", () => {
     });
   });
 
+  it("safely retries a bound post after Ghost read fails without creating a duplicate", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "failed_publish",
+      ghost_post_id: "ghost-post-bound-after-read-500",
+      ghost_updated_at: "2026-09-16T12:00:00.000Z",
+      last_error: "Ghost API 500: Cannot read post",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const findPostBySlug = vi.fn();
+    const createPost = vi.fn();
+    const readPost = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("Ghost API 500: Cannot read post"))
+      .mockResolvedValue({
+        ...draftPost(current),
+        id: "ghost-post-bound-after-read-500",
+      });
+    const updatePost = vi.fn(async (id: string) => ({
+      ...publishedPost(current),
+      id,
+    }));
+    const ghost = {
+      findPostBySlug,
+      createPost,
+      readPost,
+      updatePost,
+    } as unknown as GhostAdminClient;
+    const publicUrl = "https://example.com/rs/blog/kako-izabrati-igraonicu";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(`<link rel="canonical" href="${publicUrl}">`, { status: 200 }),
+      ),
+    );
+
+    try {
+      const publisher = new PublicationService(store, ghost, config, logger, new KeyedMutex());
+      const failed = await publisher.publishNow(current.article_id, {
+        ...actor,
+        providerObjectId: "message:-100:read-500",
+      });
+      expect(failed).toMatchObject({
+        outcome: "failed",
+        article: {
+          status: "failed_publish",
+          ghost_post_id: "ghost-post-bound-after-read-500",
+        },
+        message: expect.stringContaining("Ghost bound post lookup failed: Ghost API 500"),
+      });
+
+      const retried = await publisher.publishNow(current.article_id, {
+        ...actor,
+        providerObjectId: "message:-100:read-500-retry",
+      });
+      expect(retried).toMatchObject({
+        outcome: "published",
+        article: {
+          status: "published",
+          ghost_post_id: "ghost-post-bound-after-read-500",
+        },
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(findPostBySlug).not.toHaveBeenCalled();
+    expect(createPost).not.toHaveBeenCalled();
+    expect(updatePost).toHaveBeenCalledOnce();
+    expect(updatePost).toHaveBeenCalledWith(
+      "ghost-post-bound-after-read-500",
+      expect.objectContaining({ status: "published" }),
+    );
+    expect(events.filter((event) => event.event_type === "manual_publish_requested")).toHaveLength(2);
+    expect(events.filter((event) => event.event_type === "publish_failed")).toHaveLength(1);
+    expect(events.filter((event) => event.event_type === "published")).toHaveLength(1);
+  });
+
   it("idempotently updates the bound post after a lost successful response", async () => {
     let current = {
       ...approvedArticle(),
@@ -1182,7 +1300,7 @@ describe("PublicationService.publishNow", () => {
       vi.unstubAllGlobals();
     }
 
-    expect(ghost.readPost).toHaveBeenCalledTimes(2);
+    expect(ghost.readPost).toHaveBeenCalledOnce();
     expect(updatePost).toHaveBeenCalledOnce();
     expect(updatePost.mock.calls[0]?.[0]).toBe("ghost-post-manual");
     expect(updatePost.mock.calls[0]?.[1]).toMatchObject({ status: "published" });

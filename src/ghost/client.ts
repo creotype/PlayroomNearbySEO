@@ -44,6 +44,9 @@ type GhostEnvelope = {
   errors?: Array<{ message?: string; type?: string; context?: string }>;
 };
 
+const SAFE_GET_ATTEMPTS = 3;
+const SAFE_GET_RETRY_BASE_MS = 250;
+
 export class GhostAdminClient {
   readonly #baseUrl: string;
   readonly #keyId: string;
@@ -77,7 +80,7 @@ export class GhostAdminClient {
 
   async findPostBySlug(slug: string): Promise<GhostPost | undefined> {
     const response = await this.#request<GhostEnvelope>(
-      `posts/slug/${encodeURIComponent(slug)}/?formats=html,lexical`,
+      `posts/slug/${encodeURIComponent(slug)}/?fields=id,title,slug,status,url,updated_at,published_at`,
       undefined,
       [404],
     );
@@ -86,7 +89,7 @@ export class GhostAdminClient {
 
   async readPost(id: string): Promise<GhostPost | undefined> {
     const response = await this.#request<GhostEnvelope>(
-      `posts/${encodeURIComponent(id)}/?formats=html,lexical`,
+      `posts/${encodeURIComponent(id)}/?fields=id,title,slug,status,url,updated_at,published_at`,
       undefined,
       [404],
     );
@@ -147,7 +150,7 @@ export class GhostAdminClient {
   ): Promise<T> {
     const token = await this.#createToken();
     const isMultipart = typeof FormData !== "undefined" && init?.body instanceof FormData;
-    const response = await fetch(`${this.#baseUrl}/${path}`, {
+    const requestInit: RequestInit = {
       ...init,
       headers: {
         Accept: "application/json",
@@ -156,7 +159,23 @@ export class GhostAdminClient {
         ...(init?.body && !isMultipart ? { "Content-Type": "application/json" } : {}),
         ...init?.headers,
       },
-    });
+    };
+    const method = (requestInit.method ?? "GET").toUpperCase();
+    const maxAttempts = method === "GET" ? SAFE_GET_ATTEMPTS : 1;
+    let response: Response | undefined;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        response = await fetch(`${this.#baseUrl}/${path}`, requestInit);
+      } catch (error) {
+        if (attempt >= maxAttempts || !isTransientFetchError(error)) throw error;
+        await sleep(SAFE_GET_RETRY_BASE_MS * 2 ** (attempt - 1));
+        continue;
+      }
+      if (!isTransientStatus(response.status) || attempt >= maxAttempts) break;
+      if (response.body) await response.body.cancel().catch(() => undefined);
+      await sleep(retryDelayMs(response, attempt));
+    }
+    if (!response) throw new Error("Ghost API request produced no response");
     if (allowedStatuses.includes(response.status)) return {} as T;
     const raw = await response.text();
     let parsed: GhostEnvelope | undefined;
@@ -184,4 +203,30 @@ export class GhostAdminClient {
       .setAudience("/admin/")
       .sign(this.#secret);
   }
+}
+
+function isTransientStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function isTransientFetchError(error: unknown): boolean {
+  if (error instanceof TypeError) return true;
+  if (!(error instanceof Error)) return false;
+  return ["AbortError", "TimeoutError"].includes(error.name);
+}
+
+function retryDelayMs(response: Response, attempt: number): number {
+  const retryAfter = response.headers.get("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, 5_000);
+    const date = Date.parse(retryAfter);
+    if (Number.isFinite(date)) return Math.min(Math.max(date - Date.now(), 0), 5_000);
+  }
+  return SAFE_GET_RETRY_BASE_MS * 2 ** (attempt - 1);
+}
+
+async function sleep(milliseconds: number): Promise<void> {
+  if (milliseconds <= 0) return;
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

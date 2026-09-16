@@ -317,7 +317,7 @@ export class PublicationService {
       const published = await this.#upsertAndPublish(claimed, currentHash);
       await this.#finalizePublished(claimed, published, currentHash);
     } catch (error) {
-      const message = sanitizeError(error);
+      const message = sanitizeError(error, this.config.ghostAdminApiKey);
       this.logger.error({ articleId: article.article_id, err: message }, "Ghost publication failed");
       await this.#failPublishing(article, message);
     }
@@ -389,16 +389,22 @@ export class PublicationService {
     const storedId = stringCell(article.ghost_post_id);
     let post: GhostPost | undefined;
     if (storedId) {
-      post = await this.ghost.readPost(storedId);
+      post = await ghostStep("Ghost bound post lookup failed", () => this.ghost.readPost(storedId));
       if (!post) throw new Error(`Stored Ghost post ${storedId} no longer exists`);
       if (post.slug !== expectedSlug) throw new Error(`Ghost slug conflict for stored post ${storedId}`);
     } else {
-      const collision = await this.ghost.findPostBySlug(expectedSlug);
+      const collision = await ghostStep(
+        "Ghost preflight slug lookup failed",
+        () => this.ghost.findPostBySlug(expectedSlug),
+      );
       if (collision) throw new Error(`Ghost slug already exists without matching ghost_post_id: ${expectedSlug}`);
       const draftPayload = await buildGhostPayload(article, "draft");
-      const currentUser = await this.ghost.readCurrentUser();
+      const currentUser = await ghostStep(
+        "Ghost author lookup failed",
+        () => this.ghost.readCurrentUser(),
+      );
       if (currentUser) draftPayload.authors = [{ id: currentUser.id }];
-      post = await this.ghost.createPost(draftPayload);
+      post = await ghostStep("Ghost draft creation failed", () => this.ghost.createPost(draftPayload));
       await this.store.patchArticle(article.article_id, {
         ghost_post_id: post.id,
         ghost_updated_at: post.updated_at,
@@ -407,8 +413,6 @@ export class PublicationService {
       });
     }
 
-    const fresh = await this.ghost.readPost(post.id);
-    if (!fresh) throw new Error(`Ghost post disappeared before publish: ${post.id}`);
     const publishPayload = await buildGhostPayload(article, "published");
     const currentSheetArticle = await this.store.findArticle(article.article_id);
     if (
@@ -418,10 +422,15 @@ export class PublicationService {
     ) {
       throw new Error("Publication claim was changed before Ghost publish");
     }
-    return this.ghost.updatePost(post.id, {
-      ...publishPayload,
-      updated_at: fresh.updated_at,
-    });
+    return ghostStep("Ghost publish update failed", () =>
+      this.ghost.updatePost(post.id, {
+        ...publishPayload,
+        // Both createPost and readPost return Ghost's current revision marker.
+        // Re-reading here only asks Ghost to render the post content again and
+        // can fail on otherwise valid drafts; optimistic locking on updated_at
+        // still prevents us from overwriting a concurrent editor change.
+        updated_at: post.updated_at,
+      }));
   }
 
   async #recoverPublishing(articleId: string, timeZone: string): Promise<void> {
@@ -504,7 +513,7 @@ export class PublicationService {
       const published = await this.#upsertAndPublish(article, currentHash);
       await this.#finalizePublished(article, published, currentHash);
     } catch (error) {
-      await this.#failPublishing(article, sanitizeError(error));
+      await this.#failPublishing(article, sanitizeError(error, this.config.ghostAdminApiKey));
     }
   }
 
@@ -741,9 +750,26 @@ function parseScheduledDate(article: Article, timeZone: string): Date | undefine
   return date;
 }
 
-function sanitizeError(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return message.replace(/Ghost\s+[A-Za-z0-9._-]+/g, "Ghost [REDACTED]").slice(0, 500);
+function sanitizeError(error: unknown, ghostCredential?: string): string {
+  let message = error instanceof Error ? error.message : String(error);
+  if (ghostCredential) {
+    const sensitiveValues = [ghostCredential, ...ghostCredential.split(":")]
+      .filter((value) => value.length >= 6)
+      .sort((left, right) => right.length - left.length);
+    for (const sensitiveValue of sensitiveValues) {
+      message = message.replaceAll(sensitiveValue, "[REDACTED]");
+    }
+  }
+  return message.slice(0, 500);
+}
+
+async function ghostStep<T>(label: string, operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${label}: ${detail}`, { cause: error });
+  }
 }
 
 function assertHeroImageReady(article: Article): void {
