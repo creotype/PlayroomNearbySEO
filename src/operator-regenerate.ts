@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { articleContentHash, booleanCell, stringCell, type SheetRecord } from "./domain/article.js";
+import { articleContentHash, stringCell } from "./domain/article.js";
 import { loadConfig } from "./config.js";
 import { OpenAiArticleGenerator } from "./generation/openai-generator.js";
 import { KeyedMutex } from "./lib/keyed-mutex.js";
@@ -7,6 +7,7 @@ import { createLogger } from "./lib/logger.js";
 import { GoogleSheetsStore } from "./sheets/google-sheets.js";
 import { GenerationService } from "./services/generation-service.js";
 import { QualityGate } from "./services/quality-gate.js";
+import { hasRecoverableSystemExhaustionGate } from "./services/system-gate-recovery.js";
 
 const articleId = process.argv[2]?.trim();
 const recoverSystemGate = process.argv.slice(3).includes("--recover-system-gate");
@@ -28,7 +29,7 @@ if (!feedback) throw new Error(`Article ${articleId} has no stored editor feedba
 const baseContentHash = articleContentHash(article);
 if (recoverSystemGate) {
   const events = await store.listEvents(articleId);
-  if (!hasRecoverableSystemGate(article, events, baseContentHash)) {
+  if (!hasRecoverableSystemExhaustionGate(article, events, baseContentHash)) {
     throw new Error(`Article ${articleId} has no matching system-created exhausted QA gate`);
   }
 }
@@ -77,33 +78,4 @@ if (result.outcome === "blocked") {
     qaBlockers: stringCell(result.article.qa_blockers),
     revisionCount: result.article.revision_count,
   }));
-}
-
-function hasRecoverableSystemGate(
-  article: SheetRecord,
-  events: SheetRecord[],
-  contentHash: string,
-): boolean {
-  if (
-    !booleanCell(article.manual_required) ||
-    stringCell(article.status) !== "failed_qa" ||
-    stringCell(article.qa_status) !== "fail"
-  ) {
-    return false;
-  }
-  const terminalIndex = events.findLastIndex((event) => {
-    if (stringCell(event.event_type) !== "auto_qa_repair_exhausted") return false;
-    try {
-      const payload = JSON.parse(stringCell(event.payload_json)) as Record<string, unknown>;
-      return payload.output_hash === contentHash &&
-        payload.qa_blockers === stringCell(article.qa_blockers);
-    } catch {
-      return false;
-    }
-  });
-  if (terminalIndex < 0) return false;
-  return events.slice(terminalIndex + 1).every((event) =>
-    stringCell(event.actor_type) === "system" &&
-    stringCell(event.event_type) === "auto_qa_repair_notified"
-  );
 }
