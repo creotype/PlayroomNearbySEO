@@ -53,8 +53,33 @@ export class PublicationService {
     const scheduledAt = parseScheduledDate(article, timeZone);
     const currentHash = articleContentHash(article);
     const approvedHash = await this.#latestApprovedHash(article.article_id);
-    if (!approvedHash || approvedHash !== currentHash || stringCell(article.content_hash) !== currentHash) {
-      await this.#markConflict(article, currentHash, approvedHash);
+    if (!approvedHash) {
+      await this.#setConflict(
+        article,
+        "missing_trusted_approval",
+        "No trusted approval event authorizes publication",
+        {
+          current_hash: currentHash,
+          stored_hash: stringCell(article.content_hash) || null,
+        },
+      );
+      return;
+    }
+    if (approvedHash !== currentHash) {
+      await this.#returnEditedArticleToReview(article, currentHash, approvedHash);
+      return;
+    }
+    if (stringCell(article.content_hash) !== currentHash) {
+      await this.#setConflict(
+        article,
+        "approval_state_mismatch",
+        "Stored approval state does not match the trusted approval event",
+        {
+          current_hash: currentHash,
+          approved_hash: approvedHash,
+          stored_hash: stringCell(article.content_hash) || null,
+        },
+      );
       return;
     }
 
@@ -358,6 +383,18 @@ export class PublicationService {
       const eventType = stringCell(event.event_type);
       if (eventType !== "approved" && eventType !== "publication_rescheduled") continue;
       if (
+        eventType === "approved" &&
+        !(
+          stringCell(event.provider) === "telegram" ||
+          (
+            stringCell(event.provider) === "system" &&
+            stringCell(event.actor_id) === "auto-review-timeout"
+          )
+        )
+      ) {
+        continue;
+      }
+      if (
         eventType === "publication_rescheduled" &&
         !(
           stringCell(event.actor_id) === "publisher-rescheduler" &&
@@ -385,6 +422,48 @@ export class PublicationService {
       current_hash: currentHash,
       approved_hash: approvedHash ?? null,
     });
+  }
+
+  async #returnEditedArticleToReview(
+    article: Article,
+    currentHash: string,
+    approvedHash: string,
+  ): Promise<void> {
+    assertTransition(article.status, "needs_review");
+    const now = new Date().toISOString();
+    await this.store.patchArticleAndAppendEvent(
+      article.article_id,
+      {
+        status: "needs_review",
+        qa_status: "pending",
+        qa_blockers: "",
+        quality_score: "",
+        manual_required: false,
+        content_hash: "",
+        approved_by: "",
+        approved_at: "",
+        scheduled_publish_at: "",
+        last_error: "",
+        updated_at: now,
+      },
+      {
+        event_id: randomUUID(),
+        article_id: article.article_id,
+        event_type: "publication_reopened",
+        from_status: article.status,
+        to_status: "needs_review",
+        actor_type: "system",
+        actor_id: "publisher",
+        provider: "system",
+        message: "Publishable content changed after approval; returned to human review",
+        payload_json: JSON.stringify({
+          current_hash: currentHash,
+          approved_hash: approvedHash,
+          stored_hash: stringCell(article.content_hash) || null,
+        }),
+        created_at: now,
+      },
+    );
   }
 
   async #setConflict(

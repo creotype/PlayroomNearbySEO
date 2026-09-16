@@ -248,7 +248,7 @@ describe("EditorialAutomationService weekly queue", () => {
 
 describe("EditorialAutomationService 48-hour review window", () => {
   it("auto-approves after 48 hours and schedules the first following 10:00 local", async () => {
-    const article = review();
+    const article = review({ quality_score: "" });
     const test = setup({
       now: new Date("2026-09-09T08:06:00.000Z"),
       articles: [article],
@@ -260,6 +260,7 @@ describe("EditorialAutomationService 48-hour review window", () => {
 
     expect(article.status).toBe("approved");
     expect(article.approved_by).toBe("system:auto-review-timeout");
+    expect(article.quality_score).toBe(9);
     expect(article.scheduled_publish_at).toBe("2026-09-10T08:00:00.000Z");
     expect(article.content_hash).toBe(articleContentHash(article));
     expect(test.events.filter((event) => event.event_type === "approved")).toHaveLength(1);
@@ -316,6 +317,7 @@ describe("EditorialAutomationService 48-hour review window", () => {
 
     expect(article.status).toBe("needs_review");
     expect(article.qa_blockers).toBe("missing_source_url");
+    expect(article.quality_score).toBe(7);
     expect(test.events.filter((event) => event.event_type === "auto_approval_blocked")).toHaveLength(1);
     expect(test.events.filter((event) => event.event_type === "auto_approval_blocked_notified")).toHaveLength(1);
     expect(test.sendMessage).toHaveBeenCalledTimes(1);

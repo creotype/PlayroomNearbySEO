@@ -93,13 +93,14 @@ function setup(
 
 describe("ApprovalService", () => {
   it("records a hash-bound Telegram approval", async () => {
-    const test = setup({ passed: true, blockers: [], score: 9 });
+    const test = setup({ passed: true, blockers: [], score: 9.4 });
     const expectedHash = articleContentHash(test.current());
     const result = await test.service.approve("SEO-1", actor);
     expect(result.outcome).toBe("approved");
     expect(test.current().status).toBe("approved");
     expect(test.current().qa_status).toBe("pass");
     expect(test.current().qa_blockers).toBe("");
+    expect(test.current().quality_score).toBe(9.4);
     expect(test.current().content_hash).toBe(expectedHash);
     expect(test.events).toHaveLength(1);
     expect(JSON.parse(String(test.events[0]?.payload_json))).toMatchObject({ hash: expectedHash });
@@ -112,6 +113,7 @@ describe("ApprovalService", () => {
     expect(test.current().status).toBe("failed_qa");
     expect(test.current().qa_status).toBe("fail");
     expect(test.current().qa_blockers).toBe("missing_source_url");
+    expect(test.current().quality_score).toBe(7);
     expect(test.events).toHaveLength(1);
     expect(test.events[0]).toMatchObject({
       event_type: "approval_blocked",

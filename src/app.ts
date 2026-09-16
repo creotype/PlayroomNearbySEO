@@ -72,7 +72,7 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
   );
   const bot = createTelegramBot({ config, store, approvals, generation, logger });
   const publication = new PublicationService(store, ghost, config, logger, workflowMutex);
-  const notifier = new ReviewNotifier(store, bot, config, logger);
+  const notifier = new ReviewNotifier(store, bot, config, logger, undefined, workflowMutex);
   const autoQaRepair = new AutoQaRepairService(store, generation, bot, config, logger);
   const editorial = new EditorialAutomationService(
     store,

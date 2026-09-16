@@ -22,6 +22,11 @@ describe("article transitions", () => {
     expect(canTransition("conflict", "publishing")).toBe(false);
   });
 
+  it("returns approved or scheduled content edits to human review", () => {
+    expect(canTransition("approved", "needs_review")).toBe(true);
+    expect(canTransition("scheduled", "needs_review")).toBe(true);
+  });
+
   it("allows a stale pre-Ghost publishing lease to reset safely", () => {
     expect(canTransition("publishing", "approved")).toBe(true);
   });

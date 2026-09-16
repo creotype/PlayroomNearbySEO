@@ -145,6 +145,7 @@ export class EditorialAutomationService {
           {
             qa_status: "fail",
             qa_blockers: quality.blockers.join(","),
+            quality_score: quality.score,
             manual_required: true,
             updated_at: blockedAt,
           },
@@ -183,6 +184,7 @@ export class EditorialAutomationService {
           scheduled_publish_at: publishAt.toISOString(),
           qa_status: "pass",
           qa_blockers: "",
+          quality_score: quality.score,
           manual_required: false,
           content_hash: approvedHash,
           approved_by: "system:auto-review-timeout",

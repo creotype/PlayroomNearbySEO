@@ -91,6 +91,10 @@ function approvalEvent(article: Article): SheetRecord {
     event_id: "event-1",
     article_id: article.article_id,
     event_type: "approved",
+    actor_type: "telegram_user",
+    actor_id: "42",
+    provider: "telegram",
+    provider_object_id: "telegram:message:-100:10",
     payload_json: JSON.stringify({ hash: articleContentHash(article) }),
   };
 }
@@ -604,31 +608,96 @@ describe("PublicationService concurrency hardening", () => {
     expect(current.status).toBe("failed_publish");
   });
 
-  it("atomically records a publication conflict and its audit event", async () => {
+  it.each(["approved", "scheduled"] as const)(
+    "atomically returns manually edited %s content to a fresh review window",
+    async (status) => {
+      let current = {
+        ...approvedArticle(),
+        status,
+        ...(status === "scheduled"
+          ? { scheduled_publish_at: "2026-09-18T08:00:00.000Z" }
+          : {}),
+      } as Article;
+      current.content_hash = articleContentHash(current);
+      const events: SheetRecord[] = [approvalEvent(current)];
+      current = {
+        ...current,
+        body_markdown: `${current.body_markdown}\n\nRučno ispravljen tekst.`,
+      } as Article;
+      const atomicWrites: Array<{
+        patch: Record<string, unknown>;
+        event: Record<string, unknown>;
+      }> = [];
+      const patchArticle = vi.fn(async (_id: string, patch: Record<string, unknown>) => {
+        current = { ...current, ...patch } as Article;
+        return current;
+      });
+      const appendEvent = vi.fn(async (event: Record<string, unknown>) => {
+        events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+      });
+      const store = {
+        getSettings: async () => enabledSettings(),
+        listArticles: async () => [{ ...current }],
+        findArticle: async () => current,
+        listEvents: async () => events,
+        patchArticle,
+        patchArticleAndAppendEvent: async (
+          _id: string,
+          patch: Record<string, unknown>,
+          event: Record<string, unknown>,
+        ) => {
+          atomicWrites.push({ patch, event });
+          current = { ...current, ...patch } as Article;
+          events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
+          return current;
+        },
+        appendEvent,
+      } as unknown as GoogleSheetsStore;
+      const ghost = ghostSpy();
+
+      await new PublicationService(store, ghost.client, config, logger, new KeyedMutex()).runOnce();
+
+      expect(atomicWrites).toHaveLength(1);
+      expect(atomicWrites[0]?.patch).toMatchObject({
+        status: "needs_review",
+        qa_status: "pending",
+        qa_blockers: "",
+        quality_score: "",
+        manual_required: false,
+        content_hash: "",
+        approved_by: "",
+        approved_at: "",
+        scheduled_publish_at: "",
+      });
+      expect(atomicWrites[0]?.event).toMatchObject({
+        article_id: current.article_id,
+        event_type: "publication_reopened",
+        from_status: status,
+        to_status: "needs_review",
+        provider: "system",
+      });
+      expect(
+        patchArticle.mock.calls.some(([, patch]) => patch.status === "conflict"),
+      ).toBe(false);
+      expect(
+        appendEvent.mock.calls.some(([event]) => event.event_type === "publication_reopened"),
+      ).toBe(false);
+      expect(current.status).toBe("needs_review");
+      expect(ghost.calls).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps an approval-state mismatch as a conflict instead of treating it as a text edit", async () => {
     let current = approvedArticle();
-    const events: SheetRecord[] = [
-      {
-        ...approvalEvent(current),
-        payload_json: JSON.stringify({ hash: "stale-approved-hash" }),
-      },
-    ];
-    const atomicWrites: Array<{
-      patch: Record<string, unknown>;
-      event: Record<string, unknown>;
-    }> = [];
-    const patchArticle = vi.fn(async (_id: string, patch: Record<string, unknown>) => {
-      current = { ...current, ...patch } as Article;
-      return current;
-    });
-    const appendEvent = vi.fn(async (event: Record<string, unknown>) => {
-      events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
-    });
+    current.content_hash = "tampered-system-hash";
+    const events: SheetRecord[] = [approvalEvent(current)];
+    events[0]!.payload_json = JSON.stringify({ hash: articleContentHash(current) });
+    const atomicWrites: Array<{ patch: Record<string, unknown>; event: Record<string, unknown> }> = [];
     const store = {
       getSettings: async () => enabledSettings(),
       listArticles: async () => [{ ...current }],
       findArticle: async () => current,
       listEvents: async () => events,
-      patchArticle,
       patchArticleAndAppendEvent: async (
         _id: string,
         patch: Record<string, unknown>,
@@ -636,35 +705,23 @@ describe("PublicationService concurrency hardening", () => {
       ) => {
         atomicWrites.push({ patch, event });
         current = { ...current, ...patch } as Article;
-        events.push({ ...event, __rowNumber: events.length + 2 } as SheetRecord);
         return current;
       },
-      appendEvent,
     } as unknown as GoogleSheetsStore;
     const ghost = ghostSpy();
 
     await new PublicationService(store, ghost.client, config, logger, new KeyedMutex()).runOnce();
 
-    expect(atomicWrites).toHaveLength(1);
     expect(atomicWrites[0]?.patch).toMatchObject({
       status: "conflict",
-      qa_blockers: "changed_after_approval",
+      qa_blockers: "approval_state_mismatch",
       manual_required: true,
     });
     expect(atomicWrites[0]?.event).toMatchObject({
-      article_id: current.article_id,
       event_type: "publication_conflict",
       from_status: "approved",
       to_status: "conflict",
-      provider: "ghost",
     });
-    expect(
-      patchArticle.mock.calls.some(([, patch]) => patch.status === "conflict"),
-    ).toBe(false);
-    expect(
-      appendEvent.mock.calls.some(([event]) => event.event_type === "publication_conflict"),
-    ).toBe(false);
-    expect(current.status).toBe("conflict");
     expect(ghost.calls).not.toHaveBeenCalled();
   });
 

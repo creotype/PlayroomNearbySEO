@@ -32,11 +32,14 @@ export function articleCard(
   const row = article.__rowNumber;
   const sheetUrl = articleSheetUrl(spreadsheetId, row);
   const schedule = displayDateCell(article.scheduled_publish_at) || "после согласования";
+  const manuallyEdited = stringCell(article.qa_status) === "pending";
   return [
     `📝 <b>SEO draft · ${escapeHtml(article.article_id)}</b>`,
     `${escapeHtml(article.locale.toUpperCase())} · ${escapeHtml(stringCell(article.primary_keyword))}`,
     `<b>Title:</b> ${escapeHtml(article.title)}`,
-    "✅ Внутренняя проверка пройдена — статья готова к вашему ревью.",
+    manuallyEdited
+      ? "✏️ Статья изменена в Google Sheets после согласования. Это нормально: прежнее согласование снято, а /approve проверит и согласует текущую версию."
+      : "✅ Внутренняя проверка пройдена — статья готова к вашему ревью.",
     `<b>Publish:</b> ${escapeHtml(schedule)}`,
     "",
     `<a href="${sheetUrl}">Открыть строку в Google Sheets</a>`,

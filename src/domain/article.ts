@@ -50,7 +50,7 @@ const PUBLISHABLE_FIELDS = [
 
 export function articleContentHash(article: SheetRecord): string {
   const canonical = Object.fromEntries(
-    PUBLISHABLE_FIELDS.map((field) => [field, normalizeValue(article[field])]),
+    PUBLISHABLE_FIELDS.map((field) => [field, normalizePublishableValue(field, article[field])]),
   );
   return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
 }
@@ -133,6 +133,17 @@ export function displayDateCell(
 
 function normalizeValue(value: CellValue | undefined): CellValue {
   return typeof value === "string" ? value.replace(/\r\n/g, "\n").trim() : (value ?? "");
+}
+
+function normalizePublishableValue(
+  field: (typeof PUBLISHABLE_FIELDS)[number],
+  value: CellValue | undefined,
+): CellValue {
+  if (field === "scheduled_publish_at") {
+    const scheduledAt = dateCell(value);
+    if (scheduledAt) return scheduledAt.toISOString();
+  }
+  return normalizeValue(value);
 }
 
 function googleSerialToDate(serial: number, timeZone: string): Date | undefined {

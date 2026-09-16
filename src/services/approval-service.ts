@@ -101,6 +101,7 @@ export class ApprovalService {
           status: "failed_qa",
           qa_status: "fail",
           qa_blockers: quality.blockers.join(","),
+          quality_score: quality.score,
           updated_at: now,
         }, {
           event_id: randomUUID(),
@@ -149,6 +150,7 @@ export class ApprovalService {
           status: "approved",
           qa_status: "pass",
           qa_blockers: "",
+          quality_score: quality.score,
           manual_required: false,
           content_hash: currentHash,
           approved_by: `telegram:${actor.id}`,

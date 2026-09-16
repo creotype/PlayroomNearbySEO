@@ -1,6 +1,7 @@
 import type { Logger } from "pino";
 import type { AppConfig } from "../config.js";
 import { articleContentHash, booleanCell, stringCell, type SheetRecord } from "../domain/article.js";
+import { KeyedMutex } from "../lib/keyed-mutex.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { SeoBot } from "../telegram/bot.js";
 import { articleCard, articleSheetUrl, escapeHtml, keywordSheetUrl } from "../telegram/messages.js";
@@ -15,6 +16,7 @@ export class ReviewNotifier {
     private readonly config: AppConfig,
     private readonly logger: Logger,
     private readonly publicPageVerifier: (url: string) => Promise<PublicPageVerification> = verifyPublicPage,
+    private readonly mutex: KeyedMutex = new KeyedMutex(),
   ) {}
 
   async runOnce(): Promise<void> {
@@ -29,72 +31,96 @@ export class ReviewNotifier {
       ),
       publicationTime: stringCell(settings.get("publication_time")) || this.config.publicationTime || "10:00",
     };
-    const articles = (await this.store.listArticles(["needs_review"]))
-      .filter((article) => stringCell(article.qa_status) === "pass")
-      .filter((article) => !booleanCell(article.manual_required));
-    for (const article of articles) {
-      const currentHash = articleContentHash(article);
-      const existingMessageId = Number(article.telegram_message_id);
+    const articles = await this.store.listArticles(["needs_review"]);
+    for (const candidate of articles) {
+      let attemptedMessageId: number | undefined;
       try {
-        if (Number.isSafeInteger(existingMessageId) && existingMessageId > 0) {
-          const contentChanged = stringCell(article.content_hash) !== currentHash;
-          const needsMarkupMigration = !this.#clearedReviewMarkup.has(existingMessageId);
-          if (!contentChanged && !needsMarkupMigration) continue;
-          try {
-            await this.bot.api.editMessageText(
-              chatId,
-              existingMessageId,
-              articleCard(article, this.config.spreadsheetId, reviewPolicy),
-              {
-                parse_mode: "HTML",
-                reply_markup: { inline_keyboard: [] },
-                link_preview_options: { is_disabled: true },
-              },
-            );
-          } catch (error) {
-            const detail = error instanceof Error ? error.message : String(error);
-            if (!/message is not modified/iu.test(detail)) throw error;
+        await this.mutex.runExclusive(candidate.article_id, async () => {
+          const article = await this.store.findArticle(candidate.article_id);
+          if (
+            !article ||
+            article.status !== "needs_review" ||
+            !["pass", "pending"].includes(stringCell(article.qa_status)) ||
+            booleanCell(article.manual_required)
+          ) {
+            return;
           }
-          this.#clearedReviewMarkup.add(existingMessageId);
-          if (contentChanged) {
-            await this.store.patchArticle(article.article_id, {
-              content_hash: currentHash,
-              updated_at: new Date().toISOString(),
-            });
+          const currentHash = articleContentHash(article);
+          const existingMessageId = Number(article.telegram_message_id);
+          if (Number.isSafeInteger(existingMessageId) && existingMessageId > 0) {
+            attemptedMessageId = existingMessageId;
+            const contentChanged = stringCell(article.content_hash) !== currentHash;
+            const needsMarkupMigration = !this.#clearedReviewMarkup.has(existingMessageId);
+            if (!contentChanged && !needsMarkupMigration) return;
+            try {
+              await this.bot.api.editMessageText(
+                chatId,
+                existingMessageId,
+                articleCard(article, this.config.spreadsheetId, reviewPolicy),
+                {
+                  parse_mode: "HTML",
+                  reply_markup: { inline_keyboard: [] },
+                  link_preview_options: { is_disabled: true },
+                },
+              );
+            } catch (error) {
+              const detail = error instanceof Error ? error.message : String(error);
+              if (!/message is not modified/iu.test(detail)) throw error;
+            }
+            this.#clearedReviewMarkup.add(existingMessageId);
+            if (contentChanged) {
+              await this.store.patchArticle(article.article_id, {
+                content_hash: currentHash,
+                updated_at: new Date().toISOString(),
+              });
+            }
+            return;
           }
-          continue;
-        }
-        const message = await this.bot.api.sendMessage(
-          chatId,
-          articleCard(article, this.config.spreadsheetId, reviewPolicy),
-          { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
-        );
-        this.#clearedReviewMarkup.add(message.message_id);
-        await this.store.patchArticle(article.article_id, {
-          telegram_message_id: message.message_id,
-          content_hash: currentHash,
-          updated_at: new Date().toISOString(),
+          const message = await this.bot.api.sendMessage(
+            chatId,
+            articleCard(article, this.config.spreadsheetId, reviewPolicy),
+            { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+          );
+          this.#clearedReviewMarkup.add(message.message_id);
+          await this.store.patchArticle(article.article_id, {
+            telegram_message_id: message.message_id,
+            content_hash: currentHash,
+            updated_at: new Date().toISOString(),
+          });
         });
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
-        if (
-          Number.isSafeInteger(existingMessageId) &&
-          existingMessageId > 0 &&
-          /message to edit not found/iu.test(detail)
-        ) {
-          await this.store.patchArticle(article.article_id, {
-            telegram_message_id: "",
-            content_hash: "",
-            updated_at: new Date().toISOString(),
+        if (/message to edit not found/iu.test(detail)) {
+          let clearedMessageId: number | undefined;
+          await this.mutex.runExclusive(candidate.article_id, async () => {
+            const fresh = await this.store.findArticle(candidate.article_id);
+            const existingMessageId = Number(fresh?.telegram_message_id);
+            if (
+              !fresh ||
+              fresh.status !== "needs_review" ||
+              !Number.isSafeInteger(existingMessageId) ||
+              existingMessageId <= 0 ||
+              existingMessageId !== attemptedMessageId
+            ) {
+              return;
+            }
+            await this.store.patchArticle(candidate.article_id, {
+              telegram_message_id: "",
+              content_hash: "",
+              updated_at: new Date().toISOString(),
+            });
+            clearedMessageId = existingMessageId;
           });
-          this.logger.warn(
-            { articleId: article.article_id, telegramMessageId: existingMessageId },
-            "Missing review card mapping cleared; notifier will send a replacement",
-          );
+          if (clearedMessageId) {
+            this.logger.warn(
+              { articleId: candidate.article_id, telegramMessageId: clearedMessageId },
+              "Missing review card mapping cleared; notifier will send a replacement",
+            );
+          }
           continue;
         }
         this.logger.error(
-          { articleId: article.article_id, err: detail },
+          { articleId: candidate.article_id, err: detail },
           "Review notification failed",
         );
       }

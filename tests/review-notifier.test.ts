@@ -2,6 +2,7 @@ import type { Logger } from "pino";
 import { describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config.js";
 import { articleContentHash, type SheetRecord } from "../src/domain/article.js";
+import { KeyedMutex } from "../src/lib/keyed-mutex.js";
 import type { GoogleSheetsStore } from "../src/sheets/google-sheets.js";
 import { ReviewNotifier } from "../src/services/review-notifier.js";
 import type { SeoBot } from "../src/telegram/bot.js";
@@ -484,6 +485,7 @@ describe("ReviewNotifier review cards", () => {
       getSettings: async () => new Map([["telegram_chat_id", -5484259760]]),
       listArticles: async (statuses?: readonly string[]) =>
         statuses?.includes("needs_review") ? [article] : [],
+      findArticle: async () => article,
       listKeywords: async () => [],
     } as unknown as GoogleSheetsStore;
     const notifier = new ReviewNotifier(
@@ -496,6 +498,178 @@ describe("ReviewNotifier review cards", () => {
     await notifier.runOnce();
 
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("updates the existing card with friendly copy for an article edited after approval", async () => {
+    const article = {
+      __rowNumber: 14,
+      article_id: "SEO-TG-EDITED",
+      primary_keyword: "aktivnosti za decu Beograd",
+      locale: "sr",
+      status: "needs_review",
+      title: "Aktivnosti za decu u Beogradu",
+      slug: "aktivnosti-za-decu-u-beogradu",
+      body_markdown: "Ručno ispravljen tekst.",
+      qa_status: "pending",
+      qa_blockers: "",
+      manual_required: false,
+      telegram_message_id: 55,
+      content_hash: "approved-version-hash",
+    } as SheetRecord;
+    const sendMessage = vi.fn(async (..._args: unknown[]) => ({ message_id: 456 }));
+    const editMessageText = vi.fn(async (..._args: unknown[]) => true);
+    const patchArticle = vi.fn(async () => article);
+    const store = {
+      getSettings: async () => new Map([[
+        "telegram_chat_id",
+        -5484259760,
+      ]]),
+      listArticles: async (statuses?: readonly string[]) =>
+        statuses?.includes("needs_review") ? [article] : [],
+      findArticle: async () => article,
+      listKeywords: async () => [],
+      patchArticle,
+    } as unknown as GoogleSheetsStore;
+    const notifier = new ReviewNotifier(
+      store,
+      { api: { editMessageText, sendMessage } } as unknown as SeoBot,
+      config,
+      { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+    );
+
+    await notifier.runOnce();
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(editMessageText).toHaveBeenCalledTimes(1);
+    const text = String(editMessageText.mock.calls[0]?.[2] ?? "");
+    expect(text).toContain("Статья изменена в Google Sheets после согласования");
+    expect(text).toContain("прежнее согласование снято");
+    expect(text).toContain("/approve проверит и согласует текущую версию");
+    expect(text).not.toContain("Внутренняя проверка пройдена");
+    expect(patchArticle).toHaveBeenCalledWith(
+      article.article_id,
+      expect.objectContaining({
+        content_hash: articleContentHash(article),
+      }),
+    );
+  });
+
+  it("does not overwrite an approval hash when /approve queues during a card edit", async () => {
+    let current = {
+      __rowNumber: 14,
+      article_id: "SEO-TG-EDIT-RACE",
+      primary_keyword: "aktivnosti za decu Beograd",
+      locale: "sr",
+      status: "needs_review",
+      title: "Aktivnosti za decu u Beogradu",
+      slug: "aktivnosti-za-decu-u-beogradu",
+      body_markdown: "Ručno ispravljen tekst.",
+      qa_status: "pending",
+      qa_blockers: "",
+      manual_required: false,
+      telegram_message_id: 56,
+      content_hash: "approved-version-hash",
+    } as SheetRecord;
+    const mutex = new KeyedMutex();
+    let queuedApproval: Promise<void> | undefined;
+    const editMessageText = vi.fn(async (..._args: unknown[]) => {
+      queuedApproval = mutex.runExclusive(String(current.article_id), async () => {
+        current = {
+          ...current,
+          status: "approved",
+          content_hash: "new-approved-hash",
+          approved_by: "telegram:42",
+        } as SheetRecord;
+      });
+      return true;
+    });
+    const patchArticle = vi.fn(async (_id: string, patch: Record<string, unknown>) => {
+      current = { ...current, ...patch } as SheetRecord;
+      return current;
+    });
+    const store = {
+      getSettings: async () => new Map([["telegram_chat_id", -5484259760]]),
+      listArticles: async (statuses?: readonly string[]) =>
+        statuses?.includes("needs_review") ? [{ ...current }] : [],
+      findArticle: async () => current,
+      listKeywords: async () => [],
+      patchArticle,
+    } as unknown as GoogleSheetsStore;
+    const notifier = new ReviewNotifier(
+      store,
+      { api: { editMessageText } } as unknown as SeoBot,
+      config,
+      { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+      undefined,
+      mutex,
+    );
+
+    await notifier.runOnce();
+    await queuedApproval;
+
+    expect(editMessageText).toHaveBeenCalledTimes(1);
+    expect(patchArticle).toHaveBeenCalledTimes(1);
+    expect(current.status).toBe("approved");
+    expect(current.content_hash).toBe("new-approved-hash");
+  });
+
+  it("does not clear an approved hash when a missing-card recovery races with /approve", async () => {
+    let current = {
+      __rowNumber: 14,
+      article_id: "SEO-TG-MISSING-CARD-RACE",
+      primary_keyword: "aktivnosti za decu Beograd",
+      locale: "sr",
+      status: "needs_review",
+      title: "Aktivnosti za decu u Beogradu",
+      slug: "aktivnosti-za-decu-u-beogradu",
+      body_markdown: "Ručno ispravljen tekst.",
+      qa_status: "pending",
+      qa_blockers: "",
+      manual_required: false,
+      telegram_message_id: 57,
+      content_hash: "approved-version-hash",
+    } as SheetRecord;
+    const mutex = new KeyedMutex();
+    let queuedApproval: Promise<void> | undefined;
+    const editMessageText = vi.fn(async (..._args: unknown[]) => {
+      queuedApproval = mutex.runExclusive(String(current.article_id), async () => {
+        current = {
+          ...current,
+          status: "approved",
+          content_hash: "new-approved-hash",
+          approved_by: "telegram:42",
+        } as SheetRecord;
+      });
+      throw new Error("Call to 'editMessageText' failed! (400: Bad Request: message to edit not found)");
+    });
+    const patchArticle = vi.fn(async (_id: string, patch: Record<string, unknown>) => {
+      current = { ...current, ...patch } as SheetRecord;
+      return current;
+    });
+    const store = {
+      getSettings: async () => new Map([["telegram_chat_id", -5484259760]]),
+      listArticles: async (statuses?: readonly string[]) =>
+        statuses?.includes("needs_review") ? [{ ...current }] : [],
+      findArticle: async () => current,
+      listKeywords: async () => [],
+      patchArticle,
+    } as unknown as GoogleSheetsStore;
+    const notifier = new ReviewNotifier(
+      store,
+      { api: { editMessageText } } as unknown as SeoBot,
+      config,
+      { error: vi.fn(), warn: vi.fn() } as unknown as Logger,
+      undefined,
+      mutex,
+    );
+
+    await notifier.runOnce();
+    await queuedApproval;
+
+    expect(editMessageText).toHaveBeenCalledTimes(1);
+    expect(patchArticle).not.toHaveBeenCalled();
+    expect(current.status).toBe("approved");
+    expect(current.content_hash).toBe("new-approved-hash");
   });
 
   it("sends a button-free card that teaches the two current-article commands", async () => {
@@ -521,6 +695,7 @@ describe("ReviewNotifier review cards", () => {
       getSettings: async () => new Map([["telegram_chat_id", -5484259760]]),
       listArticles: async (statuses?: readonly string[]) =>
         statuses?.includes("needs_review") ? [article] : [],
+      findArticle: async () => article,
       listKeywords: async () => [],
       patchArticle,
     } as unknown as GoogleSheetsStore;
@@ -574,6 +749,7 @@ describe("ReviewNotifier review cards", () => {
       getSettings: async () => new Map([["telegram_chat_id", -5484259760]]),
       listArticles: async (statuses?: readonly string[]) =>
         statuses?.includes("needs_review") ? [article] : [],
+      findArticle: async () => article,
       listKeywords: async () => [],
       patchArticle: vi.fn(async () => article),
     } as unknown as GoogleSheetsStore;
@@ -626,6 +802,7 @@ describe("ReviewNotifier review cards", () => {
       getSettings: async () => new Map([["telegram_chat_id", -5484259760]]),
       listArticles: async (statuses?: readonly string[]) =>
         statuses?.includes("needs_review") ? [article] : [],
+      findArticle: async () => article,
       listKeywords: async () => [],
       patchArticle,
     } as unknown as GoogleSheetsStore;
