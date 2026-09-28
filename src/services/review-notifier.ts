@@ -391,6 +391,18 @@ function generationFailureMessage(
 function generationFailureReason(failure: SheetRecord): string {
   const retry = "После исправления очистите article_id, верните status=ready и повторите /generate.";
   if (stringCell(failure.event_type) !== "generation_blocked") {
+    try {
+      const payload = JSON.parse(stringCell(failure.payload_json)) as Record<string, unknown>;
+      if (payload.stage === "hero_image") {
+        return [
+          "Ghost временно не принял картинку, поэтому бот остановил подготовку статьи и ничего не опубликовал.",
+          "Не меняйте article_id и status вручную.",
+          "Повторную попытку можно сделать позже после восстановления Ghost — передайте это сообщение техническому администратору, чтобы он безопасно перезапустил заявку.",
+        ].join(" ");
+      }
+    } catch {
+      // Legacy generation_failed events have no structured stage.
+    }
     return `Генератор вернул техническую ошибку. ${retry}`;
   }
   try {

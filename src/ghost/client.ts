@@ -46,6 +46,20 @@ type GhostEnvelope = {
 
 const SAFE_GET_ATTEMPTS = 3;
 const SAFE_GET_RETRY_BASE_MS = 250;
+const SAFE_IMAGE_UPLOAD_ATTEMPTS = 3;
+const SAFE_IMAGE_UPLOAD_RETRY_BASE_MS = 250;
+
+class GhostApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly reason: string,
+    readonly retryAfterMs?: number,
+    readonly errors?: GhostEnvelope["errors"],
+  ) {
+    super(`Ghost API ${status}: ${reason}`);
+    this.name = "GhostApiError";
+  }
+}
 
 export class GhostAdminClient {
   readonly #baseUrl: string;
@@ -116,18 +130,26 @@ export class GhostAdminClient {
     if (input.bytes.byteLength > 20 * 1024 * 1024) {
       throw new Error("Ghost image upload exceeds the 20 MB application limit");
     }
-    const body = new FormData();
-    body.append("file", new Blob([input.bytes], { type: input.contentType }), input.filename);
-    body.append("purpose", "image");
-    if (input.ref) body.append("ref", input.ref);
-    const response = await this.#request<GhostEnvelope>("images/upload/", {
-      method: "POST",
-      body,
-      signal: AbortSignal.timeout(60_000),
-    });
-    const image = response.images?.[0];
-    if (!image?.url) throw new Error("Ghost image upload response contained no URL");
-    return image;
+    for (let attempt = 1; attempt <= SAFE_IMAGE_UPLOAD_ATTEMPTS; attempt += 1) {
+      try {
+        const response = await this.#request<GhostEnvelope>("images/upload/", {
+          method: "POST",
+          body: createImageUploadBody(input),
+          signal: AbortSignal.timeout(60_000),
+        });
+        const image = response.images?.[0];
+        if (!image?.url) throw new Error("Ghost image upload response contained no URL");
+        return image;
+      } catch (error) {
+        if (attempt >= SAFE_IMAGE_UPLOAD_ATTEMPTS || !isProvablyPreUploadFailure(error)) {
+          throw error;
+        }
+        const delay = error.retryAfterMs
+          ?? SAFE_IMAGE_UPLOAD_RETRY_BASE_MS * 2 ** (attempt - 1);
+        await sleep(delay);
+      }
+    }
+    throw new Error("Ghost image upload exhausted all attempts");
   }
 
   async updatePost(
@@ -189,7 +211,12 @@ export class GhostAdminClient {
         ?.map((error) => [error.message, error.context].filter(Boolean).join(" — "))
         .filter(Boolean)
         .join("; ");
-      throw new Error(`Ghost API ${response.status}: ${reason || "request failed"}`);
+      throw new GhostApiError(
+        response.status,
+        reason || "request failed",
+        parseRetryAfterMs(response.headers.get("retry-after")),
+        parsed?.errors,
+      );
     }
     return (parsed ?? JSON.parse(raw)) as T;
   }
@@ -215,14 +242,44 @@ function isTransientFetchError(error: unknown): boolean {
   return ["AbortError", "TimeoutError"].includes(error.name);
 }
 
+function createImageUploadBody(input: {
+  bytes: Uint8Array;
+  filename: string;
+  contentType: string;
+  ref?: string;
+}): FormData {
+  const body = new FormData();
+  body.append("file", new Blob([input.bytes], { type: input.contentType }), input.filename);
+  body.append("purpose", "image");
+  if (input.ref) body.append("ref", input.ref);
+  return body;
+}
+
+function isProvablyPreUploadFailure(error: unknown): error is GhostApiError {
+  // A thrown network error is ambiguous: Ghost may have persisted the image and
+  // only lost the response. Retry only a structured response proving that the
+  // Admin API-key lookup failed before the upload handler could run.
+  if (!(error instanceof GhostApiError) || !isTransientStatus(error.status)) return false;
+  return error.errors?.some((ghostError) => {
+    const details = [ghostError.message, ghostError.type, ghostError.context]
+      .filter(Boolean)
+      .join(" ");
+    return /\bapi_keys\b/iu.test(details) && /\bread\s+ECONNRESET\b/iu.test(details);
+  }) ?? false;
+}
+
+function parseRetryAfterMs(retryAfter: string | null): number | undefined {
+  if (!retryAfter) return undefined;
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, 5_000);
+  const date = Date.parse(retryAfter);
+  if (Number.isFinite(date)) return Math.min(Math.max(date - Date.now(), 0), 5_000);
+  return undefined;
+}
+
 function retryDelayMs(response: Response, attempt: number): number {
-  const retryAfter = response.headers.get("retry-after");
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, 5_000);
-    const date = Date.parse(retryAfter);
-    if (Number.isFinite(date)) return Math.min(Math.max(date - Date.now(), 0), 5_000);
-  }
+  const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+  if (retryAfterMs !== undefined) return retryAfterMs;
   return SAFE_GET_RETRY_BASE_MS * 2 ** (attempt - 1);
 }
 

@@ -909,6 +909,11 @@ describe("manual generation worker", () => {
     expect(test.generate).toHaveBeenCalledTimes(1);
     expect(keyword.status).toBe("paused");
     expect(test.articleRows).toHaveLength(0);
+    const failure = test.events.find((event) => event.event_type === "generation_failed");
+    expect(JSON.parse(String(failure?.payload_json))).toMatchObject({
+      keyword_id: "KW-READY-1",
+      stage: "article_generation",
+    });
   });
 
   it("does not replay a paid initial attempt after a restart with no committed article", async () => {
@@ -964,8 +969,13 @@ describe("manual generation worker", () => {
 
     expect(keyword.status).toBe("paused");
     expect(test.articleRows).toHaveLength(0);
-    expect(test.events.at(-1)).toMatchObject({ event_type: "generation_failed" });
-    expect(String(test.events.at(-1)?.message)).toContain("Hero image generation/upload failed");
+    const failure = test.events.at(-1);
+    expect(failure).toMatchObject({ event_type: "generation_failed" });
+    expect(String(failure?.message)).toContain("Hero image generation/upload failed");
+    expect(JSON.parse(String(failure?.payload_json))).toMatchObject({
+      keyword_id: "KW-READY-1",
+      stage: "hero_image",
+    });
   });
 
   it("does not treat a legacy source prefix as authorization without a durable request event", async () => {

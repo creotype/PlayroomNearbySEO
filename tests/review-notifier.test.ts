@@ -194,6 +194,64 @@ describe("ReviewNotifier generation failures", () => {
     expect(appendEvent).toHaveBeenCalledTimes(1);
     expect(events.some((event) => event.event_type === "generation_failure_notified")).toBe(true);
   });
+
+  it("explains a hero-image outage without asking editors to repair system fields", async () => {
+    const events: SheetRecord[] = [
+      {
+        __rowNumber: 2,
+        event_id: "evt-requested-image",
+        article_id: "SEO-TG-IMAGE-1",
+        event_type: "generation_requested",
+        actor_type: "telegram_user",
+        actor_id: "42",
+        provider: "telegram",
+        provider_object_id: "message:-1:2",
+      },
+      {
+        __rowNumber: 3,
+        event_id: "evt-failed-image",
+        article_id: "SEO-TG-IMAGE-1",
+        event_type: "generation_failed",
+        message: "Hero image generation/upload failed; article was not published: Ghost API 500: read ECONNRESET",
+        payload_json: JSON.stringify({ keyword_id: "KW-TG-IMAGE-1", stage: "hero_image" }),
+      },
+    ];
+    const keyword = {
+      __rowNumber: 8,
+      keyword_id: "KW-TG-IMAGE-1",
+      article_id: "SEO-TG-IMAGE-1",
+      primary_keyword: "gde sa decom Beograd",
+      status: "paused",
+    } as SheetRecord;
+    const appendEvent = vi.fn(async (event: Record<string, unknown>) => {
+      events.push({ __rowNumber: events.length + 2, ...event } as SheetRecord);
+    });
+    const sendMessage = vi.fn(async (..._args: unknown[]) => ({ message_id: 124 }));
+    const store = {
+      getSettings: async () => new Map([["telegram_chat_id", -5484259760]]),
+      listArticles: async () => [],
+      listKeywords: async () => [keyword],
+      listEvents: async () => events,
+      appendEvent,
+    } as unknown as GoogleSheetsStore;
+    const bot = { api: { sendMessage } } as unknown as SeoBot;
+    const logger = { error: vi.fn() } as unknown as Logger;
+    const notifier = new ReviewNotifier(store, bot, config, logger);
+
+    await notifier.runOnce();
+    await notifier.runOnce();
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const notification = String(sendMessage.mock.calls[0]?.[1]);
+    expect(notification).toContain("Ghost временно не принял картинку");
+    expect(notification).toContain("ничего не опубликовал");
+    expect(notification).toContain("Не меняйте article_id и status вручную");
+    expect(notification).toContain("техническому администратору");
+    expect(notification).not.toContain("очистите article_id");
+    expect(notification).not.toContain("status=ready");
+    expect(notification).not.toContain("ECONNRESET");
+    expect(appendEvent).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("ReviewNotifier publication outcomes", () => {

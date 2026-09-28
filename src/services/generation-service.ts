@@ -24,6 +24,12 @@ import { QualityGate } from "./quality-gate.js";
 
 const CLAIMED_STATUS = "assigned";
 
+type GenerationFailureStage =
+  | "article_generation"
+  | "hero_image"
+  | "quality_gate"
+  | "article_persist";
+
 export type ManualGenerationBlockReason =
   | "generator_not_configured"
   | "manual_generation_disabled"
@@ -646,6 +652,7 @@ export class GenerationService {
       await this.#failKeyword(
         keyword,
         new Error("A previous paid generation attempt ended without a committed article; automatic replay is disabled"),
+        "article_generation",
       );
       return;
     }
@@ -679,7 +686,7 @@ export class GenerationService {
         targetWords,
       });
     } catch (error) {
-      await this.#failKeyword(keyword, error);
+      await this.#failKeyword(keyword, error, "article_generation");
       return;
     }
 
@@ -712,7 +719,7 @@ export class GenerationService {
         await this.#prepareHeroImage({ ...values, __rowNumber: 0 } as Article),
       );
     } catch (error) {
-      await this.#failKeyword(keyword, error);
+      await this.#failKeyword(keyword, error, "hero_image");
       return;
     }
     try {
@@ -724,7 +731,7 @@ export class GenerationService {
       values.qa_blockers = quality.blockers.join(",");
       values.manual_required = quality.manualRequired;
     } catch (error) {
-      await this.#failKeyword(keyword, error);
+      await this.#failKeyword(keyword, error, "quality_gate");
       return;
     }
     const finalStatus = stringCell(values.qa_status) === "pass" && !booleanCell(values.manual_required)
@@ -738,7 +745,7 @@ export class GenerationService {
     } catch (error) {
       const recovered = await this.store.findArticle(articleId);
       if (!recovered) {
-        await this.#failKeyword(keyword, error);
+        await this.#failKeyword(keyword, error, "article_persist");
         return;
       }
       this.logger.warn({ keywordId, articleId }, "Article append response failed but the article exists");
@@ -782,7 +789,11 @@ export class GenerationService {
     );
   }
 
-  async #failKeyword(keyword: SheetRecord, error: unknown): Promise<void> {
+  async #failKeyword(
+    keyword: SheetRecord,
+    error: unknown,
+    stage: GenerationFailureStage,
+  ): Promise<void> {
     const keywordId = stringCell(keyword.keyword_id);
     const articleId = stringCell(keyword.article_id);
     const message = (error instanceof Error ? error.message : String(error)).slice(0, 500);
@@ -807,7 +818,7 @@ export class GenerationService {
         actor_id: "generator",
         provider: "openai",
         message,
-        payload_json: JSON.stringify({ keyword_id: keywordId }),
+        payload_json: JSON.stringify({ keyword_id: keywordId, stage }),
         created_at: now,
       },
     );
