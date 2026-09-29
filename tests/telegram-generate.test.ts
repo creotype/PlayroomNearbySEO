@@ -217,7 +217,7 @@ describe("/generate Telegram handler", () => {
     expect(test.apiCalls.some((call) => call.method === "sendMessage")).toBe(true);
   });
 
-  it("shows every invalid field and a deep link to the exact keyword row", async () => {
+  it("keeps a row with an invalid article_id untouched and sends it to safe recovery", async () => {
     const test = botHarness({
       outcome: "blocked",
       reason: "invalid_keyword_row",
@@ -236,9 +236,33 @@ describe("/generate Telegram handler", () => {
     expect(payload?.text).toContain("primary_keyword");
     expect(payload?.text).toContain("article_id");
     expect(payload?.text).toContain("SEO-LEFTOVER");
+    expect(payload?.text).toContain("сохранил строку как есть");
+    expect(payload?.text).toContain("не менял системные поля Google Sheets");
+    expect(payload?.text).toContain("безопасное восстановление техническим администратором");
+    expect(payload?.text).not.toContain("оставьте <code>status=ready</code>");
+    expect(payload?.text).not.toContain("восстановите правильный status");
+    expect(payload?.text).not.toContain("article_id</code> должен быть пустым");
     expect(payload?.text).toContain(
       'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000002&range=A7:T7"',
     );
+  });
+
+  it("keeps edit guidance for ordinary missing keyword fields", async () => {
+    const test = botHarness({
+      outcome: "blocked",
+      reason: "invalid_keyword_row",
+      rowNumber: 8,
+      invalidFields: ["keyword_id", "locale", "primary_keyword"],
+    });
+
+    await test.bot.handleUpdate(generateUpdate(-5484259760));
+
+    const text = String(sentMessagePayload(test)?.text ?? "");
+    expect(text).toContain("Заполните уникальный ID");
+    expect(text).toContain("Укажите включённую локаль");
+    expect(text).toContain("Исправьте строку");
+    expect(text).toContain("снова отправьте <code>/generate</code>");
+    expect(text).not.toContain("безопасное восстановление техническим администратором");
   });
 
   it("shows every conflicting row when keyword_id is duplicated", async () => {
@@ -263,7 +287,7 @@ describe("/generate Telegram handler", () => {
     );
   });
 
-  it("explains a concurrent Sheet edit without claiming or overwriting it", async () => {
+  it("does not prescribe manual system-field edits after a concurrent Sheet change", async () => {
     const test = botHarness({
       outcome: "blocked",
       reason: "keyword_row_changed",
@@ -275,8 +299,11 @@ describe("/generate Telegram handler", () => {
 
     const payload = sentMessagePayload(test);
     expect(payload?.parse_mode).toBe("HTML");
-    expect(payload?.text).toContain("ничего не перезаписал");
-    expect(payload?.text).toContain("status=ready");
+    expect(payload?.text).toContain("сохранил текущее состояние строки");
+    expect(payload?.text).toContain("не менял системные поля Google Sheets");
+    expect(payload?.text).toContain("безопасное восстановление техническим администратором");
+    expect(payload?.text).not.toContain("status=ready");
+    expect(payload?.text).not.toContain("article_id</code> пустой");
     expect(payload?.text).toContain(
       'href="https://docs.google.com/spreadsheets/d/sheet/edit#gid=910000002&range=A12:T12"',
     );

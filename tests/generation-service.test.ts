@@ -1012,6 +1012,127 @@ describe("manual generation worker", () => {
     expect(test.articleRows[0]).toMatchObject({ keyword_id: "KW-RETRY-SAME", status: "needs_review" });
   });
 
+  it("recovers a signed no-credits request even when its row was reset to ready", async () => {
+    const first = readyKeyword({ __rowNumber: 8, keyword_id: "KW-READY-RESET" });
+    const next = readyKeyword({
+      __rowNumber: 9,
+      keyword_id: "KW-NEXT-AFTER-READY-RESET",
+      primary_keyword: "sledeci kljuc posle ready reseta",
+    });
+    const options: { keywords: SheetRecord[]; generatorError?: Error } = {
+      keywords: [first, next],
+      generatorError: APIError.generate(
+        429,
+        {
+          error: {
+            code: "insufficient_quota",
+            type: "insufficient_quota",
+            message: "You have no credits remaining. Add credits to continue using the API.",
+          },
+        },
+        undefined,
+        new Headers(),
+      ),
+    };
+    const test = setup(options);
+
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    expect(first.status).toBe("paused");
+    first.status = "ready";
+    delete options.generatorError;
+
+    await expect(test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:107",
+    })).resolves.toMatchObject({
+      outcome: "resumed",
+      keywordId: "KW-READY-RESET",
+      articleId: first.article_id,
+    });
+    const recoveryRequest = test.events
+      .filter((event) => event.event_type === "generation_requested")
+      .at(-1);
+    expect(recoveryRequest).toMatchObject({ from_status: "ready", to_status: "assigned" });
+    expect(String(recoveryRequest?.message)).toContain("Recovery generation requested");
+    expect(next).toMatchObject({ status: "ready", article_id: "" });
+  });
+
+  it("does not replay a duplicated signed failure event", async () => {
+    const failed = readyKeyword({ keyword_id: "KW-DUPLICATED-FAILURE" });
+    const next = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-NEXT-AFTER-DUPLICATED-FAILURE",
+      primary_keyword: "sledeci kljuc posle duplog dogadjaja",
+    });
+    const test = setup({
+      keywords: [failed, next],
+      generatorError: APIError.generate(
+        429,
+        { error: { code: "insufficient_quota", message: "You have no credits remaining." } },
+        undefined,
+        new Headers(),
+      ),
+    });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    const failure = test.events.find((event) => event.event_type === "generation_failed")!;
+    test.events.push({ ...failure, __rowNumber: failure.__rowNumber + 100 });
+
+    await expect(test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:110",
+    })).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "previous_generation_failed",
+      keywordId: "KW-DUPLICATED-FAILURE",
+    });
+    expect(test.generate).toHaveBeenCalledTimes(1);
+    expect(next).toMatchObject({ status: "ready", article_id: "" });
+  });
+
+  it("does not replay an old failure after the same article was generated", async () => {
+    const keyword = readyKeyword({ keyword_id: "KW-ALREADY-GENERATED" });
+    const options: { keywords: SheetRecord[]; generatorError?: Error } = {
+      keywords: [keyword],
+      generatorError: APIError.generate(
+        429,
+        { error: { code: "insufficient_quota", message: "You have no credits remaining." } },
+        undefined,
+        new Headers(),
+      ),
+    };
+    const test = setup(options);
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    const oldFailure = test.events.find((event) => event.event_type === "generation_failed")!;
+
+    delete options.generatorError;
+    expect((await test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:111",
+    })).outcome).toBe("resumed");
+    await test.service.runManualOnce();
+    expect(test.events.some((event) => event.event_type === "generated")).toBe(true);
+    expect(test.generate).toHaveBeenCalledTimes(2);
+
+    // Reproduce a mutable-Sheet replay attempt: the old failure is moved below
+    // the successful event and the keyword is reset to ready.
+    oldFailure.__rowNumber = Math.max(...test.events.map((event) => event.__rowNumber)) + 100;
+    keyword.status = "ready";
+    test.articleRows[0]!.status = "failed_generation";
+
+    await expect(test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:112",
+    })).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "previous_generation_failed",
+      keywordId: "KW-ALREADY-GENERATED",
+    });
+    expect(test.generate).toHaveBeenCalledTimes(2);
+  });
+
   it("recovers the exact legacy no-credits failure emitted before structured reasons existed", async () => {
     const keyword = readyKeyword({ keyword_id: "KW-CLIENT-006" });
     const options: { keywords: SheetRecord[]; generatorError?: Error } = {
@@ -1042,6 +1163,57 @@ describe("manual generation worker", () => {
       ...request,
       providerObjectId: "message:-5484259760:105",
     })).resolves.toMatchObject({ outcome: "resumed", keywordId: "KW-CLIENT-006" });
+  });
+
+  it("recovers the proven legacy no-credits request when its row was reset to ready", async () => {
+    const keyword = readyKeyword({ __rowNumber: 21, keyword_id: "KW-CLIENT-006" });
+    const next = readyKeyword({
+      __rowNumber: 22,
+      keyword_id: "KW-NEXT-AFTER-LEGACY-CREDIT-FAILURE",
+      primary_keyword: "sledeci kljuc posle dopune kredita",
+    });
+    const options: { keywords: SheetRecord[]; generatorError?: Error } = {
+      keywords: [keyword, next],
+      generatorError: APIError.generate(
+        429,
+        { error: { message: "You have no credits remaining." } },
+        undefined,
+        new Headers(),
+      ),
+    };
+    const test = setup(options);
+    const legacyRequest = { ...request, providerObjectId: "message:-5484259760:147" };
+    expect((await test.service.requestManualGeneration(legacyRequest)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    expect(keyword).toMatchObject({
+      status: "paused",
+      article_id: "SEO-TG-4C9E16E19436",
+    });
+
+    test.events.find((event) => event.event_type === "generation_requested")!.event_id =
+      "evt-generation_requested-6edea860bb804cd700482de9";
+    test.events.find((event) => event.event_type === "generation_attempt_started")!.event_id =
+      "evt-generation_attempt_started-797c1815321f60bfa6e57b2e";
+    const failure = test.events.find((event) => event.event_type === "generation_failed")!;
+    failure.event_id = "evt-generation_failed-731cd5df27d4390fcf50c865";
+    failure.message = "429 You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.";
+    failure.payload_json = JSON.stringify({ keyword_id: "KW-CLIENT-006", stage: "article_generation" });
+
+    // Reproduce the live Sheet state from the Telegram error: the failed row kept
+    // its reserved article_id but was changed back to ready after credits were added.
+    keyword.status = "ready";
+    delete options.generatorError;
+
+    await expect(test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:105",
+    })).resolves.toMatchObject({
+      outcome: "resumed",
+      keywordId: "KW-CLIENT-006",
+      articleId: "SEO-TG-4C9E16E19436",
+      rowNumber: 21,
+    });
+    expect(next).toMatchObject({ status: "ready", article_id: "" });
   });
 
   it("does not trust an edited Sheet retry reason without its valid HMAC proof", async () => {
@@ -1079,6 +1251,43 @@ describe("manual generation worker", () => {
     expect(next).toMatchObject({ status: "ready", article_id: "" });
   });
 
+  it("does not trust a ready row with an article id when its retry proof was edited", async () => {
+    const failed = readyKeyword({ __rowNumber: 12, keyword_id: "KW-TAMPERED-READY" });
+    const next = readyKeyword({
+      __rowNumber: 13,
+      keyword_id: "KW-NEXT-AFTER-TAMPERED-READY",
+      primary_keyword: "sledeci kljuc posle nevalidnog dokaza",
+    });
+    const test = setup({
+      keywords: [failed, next],
+      generatorError: APIError.generate(
+        429,
+        { error: { code: "insufficient_quota", message: "You have no credits remaining." } },
+        undefined,
+        new Headers(),
+      ),
+    });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    const failure = test.events.find((event) => event.event_type === "generation_failed")!;
+    const payload = JSON.parse(String(failure.payload_json)) as Record<string, unknown>;
+    const proof = String(payload.retry_proof);
+    payload.retry_proof = `${proof.slice(0, -1)}${proof.endsWith("0") ? "1" : "0"}`;
+    failure.payload_json = JSON.stringify(payload);
+    failed.status = "ready";
+
+    await expect(test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:108",
+    })).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "previous_generation_failed",
+      keywordId: "KW-TAMPERED-READY",
+      articleId: failed.article_id,
+    });
+    expect(next).toMatchObject({ status: "ready", article_id: "" });
+  });
+
   it("does not skip an ambiguous failed request and consume the next ready keyword", async () => {
     const failed = readyKeyword({ __rowNumber: 2, keyword_id: "KW-AMBIGUOUS" });
     const next = readyKeyword({
@@ -1100,6 +1309,34 @@ describe("manual generation worker", () => {
     });
     expect(test.generate).toHaveBeenCalledTimes(1);
     expect(next).toMatchObject({ status: "ready", article_id: "" });
+  });
+
+  it("blocks a newer ready row when an ambiguous signed request was reset to ready", async () => {
+    const failed = readyKeyword({ __rowNumber: 9, keyword_id: "KW-AMBIGUOUS-READY" });
+    const test = setup({ keywords: [failed], generatorError: new Error("upstream disconnected") });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    expect(failed.status).toBe("paused");
+
+    failed.status = "ready";
+    const physicallyEarlier = readyKeyword({
+      __rowNumber: 2,
+      keyword_id: "KW-EARLIER-BUT-MUST-WAIT",
+      primary_keyword: "raniji kljuc koji mora da saceka",
+    });
+    test.keywordRows.push(physicallyEarlier);
+
+    await expect(test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:109",
+    })).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "previous_generation_failed",
+      keywordId: "KW-AMBIGUOUS-READY",
+      articleId: failed.article_id,
+    });
+    expect(physicallyEarlier).toMatchObject({ status: "ready", article_id: "" });
+    expect(test.generate).toHaveBeenCalledTimes(1);
   });
 
   it("continues from a durable paid-result checkpoint without calling the article model twice", async () => {

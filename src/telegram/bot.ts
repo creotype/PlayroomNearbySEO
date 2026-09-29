@@ -564,7 +564,8 @@ async function replyGenerationResult(
     await ctx.reply(
       [
         `⚠️ Предыдущая генерация <code>${escapeHtml(result.keywordId)}</code> завершилась ошибкой.`,
-        "Системные поля в таблице не меняйте. Если отдельное сообщение бота прямо разрешило повтор, отправьте новый <code>/generate</code>; иначе передайте ошибку техническому администратору.",
+        "Бот сохранил строку как есть и не менял системные поля Google Sheets.",
+        "Если отдельное сообщение бота прямо разрешило повтор, отправьте новый <code>/generate</code>; иначе ничего не меняйте вручную — нужны проверка и безопасное восстановление техническим администратором.",
         "",
         `<a href="${sheetUrl}">Открыть строку в Google Sheets</a>`,
       ].join("\n"),
@@ -670,7 +671,7 @@ function manualGenerationBlockedMessage(
   const rowTitle = result.rowNumber ? `Строка ${result.rowNumber}` : "Верхняя ready-строка";
   const retry = "Исправьте строку, оставьте <code>status=ready</code> и снова отправьте <code>/generate</code>.";
   const openRow = result.rowNumber
-    ? `<a href="${rowUrl}">Исправить строку ${result.rowNumber} в Google Sheets</a>`
+    ? `<a href="${rowUrl}">Открыть строку ${result.rowNumber} в Google Sheets</a>`
     : `<a href="${queueUrl}">Открыть keywords в Google Sheets</a>`;
 
   if (result.reason === "generator_not_configured") {
@@ -711,7 +712,7 @@ function manualGenerationBlockedMessage(
     return [
       "⛔ <b>В таблице несколько активных статей.</b>",
       `Строки <code>articles</code>: <code>${escapeHtml(rows)}</code>. Бот не создал ещё одну статью.`,
-      "Оставьте только одну статью в статусе <code>needs_review</code> или <code>failed_qa</code>; остальные сначала завершите или передайте администратору.",
+      "Бот сохранил строки как есть и не менял системные поля Google Sheets. Не исправляйте их статусы вручную — нужны проверка и безопасное восстановление техническим администратором.",
       "",
       rowLinks || `<a href="${articleSheetUrl(config.spreadsheetId)}">Открыть articles в Google Sheets</a>`,
     ].join("\n");
@@ -731,12 +732,14 @@ function manualGenerationBlockedMessage(
     return [
       "🛑 <b>Предыдущая заявка остановилась в неопределённом состоянии.</b>",
       `<code>${escapeHtml(result.keywordId ?? "без ID")}</code> остаётся первой в очереди; следующий ключ бот не возьмёт.`,
-      "Системные поля в таблице не меняйте и не повторяйте /generate: нужна проверка технического администратора, чтобы исключить двойную оплату.",
+      "Бот сохранил строку как есть и не менял системные поля Google Sheets.",
+      "Ничего не меняйте вручную и не повторяйте <code>/generate</code>: нужны проверка и безопасное восстановление техническим администратором, чтобы исключить двойную оплату.",
       "",
       openRow,
     ].join("\n");
   }
   if (result.reason === "invalid_keyword_row") {
+    const hasSystemStateConflict = result.invalidFields?.includes("article_id") ?? false;
     const invalidHeader = result.rowNumber
       ? `/generate остановлен на строке ${result.rowNumber}.`
       : "/generate остановлен на верхней ready-строке.";
@@ -749,7 +752,9 @@ function manualGenerationBlockedMessage(
       `⛔ <b>${invalidHeader}</b>`,
       "Бот не пропустил сломанный верхний ключ, чтобы не нарушить порядок очереди.",
       ...issues.map((issue) => `• ${issue}`),
-      retry,
+      hasSystemStateConflict
+        ? "Бот сохранил строку как есть и не менял системные поля Google Sheets. Не очищайте <code>article_id</code> и не меняйте <code>status</code> вручную; нужны проверка и безопасное восстановление техническим администратором. До этого <code>/generate</code> не повторяйте."
+        : retry,
       "",
       openRow,
     ].join("\n");
@@ -770,7 +775,8 @@ function manualGenerationBlockedMessage(
   if (result.reason === "keyword_row_changed") {
     return [
       `↻ <b>${rowTitle} изменилась во время запуска.</b>`,
-      "Бот ничего не перезаписал. Проверьте, что <code>status=ready</code>, <code>article_id</code> пустой, а <code>locale</code> и <code>primary_keyword</code> заполнены, затем повторите <code>/generate</code>.",
+      "Бот сохранил текущее состояние строки и не менял системные поля Google Sheets.",
+      "Не меняйте <code>status</code> или <code>article_id</code> вручную и не повторяйте <code>/generate</code>: нужны проверка и безопасное восстановление техническим администратором.",
       "",
       openRow,
     ].join("\n");
@@ -779,7 +785,7 @@ function manualGenerationBlockedMessage(
     return [
       `⛔ <b>Конфликт системной заявки · ${rowTitle}.</b>`,
       `Текущий <code>article_id</code>: <code>${escapeHtml(result.articleId ?? "пусто")}</code>. Подпись Telegram-заявки не совпадает с данными строки.`,
-      "Не редактируйте <code>events</code> вручную; откройте строку и передайте её техническому администратору.",
+      "Бот сохранил строку как есть и не менял системные поля Google Sheets. Не редактируйте <code>status</code>, <code>article_id</code> или <code>events</code> вручную — нужны проверка и безопасное восстановление техническим администратором.",
       "",
       openRow,
     ].join("\n");
@@ -832,7 +838,7 @@ function invalidKeywordFieldMessage(
   if (field === "primary_keyword") {
     return `<code>C${row} primary_keyword</code> должен содержать 2–200 обычных символов без невидимых управляющих знаков.`;
   }
-  return `<code>O${row} article_id</code> должен быть пустым при <code>status=ready</code>; сейчас: <code>${escapeHtml(articleId ?? "заполнен")}</code>. Если статья уже создавалась, восстановите правильный status вместо создания дубля.`;
+  return `<code>O${row} article_id</code> уже содержит <code>${escapeHtml(articleId ?? "значение")}</code>. Это конфликт системного состояния, а не поле для ручного исправления.`;
 }
 
 function generateUsage(message: string): string {

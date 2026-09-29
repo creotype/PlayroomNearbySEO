@@ -233,8 +233,8 @@ export class GenerationService {
         });
       }
 
-      const recoverable = await this.#recoverablePausedKeyword(allKeywords);
-      const unresolved = await this.#unresolvedPausedManualKeyword(allKeywords);
+      const recoverable = await this.#recoverableKeyword(allKeywords);
+      const unresolved = await this.#unresolvedManualKeyword(allKeywords);
       const [recoverableRank, unresolvedRank] = await Promise.all([
         recoverable ? this.#pausedEventRank(recoverable) : Promise.resolve(-1),
         unresolved ? this.#pausedEventRank(unresolved) : Promise.resolve(-1),
@@ -253,6 +253,10 @@ export class GenerationService {
       const normalizedKeyword = normalizeManualKeyword(stringCell(keyword.primary_keyword));
       const locale = stringCell(keyword.locale).toLowerCase();
       const isRecovery = Boolean(recoverable && recoverable.__rowNumber === keyword.__rowNumber);
+      const sourceStatus = stringCell(keyword.status);
+      const requestFromStatus: "ready" | "paused" = isRecovery && sourceStatus === "paused"
+        ? "paused"
+        : "ready";
       const articleId = isRecovery ? stringCell(keyword.article_id) : requestArticleId;
       const invalidFields: InvalidKeywordField[] = [];
       if (!keywordId) invalidFields.push("keyword_id");
@@ -315,10 +319,11 @@ export class GenerationService {
           keyword.__rowNumber,
           now,
           this.config.telegramBotToken,
-          isRecovery ? "paused" : "ready",
+          requestFromStatus,
+          isRecovery,
         ),
         {
-          status: isRecovery ? "paused" : "ready",
+          status: requestFromStatus,
           article_id: isRecovery ? articleId : "",
           locale: keyword.locale ?? "",
           primary_keyword: keyword.primary_keyword ?? "",
@@ -673,11 +678,35 @@ export class GenerationService {
     return hasInternalLink ? undefined : "no_internal_links";
   }
 
-  async #recoverablePausedKeyword(allKeywords: SheetRecord[]): Promise<SheetRecord | undefined> {
-    const paused = await this.#pausedCandidatesNewestFirst(allKeywords);
+  async #recoverableKeyword(allKeywords: SheetRecord[]): Promise<SheetRecord | undefined> {
+    const candidates = await this.#recoveryCandidatesNewestFirst(allKeywords);
 
-    for (const candidate of paused) {
+    for (const candidate of candidates) {
       const articleId = stringCell(candidate.article_id);
+      const events = await this.store.listEvents(articleId);
+      // A completed generation is terminal for this article id. Sheet row
+      // reordering must never make an older signed failure spend again.
+      if (events.some((event) => stringCell(event.event_type) === "generated")) continue;
+      const request = latestEvent(
+        events,
+        (event) =>
+          stringCell(event.event_type) === "generation_requested" &&
+          stringCell(event.actor_type) === "telegram_user" &&
+          stringCell(event.provider) === "telegram",
+      );
+      // A ready row with an article id is normally invalid. Trust it as a
+      // recovery candidate only when it still belongs to a signed Telegram
+      // request; this prevents arbitrary Sheet edits from attaching an article.
+      if (
+        stringCell(candidate.status) === "ready" &&
+        (
+          !request ||
+          !eventIdIsUnique(events, request) ||
+          !(await this.#hasValidManualRequest(candidate))
+        )
+      ) {
+        continue;
+      }
       const article = await this.store.findArticle(articleId);
       if (
         article &&
@@ -700,19 +729,11 @@ export class GenerationService {
         }
       }
 
-      const events = await this.store.listEvents(articleId);
       const failure = latestEvent(
         events,
         (event) => ["generation_failed", "generation_blocked"].includes(stringCell(event.event_type)),
       );
       if (!failure) continue;
-      const request = latestEvent(
-        events,
-        (event) =>
-          stringCell(event.event_type) === "generation_requested" &&
-          stringCell(event.actor_type) === "telegram_user" &&
-          stringCell(event.provider) === "telegram",
-      );
       const attempt = latestEvent(
         events,
         (event) => stringCell(event.event_type) === "generation_attempt_started",
@@ -727,6 +748,11 @@ export class GenerationService {
           "generated",
         ].includes(stringCell(event.event_type)),
       );
+      if (
+        !eventIdIsUnique(events, failure) ||
+        (request && !eventIdIsUnique(events, request)) ||
+        (attempt && !eventIdIsUnique(events, attempt))
+      ) continue;
       if (!isExplicitlyRecoverableStop(
         failure,
         candidate,
@@ -747,25 +773,12 @@ export class GenerationService {
     return undefined;
   }
 
-  async #unresolvedPausedManualKeyword(allKeywords: SheetRecord[]): Promise<SheetRecord | undefined> {
-    const paused = await this.#pausedCandidatesNewestFirst(allKeywords);
-    for (const candidate of paused) {
-      const events = await this.store.listEvents(stringCell(candidate.article_id));
-      const request = latestEvent(
-        events,
-        (event) =>
-          stringCell(event.event_type) === "generation_requested" &&
-          stringCell(event.actor_type) === "telegram_user" &&
-          stringCell(event.provider) === "telegram",
-      );
-      if (request) return candidate;
-    }
-    return undefined;
-  }
-
-  async #pausedCandidatesNewestFirst(allKeywords: SheetRecord[]): Promise<SheetRecord[]> {
+  async #recoveryCandidatesNewestFirst(allKeywords: SheetRecord[]): Promise<SheetRecord[]> {
     const candidates = allKeywords
-      .filter((candidate) => stringCell(candidate.status) === "paused")
+      .filter((candidate) => {
+        const status = stringCell(candidate.status);
+        return status === "paused" || (status === "ready" && Boolean(stringCell(candidate.article_id)));
+      })
       .filter((candidate) => Boolean(stringCell(candidate.keyword_id) && stringCell(candidate.article_id)));
     const ranked = await Promise.all(
       candidates.map(async (candidate) => ({
@@ -779,6 +792,22 @@ export class GenerationService {
         right.candidate.__rowNumber - left.candidate.__rowNumber,
       )
       .map(({ candidate }) => candidate);
+  }
+
+  async #unresolvedManualKeyword(allKeywords: SheetRecord[]): Promise<SheetRecord | undefined> {
+    const candidates = await this.#recoveryCandidatesNewestFirst(allKeywords);
+    for (const candidate of candidates) {
+      const events = await this.store.listEvents(stringCell(candidate.article_id));
+      const request = latestEvent(
+        events,
+        (event) =>
+          stringCell(event.event_type) === "generation_requested" &&
+          stringCell(event.actor_type) === "telegram_user" &&
+          stringCell(event.provider) === "telegram",
+      );
+      if (request) return candidate;
+    }
+    return undefined;
   }
 
   async #pausedEventRank(keyword: SheetRecord): Promise<number> {
@@ -1474,6 +1503,7 @@ function requestedEvent(
   createdAt: string,
   signingSecret: string,
   fromStatus: "ready" | "paused" = "ready",
+  isRecovery = fromStatus === "paused",
 ): AuditEvent {
   const actorId = String(request.actorId);
   const signature = manualRequestSignature(
@@ -1496,7 +1526,7 @@ function requestedEvent(
     actor_id: actorId,
     provider: "telegram",
     provider_object_id: request.providerObjectId,
-    message: `${fromStatus === "paused" ? "Recovery" : "Next-keyword"} generation requested for ${keyword}`,
+    message: `${isRecovery ? "Recovery" : "Next-keyword"} generation requested for ${keyword}`,
     payload_json: JSON.stringify({
       request_kind: "sheet_queue",
       keyword_id: keywordId,
@@ -1594,6 +1624,11 @@ function latestEvent(
       right.__rowNumber - left.__rowNumber ||
       stringCell(right.created_at).localeCompare(stringCell(left.created_at)),
     )[0];
+}
+
+function eventIdIsUnique(events: SheetRecord[], event: SheetRecord): boolean {
+  const eventId = stringCell(event.event_id);
+  return Boolean(eventId) && events.filter((candidate) => stringCell(candidate.event_id) === eventId).length === 1;
 }
 
 function storedOpenAiFailureReason(
