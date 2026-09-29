@@ -564,11 +564,21 @@ async function replyGenerationResult(
     await ctx.reply(
       [
         `⚠️ Предыдущая генерация <code>${escapeHtml(result.keywordId)}</code> завершилась ошибкой.`,
-        "Исправьте данные при необходимости, очистите <code>article_id</code>, верните <code>status=ready</code> и снова отправьте <code>/generate</code>.",
+        "Системные поля в таблице не меняйте. Если отдельное сообщение бота прямо разрешило повтор, отправьте новый <code>/generate</code>; иначе передайте ошибку техническому администратору.",
         "",
         `<a href="${sheetUrl}">Открыть строку в Google Sheets</a>`,
       ].join("\n"),
       { parse_mode: "HTML", link_preview_options: { is_disabled: true } },
+    );
+    return;
+  }
+  if (result.outcome === "resumed") {
+    await ctx.reply(
+      [
+        `🔄 Возобновляю <code>${escapeHtml(result.keywordId)}</code> после технической остановки.`,
+        "Следующий ключ не трогаю. Если текст уже был получен, продолжу с сохранённой копии без повторной генерации статьи.",
+      ].join("\n"),
+      { parse_mode: "HTML" },
     );
     return;
   }
@@ -713,6 +723,15 @@ function manualGenerationBlockedMessage(
         ? `Текущий article ID: <code>${escapeHtml(result.articleId)}</code>.`
         : "Бот уже обрабатывает предыдущий ключевик.",
       "Дождитесь review-карточки — повторять <code>/generate</code> не нужно.",
+      "",
+      openRow,
+    ].join("\n");
+  }
+  if (result.reason === "previous_generation_failed") {
+    return [
+      "🛑 <b>Предыдущая заявка остановилась в неопределённом состоянии.</b>",
+      `<code>${escapeHtml(result.keywordId ?? "без ID")}</code> остаётся первой в очереди; следующий ключ бот не возьмёт.`,
+      "Системные поля в таблице не меняйте и не повторяйте /generate: нужна проверка технического администратора, чтобы исключить двойную оплату.",
       "",
       openRow,
     ].join("\n");

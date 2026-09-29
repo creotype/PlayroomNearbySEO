@@ -188,8 +188,9 @@ describe("ReviewNotifier generation failures", () => {
     const notification = String(sendMessage.mock.calls[0]?.[1]);
     expect(notification).toContain("Генерация остановлена");
     expect(notification).toContain("link_inventory");
-    expect(notification).toContain("очистите article_id");
-    expect(notification).toContain("status=ready");
+    expect(notification).toContain("Системные поля не меняйте");
+    expect(notification).not.toContain("очистите article_id");
+    expect(notification).not.toContain("status=ready");
     expect(notification).toContain("/generate");
     expect(appendEvent).toHaveBeenCalledTimes(1);
     expect(events.some((event) => event.event_type === "generation_failure_notified")).toBe(true);
@@ -243,14 +244,92 @@ describe("ReviewNotifier generation failures", () => {
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
     const notification = String(sendMessage.mock.calls[0]?.[1]);
-    expect(notification).toContain("Ghost временно не принял картинку");
+    expect(notification).toContain("Картинка или её загрузка временно не завершилась");
     expect(notification).toContain("ничего не опубликовал");
     expect(notification).toContain("Не меняйте article_id и status вручную");
-    expect(notification).toContain("техническому администратору");
+    expect(notification).toContain("без повторной генерации текста");
     expect(notification).not.toContain("очистите article_id");
     expect(notification).not.toContain("status=ready");
     expect(notification).not.toContain("ECONNRESET");
     expect(appendEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [
+      "openai_credit_balance_exhausted",
+      "закончились кредиты",
+      "https://platform.openai.com/settings/organization/billing/",
+    ],
+    [
+      "openai_spend_or_usage_limit_reached",
+      "лимита расходов или использования",
+      "снова отправить /generate",
+    ],
+    [
+      "openai_temporary_rate_limit",
+      "ограничил частоту запросов",
+      "Бот повторит эту же заявку",
+    ],
+    [
+      "openai_authentication_failed",
+      "отклонил API-ключ",
+      "снова отправьте /generate",
+    ],
+  ] as const)("explains %s without asking an editor to mutate workflow fields", async (reason, expected, detail) => {
+    const articleId = `SEO-${reason}`;
+    const events: SheetRecord[] = [
+      {
+        __rowNumber: 2,
+        event_id: `evt-requested-${reason}`,
+        article_id: articleId,
+        event_type: "generation_requested",
+        actor_type: "telegram_user",
+        actor_id: "42",
+        provider: "telegram",
+        provider_object_id: "message:-1:2",
+      },
+      {
+        __rowNumber: 3,
+        event_id: `evt-failed-${reason}`,
+        article_id: articleId,
+        event_type: "generation_failed",
+        message: "provider detail that must not be shown",
+        payload_json: JSON.stringify({ keyword_id: "KW-OPENAI-1", stage: "article_generation", reason }),
+      },
+    ];
+    const keyword = {
+      __rowNumber: 9,
+      keyword_id: "KW-OPENAI-1",
+      article_id: articleId,
+      primary_keyword: "gde sa decom Beograd",
+      status: "paused",
+    } as SheetRecord;
+    const appendEvent = vi.fn(async (event: Record<string, unknown>) => {
+      events.push({ __rowNumber: events.length + 2, ...event } as SheetRecord);
+    });
+    const sendMessage = vi.fn(async (..._args: unknown[]) => ({ message_id: 125 }));
+    const store = {
+      getSettings: async () => new Map([["telegram_chat_id", -5484259760]]),
+      listArticles: async () => [],
+      listKeywords: async () => [keyword],
+      listEvents: async () => events,
+      appendEvent,
+    } as unknown as GoogleSheetsStore;
+    const notifier = new ReviewNotifier(
+      store,
+      { api: { sendMessage } } as unknown as SeoBot,
+      config,
+      { error: vi.fn() } as unknown as Logger,
+    );
+
+    await notifier.runOnce();
+
+    const notification = String(sendMessage.mock.calls[0]?.[1]);
+    expect(notification).toContain(expected);
+    expect(notification).toContain(detail);
+    expect(notification).not.toContain("очистите article_id");
+    expect(notification).not.toContain("status=ready");
+    expect(notification).not.toContain("provider detail");
   });
 });
 

@@ -389,26 +389,50 @@ function generationFailureMessage(
 }
 
 function generationFailureReason(failure: SheetRecord): string {
-  const retry = "После исправления очистите article_id, верните status=ready и повторите /generate.";
+  const retry = "Системные поля не меняйте: после устранения причины отправьте /generate, и бот продолжит эту же заявку.";
   if (stringCell(failure.event_type) !== "generation_blocked") {
     try {
       const payload = JSON.parse(stringCell(failure.payload_json)) as Record<string, unknown>;
+      if (payload.reason === "openai_credit_balance_exhausted") {
+        return [
+          "На балансе OpenAI закончились кредиты, поэтому запрос был отклонён.",
+          "Пополните баланс и снова отправьте /generate — бот продолжит эту же заявку, а следующий ключ не тронет. Строку и системные поля менять не нужно.",
+          '<a href="https://platform.openai.com/settings/organization/billing/">Пополнить баланс OpenAI</a>',
+        ].join(" ");
+      }
+      if (payload.reason === "openai_spend_or_usage_limit_reached") {
+        return [
+          "OpenAI остановил запрос из-за лимита расходов или использования организации/проекта, поэтому статья не создавалась.",
+          "Владельцу OpenAI нужно проверить лимиты, затем снова отправить /generate. Бот продолжит эту же заявку; строку менять не нужно.",
+        ].join(" ");
+      }
+      if (payload.reason === "openai_temporary_rate_limit") {
+        return [
+          "OpenAI временно ограничил частоту запросов, поэтому статья не создавалась.",
+          "Ничего в таблице не меняйте — немного подождите и снова отправьте /generate. Бот повторит эту же заявку.",
+        ].join(" ");
+      }
+      if (payload.reason === "openai_authentication_failed") {
+        return [
+          "OpenAI отклонил API-ключ или доступ проекта, поэтому статья не создавалась.",
+          "После исправления ключа или доступа снова отправьте /generate. Строку и системные поля в таблице менять не нужно.",
+        ].join(" ");
+      }
       if (payload.stage === "hero_image") {
         return [
-          "Ghost временно не принял картинку, поэтому бот остановил подготовку статьи и ничего не опубликовал.",
-          "Не меняйте article_id и status вручную.",
-          "Повторную попытку можно сделать позже после восстановления Ghost — передайте это сообщение техническому администратору, чтобы он безопасно перезапустил заявку.",
+          "Картинка или её загрузка временно не завершилась, поэтому бот ничего не опубликовал.",
+          "Текст статьи сохранён. Не меняйте article_id и status вручную; позже отправьте /generate, и бот продолжит с картинки без повторной генерации текста.",
         ].join(" ");
       }
     } catch {
       // Legacy generation_failed events have no structured stage.
     }
-    return `Генератор вернул техническую ошибку. ${retry}`;
+    return "Генератор остановился в неопределённом состоянии. Системные поля не меняйте и не повторяйте /generate: передайте сообщение техническому администратору, чтобы исключить двойную оплату.";
   }
   try {
     const payload = JSON.parse(stringCell(failure.payload_json)) as Record<string, unknown>;
     if (payload.reason === "ru_disabled") {
-      return `Локаль RU выключили после постановки в очередь. Исправьте locale или обратитесь к администратору. ${retry}`;
+      return `Локаль RU выключили после постановки в очередь. Включите её в settings или обратитесь к администратору. ${retry}`;
     }
     if (payload.reason === "locale_disabled") {
       return `Локаль ключа выключили после постановки в очередь. Исправьте locale или settings.enabled_locales. ${retry}`;
@@ -417,7 +441,7 @@ function generationFailureReason(failure: SheetRecord): string {
       return `Для локали больше нет разрешённой внутренней ссылки. Проверьте link_inventory. ${retry}`;
     }
     if (payload.reason === "invalid_manual_request") {
-      return "Системные поля ключа изменились после /generate. Проверьте строку, очистите article_id и верните status=ready для нового запуска.";
+      return `Данные ключа изменились после постановки в очередь. Проверьте пользовательские поля строки. ${retry}`;
     }
   } catch {
     // Fall through to a safe operator-facing explanation.

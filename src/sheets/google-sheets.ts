@@ -325,6 +325,21 @@ export class GoogleSheetsStore {
     );
   }
 
+  async findEventByProviderObjectId(
+    provider: string,
+    providerObjectId: string,
+    eventType?: string,
+  ): Promise<SheetRecord | undefined> {
+    const normalizedProvider = provider.trim().toLowerCase();
+    const normalizedObjectId = providerObjectId.trim();
+    return (await this.#readTable("events")).rows.find(
+      (row) =>
+        stringCell(row.provider).toLowerCase() === normalizedProvider &&
+        stringCell(row.provider_object_id) === normalizedObjectId &&
+        (!eventType || stringCell(row.event_type) === eventType),
+    );
+  }
+
   async #readTable(sheet: SheetName, refreshHeaders = false): Promise<SheetTable> {
     const response = await this.#sheets.spreadsheets.values.get({
       spreadsheetId: this.#spreadsheetId,

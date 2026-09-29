@@ -30,7 +30,7 @@ export const generatedArticleResponseSchema = z.object({
   qa_blockers: z.array(generatedQaBlockerSchema).max(GENERATED_QA_BLOCKER_CODES.length),
 });
 
-const generatedArticleSchema = generatedArticleResponseSchema.extend({
+export const generatedArticleSchema = generatedArticleResponseSchema.extend({
   source_urls: z.array(z.string().url()).min(1),
   internal_links: z.array(z.string().url()).min(1),
 });

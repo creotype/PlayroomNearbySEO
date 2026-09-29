@@ -5,7 +5,7 @@ const allowedTransitions: Record<ArticleStatus, ReadonlySet<ArticleStatus>> = {
   brief_ready: new Set(["generating", "cancelled"]),
   generating: new Set(["qa_pending", "failed_generation", "cancelled"]),
   draft: new Set(["qa_pending", "needs_review", "cancelled"]),
-  qa_pending: new Set(["needs_review", "failed_qa", "cancelled"]),
+  qa_pending: new Set(["needs_review", "failed_qa", "failed_generation", "cancelled"]),
   needs_review: new Set(["approved", "revision_requested", "failed_qa", "cancelled"]),
   revision_requested: new Set(["qa_pending", "needs_review", "cancelled"]),
   approved: new Set(["scheduled", "publishing", "needs_review", "conflict", "cancelled"]),

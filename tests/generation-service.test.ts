@@ -1,7 +1,8 @@
 import type { Logger } from "pino";
+import { APIError } from "openai";
 import { describe, expect, it, vi } from "vitest";
 import type { AppConfig } from "../src/config.js";
-import { articleContentHash, type CellValue, type SheetRecord } from "../src/domain/article.js";
+import { articleContentHash, stringCell, type CellValue, type SheetRecord } from "../src/domain/article.js";
 import type { OpenAiArticleGenerator } from "../src/generation/openai-generator.js";
 import { KeyedMutex } from "../src/lib/keyed-mutex.js";
 import type { GoogleSheetsStore } from "../src/sheets/google-sheets.js";
@@ -10,6 +11,7 @@ import {
   manualGenerationIsEnabled,
 } from "../src/services/generation-service.js";
 import type { HeroImageService } from "../src/services/hero-image-service.js";
+import type { InitialGenerationCheckpointStore } from "../src/services/initial-generation-checkpoint-store.js";
 import { QualityGate } from "../src/services/quality-gate.js";
 
 const config: AppConfig = {
@@ -71,6 +73,8 @@ function setup(options: {
   links?: SheetRecord[];
   workflowMutex?: KeyedMutex;
   heroImages?: HeroImageService;
+  initialCheckpoints?: InitialGenerationCheckpointStore;
+  patchArticleError?: (articleId: string, patch: Record<string, CellValue>) => Error | undefined;
   beforeKeywordClaim?: (keyword: SheetRecord) => void;
   onGenerate?: () => void | Promise<void>;
 } = {}) {
@@ -174,6 +178,14 @@ function setup(options: {
     appendArticle: async (values: Record<string, CellValue>) => {
       articleRows.push({ __rowNumber: articleRows.length + 2, ...values });
     },
+    patchArticle: async (articleId: string, patch: Record<string, CellValue>) => {
+      const patchError = options.patchArticleError?.(articleId, patch);
+      if (patchError) throw patchError;
+      const article = articleRows.find((row) => row.article_id === articleId);
+      if (!article) throw new Error(`Missing article ${articleId}`);
+      Object.assign(article, patch);
+      return article;
+    },
     patchArticleAndAppendEvent: async (
       articleId: string,
       patch: Record<string, CellValue>,
@@ -188,6 +200,16 @@ function setup(options: {
       return article;
     },
     listEvents: async (articleId: string) => events.filter((event) => event.article_id === articleId),
+    findEventByProviderObjectId: async (
+      provider: string,
+      providerObjectId: string,
+      eventType?: string,
+    ) => events.find(
+      (event) =>
+        event.provider === provider &&
+        event.provider_object_id === providerObjectId &&
+        (!eventType || event.event_type === eventType),
+    ),
     appendEvent: async (event: Record<string, CellValue>) => {
       events.push({ __rowNumber: events.length + 2, ...event });
     },
@@ -207,6 +229,7 @@ function setup(options: {
     new QualityGate(typedStore, config),
     options.workflowMutex,
     heroImages,
+    options.initialCheckpoints,
   );
   return {
     service,
@@ -908,12 +931,355 @@ describe("manual generation worker", () => {
     await test.service.runManualOnce();
     expect(test.generate).toHaveBeenCalledTimes(1);
     expect(keyword.status).toBe("paused");
-    expect(test.articleRows).toHaveLength(0);
+    expect(test.articleRows).toHaveLength(1);
+    expect(test.articleRows[0]).toMatchObject({ status: "failed_generation", body_markdown: "" });
     const failure = test.events.find((event) => event.event_type === "generation_failed");
     expect(JSON.parse(String(failure?.payload_json))).toMatchObject({
       keyword_id: "KW-READY-1",
       stage: "article_generation",
     });
+  });
+
+  it("records the safe OpenAI failure reason alongside the generation stage", async () => {
+    const keyword = readyKeyword();
+    const providerError = APIError.generate(
+      429,
+      {
+        error: {
+          code: "insufficient_quota",
+          type: "insufficient_quota",
+          message: "You have no credits remaining. Add credits to continue using the API.",
+        },
+      },
+      undefined,
+      new Headers(),
+    );
+    const test = setup({ keywords: [keyword], generatorError: providerError });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+
+    await test.service.runManualOnce();
+
+    const failure = test.events.find((event) => event.event_type === "generation_failed");
+    expect(JSON.parse(String(failure?.payload_json))).toMatchObject({
+      keyword_id: "KW-READY-1",
+      stage: "article_generation",
+      reason: "openai_credit_balance_exhausted",
+    });
+  });
+
+  it("retries a proven rejected OpenAI request on the same keyword without consuming the next row", async () => {
+    const first = readyKeyword({ __rowNumber: 2, keyword_id: "KW-RETRY-SAME" });
+    const next = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-NEXT-UNTOUCHED",
+      primary_keyword: "sledeći ključ ostaje netaknut",
+    });
+    const providerError = APIError.generate(
+      429,
+      {
+        error: {
+          code: "insufficient_quota",
+          type: "insufficient_quota",
+          message: "You have no credits remaining. Add credits to continue using the API.",
+        },
+      },
+      undefined,
+      new Headers(),
+    );
+    const options: {
+      keywords: SheetRecord[];
+      generatorError?: Error;
+    } = { keywords: [first, next], generatorError: providerError };
+    const test = setup(options);
+
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    expect(first.status).toBe("paused");
+    expect(next).toMatchObject({ status: "ready", article_id: "" });
+
+    delete options.generatorError;
+    const resumed = await test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:101",
+    });
+    expect(resumed).toMatchObject({ outcome: "resumed", keywordId: "KW-RETRY-SAME" });
+    await test.service.runManualOnce();
+
+    expect(test.generate).toHaveBeenCalledTimes(2);
+    expect(first.status).toBe("used");
+    expect(next).toMatchObject({ status: "ready", article_id: "" });
+    expect(test.articleRows).toHaveLength(1);
+    expect(test.articleRows[0]).toMatchObject({ keyword_id: "KW-RETRY-SAME", status: "needs_review" });
+  });
+
+  it("recovers the exact legacy no-credits failure emitted before structured reasons existed", async () => {
+    const keyword = readyKeyword({ keyword_id: "KW-CLIENT-006" });
+    const options: { keywords: SheetRecord[]; generatorError?: Error } = {
+      keywords: [keyword],
+      generatorError: APIError.generate(
+        429,
+        { error: { message: "You have no credits remaining." } },
+        undefined,
+        new Headers(),
+      ),
+    };
+    const test = setup(options);
+    const legacyRequest = { ...request, providerObjectId: "message:-5484259760:147" };
+    expect((await test.service.requestManualGeneration(legacyRequest)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    expect(keyword.article_id).toBe("SEO-TG-4C9E16E19436");
+    test.events.find((event) => event.event_type === "generation_requested")!.event_id =
+      "evt-generation_requested-6edea860bb804cd700482de9";
+    test.events.find((event) => event.event_type === "generation_attempt_started")!.event_id =
+      "evt-generation_attempt_started-797c1815321f60bfa6e57b2e";
+    const failure = test.events.find((event) => event.event_type === "generation_failed")!;
+    failure.event_id = "evt-generation_failed-731cd5df27d4390fcf50c865";
+    failure.message = "429 You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/.";
+    failure.payload_json = JSON.stringify({ keyword_id: "KW-CLIENT-006", stage: "article_generation" });
+
+    delete options.generatorError;
+    await expect(test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:105",
+    })).resolves.toMatchObject({ outcome: "resumed", keywordId: "KW-CLIENT-006" });
+  });
+
+  it("does not trust an edited Sheet retry reason without its valid HMAC proof", async () => {
+    const failed = readyKeyword({ keyword_id: "KW-TAMPERED-RETRY" });
+    const next = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-NEXT-AFTER-TAMPER",
+      primary_keyword: "sledeći ključ posle izmenjenog dokaza",
+    });
+    const test = setup({
+      keywords: [failed, next],
+      generatorError: APIError.generate(
+        429,
+        { error: { message: "You have no credits remaining." } },
+        undefined,
+        new Headers(),
+      ),
+    });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    const failure = test.events.find((event) => event.event_type === "generation_failed")!;
+    const payload = JSON.parse(String(failure.payload_json)) as Record<string, unknown>;
+    const proof = String(payload.retry_proof);
+    payload.retry_proof = `${proof.slice(0, -1)}${proof.endsWith("0") ? "1" : "0"}`;
+    failure.payload_json = JSON.stringify(payload);
+
+    await expect(test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:106",
+    })).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "previous_generation_failed",
+      keywordId: "KW-TAMPERED-RETRY",
+    });
+    expect(next).toMatchObject({ status: "ready", article_id: "" });
+  });
+
+  it("does not skip an ambiguous failed request and consume the next ready keyword", async () => {
+    const failed = readyKeyword({ __rowNumber: 2, keyword_id: "KW-AMBIGUOUS" });
+    const next = readyKeyword({
+      __rowNumber: 3,
+      keyword_id: "KW-MUST-WAIT",
+      primary_keyword: "ključ koji mora da sačeka",
+    });
+    const test = setup({ keywords: [failed, next], generatorError: new Error("upstream disconnected") });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+
+    await expect(test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:102",
+    })).resolves.toMatchObject({
+      outcome: "blocked",
+      reason: "previous_generation_failed",
+      keywordId: "KW-AMBIGUOUS",
+    });
+    expect(test.generate).toHaveBeenCalledTimes(1);
+    expect(next).toMatchObject({ status: "ready", article_id: "" });
+  });
+
+  it("continues from a durable paid-result checkpoint without calling the article model twice", async () => {
+    let checkpoint: unknown;
+    const checkpoints = {
+      save: vi.fn(async (value: unknown) => {
+        checkpoint = value;
+        return value;
+      }),
+      load: vi.fn(async () => checkpoint),
+      remove: vi.fn(async () => {
+        checkpoint = undefined;
+      }),
+    } as unknown as InitialGenerationCheckpointStore;
+    let failGeneratedTextWrite = true;
+    const keyword = readyKeyword({ keyword_id: "KW-CHECKPOINT" });
+    const test = setup({
+      keywords: [keyword],
+      initialCheckpoints: checkpoints,
+      patchArticleError: (_articleId, patch) =>
+        failGeneratedTextWrite && stringCell(patch.body_markdown)
+          ? new Error("Sheet write response lost")
+          : undefined,
+    });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    expect(keyword.status).toBe("paused");
+    expect(checkpoint).toBeTruthy();
+
+    failGeneratedTextWrite = false;
+    expect((await test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:103",
+    })).outcome).toBe("resumed");
+    await test.service.runManualOnce();
+
+    expect(test.generate).toHaveBeenCalledTimes(1);
+    expect(checkpoints.remove).toHaveBeenCalled();
+    expect(keyword.status).toBe("used");
+    expect(test.articleRows[0]).toMatchObject({ status: "needs_review" });
+  });
+
+  it("still persists the paid text to Sheets when the local checkpoint write fails", async () => {
+    const checkpoints = {
+      save: vi.fn(async () => { throw new Error("checkpoint disk unavailable"); }),
+      load: vi.fn(async () => undefined),
+      remove: vi.fn(async () => undefined),
+    } as unknown as InitialGenerationCheckpointStore;
+    const keyword = readyKeyword({ keyword_id: "KW-CHECKPOINT-DISK-FAIL" });
+    const test = setup({ keywords: [keyword], initialCheckpoints: checkpoints });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+
+    await test.service.runManualOnce();
+
+    expect(checkpoints.save).toHaveBeenCalledOnce();
+    expect(test.generate).toHaveBeenCalledOnce();
+    expect(keyword.status).toBe("used");
+    expect(test.articleRows[0]).toMatchObject({ status: "needs_review" });
+  });
+
+  it("resumes hero processing from saved text without regenerating the article", async () => {
+    const ensureForArticle = vi.fn()
+      .mockRejectedValueOnce(new Error("image provider unavailable"))
+      .mockResolvedValue({
+        url: "https://example.com/content/images/recovered-hero.webp",
+        alt: "Recovered hero",
+      });
+    const keyword = readyKeyword({ keyword_id: "KW-HERO-RESUME" });
+    const test = setup({
+      keywords: [keyword],
+      heroImages: { ensureForArticle } as unknown as HeroImageService,
+    });
+    expect((await test.service.requestManualGeneration(request)).outcome).toBe("queued");
+    await test.service.runManualOnce();
+    expect(keyword.status).toBe("paused");
+    expect(String(test.articleRows[0]?.body_markdown)).toContain("Playroom vodič");
+
+    expect((await test.service.requestManualGeneration({
+      ...request,
+      providerObjectId: "message:-5484259760:104",
+    })).outcome).toBe("resumed");
+    await test.service.runManualOnce();
+
+    expect(test.generate).toHaveBeenCalledTimes(1);
+    expect(ensureForArticle).toHaveBeenCalledTimes(2);
+    expect(keyword.status).toBe("used");
+    expect(test.articleRows[0]).toMatchObject({
+      status: "needs_review",
+      feature_image_url: "https://example.com/content/images/recovered-hero.webp",
+    });
+  });
+
+  it("does not automatically replay an interrupted paid hero-image attempt", async () => {
+    const ensureForArticle = vi.fn(async () => ({
+      url: "https://example.com/content/images/should-not-run.webp",
+      alt: "Should not run",
+    }));
+    const keyword = readyKeyword({ keyword_id: "KW-HERO-AMBIGUOUS" });
+    const test = setup({
+      keywords: [keyword],
+      heroImages: { ensureForArticle } as unknown as HeroImageService,
+    });
+    const queued = await test.service.requestManualGeneration(request);
+    expect(queued.outcome).toBe("queued");
+    const articleId = queued.outcome === "blocked" ? "" : queued.articleId;
+    keyword.status = "generating";
+    test.articleRows.push({
+      __rowNumber: 2,
+      article_id: articleId,
+      keyword_id: "KW-HERO-AMBIGUOUS",
+      locale: "sr",
+      status: "generating",
+      title: "Sačuvan naslov članka",
+      slug: "sacuvan-naslov-clanka",
+      excerpt: "Praktičan vodič za roditelje koji biraju aktivnosti u Beogradu.",
+      seo_title: "Sačuvan naslov članka za roditelje",
+      meta_description: "Praktičan vodič za roditelje koji traže proverene ideje za porodične aktivnosti i mesta u Beogradu.",
+      body_markdown: validGeneratedBody(),
+      tags: "rs",
+      source_urls: "https://example.com/source",
+      internal_links: allowedInternalUrl,
+      quality_score: 9,
+      qa_status: "pending",
+      qa_blockers: "",
+    });
+    test.events.push({
+      __rowNumber: test.events.length + 2,
+      event_id: "evt-hero-ambiguous",
+      article_id: articleId,
+      event_type: "hero_image_attempt_started",
+      actor_type: "system",
+      actor_id: "hero-image-generator",
+      provider: "openai",
+    });
+
+    await test.service.runManualOnce();
+
+    expect(test.generate).not.toHaveBeenCalled();
+    expect(ensureForArticle).not.toHaveBeenCalled();
+    expect(keyword.status).toBe("paused");
+    expect(test.events.some((event) => event.event_type === "generation_failed")).toBe(true);
+  });
+
+  it("treats saved Sheet text as authoritative when stale checkpoint cleanup fails", async () => {
+    const checkpoints = {
+      load: vi.fn(async () => { throw new Error("stale checkpoint is unreadable"); }),
+      remove: vi.fn(async () => { throw new Error("checkpoint unlink denied"); }),
+    } as unknown as InitialGenerationCheckpointStore;
+    const keyword = readyKeyword({ keyword_id: "KW-SHEET-AUTHORITATIVE" });
+    const test = setup({ keywords: [keyword], initialCheckpoints: checkpoints });
+    const queued = await test.service.requestManualGeneration(request);
+    const articleId = queued.outcome === "blocked" ? "" : queued.articleId;
+    keyword.status = "generating";
+    test.articleRows.push({
+      __rowNumber: 2,
+      article_id: articleId,
+      keyword_id: "KW-SHEET-AUTHORITATIVE",
+      locale: "sr",
+      status: "generating",
+      title: "Sačuvan članak iz Google Sheets",
+      slug: "sacuvan-clanak-iz-google-sheets",
+      excerpt: "Praktičan vodič za roditelje koji biraju aktivnosti u Beogradu.",
+      seo_title: "Sačuvan članak iz Google Sheets",
+      meta_description: "Praktičan vodič za roditelje koji traže proverene ideje za porodične aktivnosti i mesta u Beogradu.",
+      body_markdown: validGeneratedBody(),
+      tags: "rs",
+      source_urls: "https://example.com/source",
+      internal_links: allowedInternalUrl,
+      quality_score: 9,
+      qa_status: "pending",
+      qa_blockers: "",
+    });
+
+    await test.service.runManualOnce();
+
+    expect(checkpoints.load).not.toHaveBeenCalled();
+    expect(checkpoints.remove).toHaveBeenCalled();
+    expect(test.generate).not.toHaveBeenCalled();
+    expect(keyword.status).toBe("used");
+    expect(test.articleRows[0]).toMatchObject({ status: "needs_review" });
   });
 
   it("does not replay a paid initial attempt after a restart with no committed article", async () => {
@@ -955,7 +1321,7 @@ describe("manual generation worker", () => {
     });
   });
 
-  it("pauses generation and creates no review article when hero creation fails", async () => {
+  it("pauses generation but preserves the generated text when hero creation fails", async () => {
     const keyword = readyKeyword();
     const test = setup({
       keywords: [keyword],
@@ -968,7 +1334,9 @@ describe("manual generation worker", () => {
     await test.service.runManualOnce();
 
     expect(keyword.status).toBe("paused");
-    expect(test.articleRows).toHaveLength(0);
+    expect(test.articleRows).toHaveLength(1);
+    expect(test.articleRows[0]).toMatchObject({ status: "failed_generation" });
+    expect(String(test.articleRows[0]?.body_markdown)).toContain("Playroom vodič");
     const failure = test.events.at(-1);
     expect(failure).toMatchObject({ event_type: "generation_failed" });
     expect(String(failure?.message)).toContain("Hero image generation/upload failed");

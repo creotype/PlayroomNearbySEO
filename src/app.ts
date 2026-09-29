@@ -1,4 +1,5 @@
 import type { Server } from "node:http";
+import path from "node:path";
 import type { Logger } from "pino";
 import type { AppConfig } from "./config.js";
 import { isValidIanaTimeZone } from "./config.js";
@@ -14,6 +15,7 @@ import { AutoQaRepairService } from "./services/auto-qa-repair-service.js";
 import { EditorialAutomationService } from "./services/editorial-automation-service.js";
 import { GenerationService } from "./services/generation-service.js";
 import { HeroImageService } from "./services/hero-image-service.js";
+import { InitialGenerationCheckpointStore } from "./services/initial-generation-checkpoint-store.js";
 import { PublicationService } from "./services/publication-service.js";
 import { QualityGate } from "./services/quality-gate.js";
 import { ReviewNotifier } from "./services/review-notifier.js";
@@ -61,6 +63,11 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
         `${config.targetEnvironment}:${config.ghostAdminUrl}`,
       )
     : undefined;
+  const initialCheckpoints = generator
+    ? new InitialGenerationCheckpointStore(
+        path.resolve(config.heroImageCacheDir, "..", "generation-checkpoints"),
+      )
+    : undefined;
   const generation = new GenerationService(
     store,
     generator,
@@ -69,6 +76,7 @@ export async function startApp(config: AppConfig, logger: Logger): Promise<Runni
     qualityGate,
     workflowMutex,
     heroImages,
+    initialCheckpoints,
   );
   const publication = new PublicationService(store, ghost, config, logger, workflowMutex);
   const bot = createTelegramBot({ config, store, approvals, generation, publication, logger });

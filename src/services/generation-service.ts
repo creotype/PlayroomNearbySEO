@@ -13,13 +13,20 @@ import {
   type SheetRecord,
 } from "../domain/article.js";
 import {
+  GENERATED_QA_BLOCKER_CODES,
   isSemanticGeneratedQaBlocker,
   type GeneratedQaBlockerCode,
 } from "../domain/quality.js";
 import type { GeneratedArticle, OpenAiArticleGenerator } from "../generation/openai-generator.js";
+import {
+  classifyOpenAiApiError,
+  OPENAI_FAILURE_REASONS,
+  type OpenAiFailureReason,
+} from "../generation/openai-error.js";
 import { KeyedMutex } from "../lib/keyed-mutex.js";
 import type { AuditEvent, GoogleSheetsStore } from "../sheets/google-sheets.js";
 import type { HeroImageService } from "./hero-image-service.js";
+import type { InitialGenerationCheckpointStore } from "./initial-generation-checkpoint-store.js";
 import { QualityGate } from "./quality-gate.js";
 
 const CLAIMED_STATUS = "assigned";
@@ -43,7 +50,8 @@ export type ManualGenerationBlockReason =
   | "no_internal_links"
   | "active_review_exists"
   | "multiple_active_reviews"
-  | "generation_in_progress";
+  | "generation_in_progress"
+  | "previous_generation_failed";
 
 export type InvalidKeywordField = "keyword_id" | "locale" | "primary_keyword" | "article_id";
 
@@ -55,7 +63,7 @@ export type ManualGenerationRequest = {
 
 export type ManualGenerationResult =
   | {
-      outcome: "queued" | "already_queued" | "already_generated" | "previous_failed";
+      outcome: "queued" | "resumed" | "already_queued" | "already_generated" | "previous_failed";
       keywordId: string;
       articleId: string;
       locale: string;
@@ -128,6 +136,7 @@ export class GenerationService {
     private readonly qualityGate: QualityGate = new QualityGate(store, config),
     private readonly workflowMutex: KeyedMutex = new KeyedMutex(),
     private readonly heroImages?: HeroImageService,
+    private readonly initialCheckpoints?: InitialGenerationCheckpointStore,
   ) {}
 
   /** Scheduled queue. The Sheet generation_enabled flag is an absolute gate. */
@@ -146,11 +155,11 @@ export class GenerationService {
     if (!manualGenerationIsEnabled(this.config, settings)) {
       return { outcome: "blocked", reason: "manual_generation_disabled" };
     }
-    const articleId = manualRequestArticleId(request.providerObjectId);
+    const requestArticleId = manualRequestArticleId(request.providerObjectId);
     return this.#requestMutex.runExclusive("keyword-claim", async () => {
       const allKeywords = await this.store.listKeywords(undefined, { includeIncomplete: true });
       const existing = allKeywords.find(
-        (candidate) => stringCell(candidate.article_id).toLowerCase() === articleId.toLowerCase(),
+        (candidate) => stringCell(candidate.article_id).toLowerCase() === requestArticleId.toLowerCase(),
       );
       if (existing) {
         if (!(await this.#hasValidManualRequest(existing))) {
@@ -159,6 +168,30 @@ export class GenerationService {
           });
         }
         return resultForExistingKeyword(existing);
+      }
+      const duplicateEvent = await this.store.findEventByProviderObjectId(
+        "telegram",
+        request.providerObjectId,
+        "generation_requested",
+      );
+      if (duplicateEvent) {
+        const candidate = allKeywords.find(
+          (row) =>
+            stringCell(row.article_id).toLowerCase() ===
+              stringCell(duplicateEvent.article_id).toLowerCase(),
+        );
+        if (!candidate) {
+          return {
+            outcome: "blocked",
+            reason: "request_conflict",
+            articleId: stringCell(duplicateEvent.article_id),
+          };
+        }
+        const candidateArticleId = stringCell(candidate.article_id);
+        if (!(await this.#hasValidManualRequest(candidate))) {
+          return blockedForKeyword("request_conflict", candidate, { articleId: candidateArticleId });
+        }
+        return resultForExistingKeyword(candidate);
       }
 
       const activeGenerationRequests = allKeywords
@@ -200,7 +233,18 @@ export class GenerationService {
         });
       }
 
-      const keyword = allKeywords
+      const recoverable = await this.#recoverablePausedKeyword(allKeywords);
+      const unresolved = await this.#unresolvedPausedManualKeyword(allKeywords);
+      const [recoverableRank, unresolvedRank] = await Promise.all([
+        recoverable ? this.#pausedEventRank(recoverable) : Promise.resolve(-1),
+        unresolved ? this.#pausedEventRank(unresolved) : Promise.resolve(-1),
+      ]);
+      if (unresolved && (!recoverable || unresolvedRank > recoverableRank)) {
+        return blockedForKeyword("previous_generation_failed", unresolved, {
+          articleId: stringCell(unresolved.article_id),
+        });
+      }
+      const keyword = recoverable ?? allKeywords
         .filter((candidate) => stringCell(candidate.status) === "ready")
         .sort((left, right) => left.__rowNumber - right.__rowNumber)[0];
       if (!keyword) return { outcome: "blocked", reason: "no_ready_keywords" };
@@ -208,6 +252,8 @@ export class GenerationService {
       const keywordId = stringCell(keyword.keyword_id);
       const normalizedKeyword = normalizeManualKeyword(stringCell(keyword.primary_keyword));
       const locale = stringCell(keyword.locale).toLowerCase();
+      const isRecovery = Boolean(recoverable && recoverable.__rowNumber === keyword.__rowNumber);
+      const articleId = isRecovery ? stringCell(keyword.article_id) : requestArticleId;
       const invalidFields: InvalidKeywordField[] = [];
       if (!keywordId) invalidFields.push("keyword_id");
       if (!locale) invalidFields.push("locale");
@@ -218,7 +264,7 @@ export class GenerationService {
       ) {
         invalidFields.push("primary_keyword");
       }
-      if (stringCell(keyword.article_id)) invalidFields.push("article_id");
+      if (!isRecovery && stringCell(keyword.article_id)) invalidFields.push("article_id");
       if (invalidFields.length > 0) {
         return blockedForKeyword("invalid_keyword_row", keyword, {
           invalidFields,
@@ -269,10 +315,11 @@ export class GenerationService {
           keyword.__rowNumber,
           now,
           this.config.telegramBotToken,
+          isRecovery ? "paused" : "ready",
         ),
         {
-          status: "ready",
-          article_id: "",
+          status: isRecovery ? "paused" : "ready",
+          article_id: isRecovery ? articleId : "",
           locale: keyword.locale ?? "",
           primary_keyword: keyword.primary_keyword ?? "",
         },
@@ -281,7 +328,7 @@ export class GenerationService {
         return blockedForKeyword("keyword_row_changed", keyword);
       }
       return {
-        outcome: "queued",
+        outcome: isRecovery ? "resumed" : "queued",
         keywordId,
         articleId,
         locale,
@@ -626,29 +673,232 @@ export class GenerationService {
     return hasInternalLink ? undefined : "no_internal_links";
   }
 
+  async #recoverablePausedKeyword(allKeywords: SheetRecord[]): Promise<SheetRecord | undefined> {
+    const paused = await this.#pausedCandidatesNewestFirst(allKeywords);
+
+    for (const candidate of paused) {
+      const articleId = stringCell(candidate.article_id);
+      const article = await this.store.findArticle(articleId);
+      if (
+        article &&
+        stringCell(article.keyword_id) === stringCell(candidate.keyword_id) &&
+        stringCell(article.body_markdown) &&
+        ["generating", "qa_pending", "failed_generation"].includes(article.status)
+      ) {
+        return candidate;
+      }
+
+      if (this.initialCheckpoints) {
+        try {
+          const checkpoint = await this.initialCheckpoints.load(articleId);
+          if (checkpoint && checkpoint.keywordId === stringCell(candidate.keyword_id)) return candidate;
+        } catch (error) {
+          this.logger.error(
+            { articleId, err: error instanceof Error ? error.message : String(error) },
+            "Initial generation checkpoint could not be inspected",
+          );
+        }
+      }
+
+      const events = await this.store.listEvents(articleId);
+      const failure = latestEvent(
+        events,
+        (event) => ["generation_failed", "generation_blocked"].includes(stringCell(event.event_type)),
+      );
+      if (!failure) continue;
+      const request = latestEvent(
+        events,
+        (event) =>
+          stringCell(event.event_type) === "generation_requested" &&
+          stringCell(event.actor_type) === "telegram_user" &&
+          stringCell(event.provider) === "telegram",
+      );
+      const attempt = latestEvent(
+        events,
+        (event) => stringCell(event.event_type) === "generation_attempt_started",
+      );
+      const latestTerminal = latestEvent(
+        events,
+        (event) => [
+          "generation_requested",
+          "generation_attempt_started",
+          "generation_failed",
+          "generation_blocked",
+          "generated",
+        ].includes(stringCell(event.event_type)),
+      );
+      if (!isExplicitlyRecoverableStop(
+        failure,
+        candidate,
+        request,
+        attempt,
+        this.config.telegramBotToken,
+      )) continue;
+      if (!request || latestTerminal?.__rowNumber !== failure.__rowNumber) continue;
+      if (stringCell(failure.event_type) === "generation_failed") {
+        if (!attempt || !(request.__rowNumber < attempt.__rowNumber && attempt.__rowNumber < failure.__rowNumber)) {
+          continue;
+        }
+      } else if (!(request.__rowNumber < failure.__rowNumber)) {
+        continue;
+      }
+      if (await this.#hasValidManualRequest(candidate)) return candidate;
+    }
+    return undefined;
+  }
+
+  async #unresolvedPausedManualKeyword(allKeywords: SheetRecord[]): Promise<SheetRecord | undefined> {
+    const paused = await this.#pausedCandidatesNewestFirst(allKeywords);
+    for (const candidate of paused) {
+      const events = await this.store.listEvents(stringCell(candidate.article_id));
+      const request = latestEvent(
+        events,
+        (event) =>
+          stringCell(event.event_type) === "generation_requested" &&
+          stringCell(event.actor_type) === "telegram_user" &&
+          stringCell(event.provider) === "telegram",
+      );
+      if (request) return candidate;
+    }
+    return undefined;
+  }
+
+  async #pausedCandidatesNewestFirst(allKeywords: SheetRecord[]): Promise<SheetRecord[]> {
+    const candidates = allKeywords
+      .filter((candidate) => stringCell(candidate.status) === "paused")
+      .filter((candidate) => Boolean(stringCell(candidate.keyword_id) && stringCell(candidate.article_id)));
+    const ranked = await Promise.all(
+      candidates.map(async (candidate) => ({
+        candidate,
+        rank: await this.#pausedEventRank(candidate),
+      })),
+    );
+    return ranked
+      .sort((left, right) =>
+        right.rank - left.rank ||
+        right.candidate.__rowNumber - left.candidate.__rowNumber,
+      )
+      .map(({ candidate }) => candidate);
+  }
+
+  async #pausedEventRank(keyword: SheetRecord): Promise<number> {
+    const articleId = stringCell(keyword.article_id);
+    if (!articleId) return -1;
+    const events = await this.store.listEvents(articleId);
+    const latestRequest = latestEvent(
+      events,
+      (event) =>
+        stringCell(event.event_type) === "generation_requested" &&
+        stringCell(event.actor_type) === "telegram_user" &&
+        stringCell(event.provider) === "telegram",
+    );
+    if (latestRequest) return latestRequest.__rowNumber;
+    return events
+      .filter((event) => [
+        "generation_attempt_started",
+        "hero_image_attempt_started",
+        "generation_failed",
+        "generation_blocked",
+        "generated",
+      ].includes(stringCell(event.event_type)))
+      .reduce((latest, event) => Math.max(latest, event.__rowNumber), -1);
+  }
+
   async #generateKeyword(keyword: SheetRecord, settings: Map<string, CellValue>): Promise<void> {
     const keywordId = stringCell(keyword.keyword_id);
     const articleId = stringCell(keyword.article_id) || createArticleId();
-    const existingArticle = await this.store.findArticle(articleId);
-    if (existingArticle) {
-      await this.#completeKeyword(keyword, articleId, existingArticle.status);
+    const priorEvents = await this.store.listEvents(articleId);
+    const requestEvent = latestEvent(
+      priorEvents,
+      (event) =>
+        stringCell(event.event_type) === "generation_requested" &&
+        stringCell(event.actor_type) === "telegram_user" &&
+        stringCell(event.provider) === "telegram" &&
+        Boolean(stringCell(event.provider_object_id)),
+    );
+    const requestKey = requestEvent
+      ? stringCell(requestEvent.provider_object_id)
+      : `scheduled:${keywordId}:${articleId}`;
+    let article = await this.store.findArticle(articleId);
+    if (article && stringCell(article.body_markdown)) {
+      const latestHeroAttempt = latestEvent(
+        priorEvents,
+        (event) => stringCell(event.event_type) === "hero_image_attempt_started",
+      );
+      if (
+        !stringCell(article.feature_image_url) &&
+        latestHeroAttempt &&
+        (!requestEvent || latestHeroAttempt.__rowNumber > requestEvent.__rowNumber)
+      ) {
+        await this.#failKeyword(
+          keyword,
+          new Error("A previous hero-image attempt ended without a committed image; automatic replay is disabled"),
+          "hero_image",
+        );
+        return;
+      }
+      await this.#removeInitialCheckpointBestEffort(articleId);
+      if (["generating", "qa_pending", "failed_generation"].includes(article.status)) {
+        await this.store.patchKeyword(keywordId, {
+          status: "generating",
+          updated_at: new Date().toISOString(),
+        });
+        await this.#finishInitialArticle(keyword, article);
+      } else {
+        await this.#completeKeyword(keyword, articleId, article.status);
+      }
       return;
     }
-    const priorEvents = await this.store.listEvents(articleId);
-    if (
-      priorEvents.some((event) =>
-        ["generation_failed", "generation_blocked"].includes(stringCell(event.event_type)),
-      )
-    ) {
+
+    let checkpoint;
+    try {
+      checkpoint = await this.initialCheckpoints?.load(articleId);
+    } catch (error) {
+      await this.#failKeyword(keyword, error, "article_persist");
+      return;
+    }
+
+    if (checkpoint) {
+      if (checkpoint.keywordId !== keywordId) {
+        await this.#failKeyword(
+          keyword,
+          new Error(`Saved generation checkpoint belongs to a different keyword`),
+          "article_persist",
+        );
+        return;
+      }
+      article = article ?? await this.#ensureInitialArticle(keyword, articleId);
+      try {
+        article = await this.#persistGeneratedText(articleId, checkpoint.generated);
+        await this.#removeInitialCheckpointBestEffort(articleId);
+        await this.store.patchKeyword(keywordId, {
+          status: "generating",
+          updated_at: new Date().toISOString(),
+        });
+      } catch (error) {
+        await this.#failKeyword(keyword, error, "article_persist");
+        return;
+      }
+      await this.#finishInitialArticle(keyword, article);
+      return;
+    }
+
+    const latestFailure = latestEvent(
+      priorEvents,
+      (event) => ["generation_failed", "generation_blocked"].includes(stringCell(event.event_type)),
+    );
+    if (latestFailure && (!requestEvent || latestFailure.__rowNumber > requestEvent.__rowNumber)) {
       await this.store.patchKeyword(keywordId, {
         status: "paused",
         updated_at: new Date().toISOString(),
       });
       return;
     }
-    if (
-      priorEvents.some((event) => stringCell(event.event_type) === "generation_attempt_started")
-    ) {
+    const latestAttempt = latestEvent(
+      priorEvents,
+      (event) => stringCell(event.event_type) === "generation_attempt_started",
+    );
+    if (latestAttempt && (!requestEvent || latestAttempt.__rowNumber > requestEvent.__rowNumber)) {
       await this.#failKeyword(
         keyword,
         new Error("A previous paid generation attempt ended without a committed article; automatic replay is disabled"),
@@ -657,7 +907,18 @@ export class GenerationService {
       return;
     }
 
-    let generated;
+    try {
+      article = article ?? await this.#ensureInitialArticle(keyword, articleId);
+      await this.store.patchKeyword(keywordId, {
+        status: "generating",
+        updated_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      await this.#failKeyword(keyword, error, "article_persist");
+      return;
+    }
+
+    let generated: GeneratedArticle;
     try {
       const [guardrails, links] = await Promise.all([
         this.store.listGuardrails(),
@@ -665,7 +926,7 @@ export class GenerationService {
       ]);
       const targetWords = numberCell(settings.get("default_article_length_words")) || 1_200;
       await this.store.appendEvent({
-        event_id: stableEventId("generation_attempt_started", articleId),
+        event_id: stableEventId("generation_attempt_started", `${articleId}:${requestKey}`),
         article_id: articleId,
         event_type: "generation_attempt_started",
         from_status: CLAIMED_STATUS,
@@ -690,67 +951,231 @@ export class GenerationService {
       return;
     }
 
+    let checkpointSaved = false;
+    if (this.initialCheckpoints) {
+      try {
+        await this.initialCheckpoints.save({
+          version: 1,
+          articleId,
+          keywordId,
+          requestKey,
+          model: this.config.openAiModel,
+          generated,
+          createdAt: new Date().toISOString(),
+        });
+        checkpointSaved = true;
+      } catch (error) {
+        this.logger.error(
+          { keywordId, articleId, err: error instanceof Error ? error.message : String(error) },
+          "Could not save the local paid-result checkpoint; attempting the Sheet write",
+        );
+      }
+    }
+    try {
+      article = await this.#persistGeneratedText(articleId, generated);
+      if (checkpointSaved) await this.#removeInitialCheckpointBestEffort(articleId);
+    } catch (error) {
+      const recovered = await this.store.findArticle(articleId);
+      if (!recovered || !stringCell(recovered.body_markdown)) {
+        await this.#failKeyword(keyword, error, "article_persist");
+        return;
+      }
+      article = recovered;
+      if (checkpointSaved) await this.#removeInitialCheckpointBestEffort(articleId);
+      this.logger.warn({ keywordId, articleId }, "Generated text write response failed but the article text exists");
+    }
+    await this.#finishInitialArticle(keyword, article);
+  }
+
+  async #ensureInitialArticle(keyword: SheetRecord, articleId: string): Promise<Article> {
+    const existing = await this.store.findArticle(articleId);
+    if (existing) return existing;
     const now = new Date().toISOString();
-    const generatedFields = generatedArticleFields(generated);
     const values: Record<string, CellValue> = {
       article_id: articleId,
-      keyword_id: keywordId,
-      translation_group_id: `TG-${keywordId}`,
+      keyword_id: stringCell(keyword.keyword_id),
+      translation_group_id: `TG-${stringCell(keyword.keyword_id)}`,
       locale: stringCell(keyword.locale),
-      status: "needs_review",
+      status: "generating",
       primary_keyword: stringCell(keyword.primary_keyword),
       secondary_keywords: stringCell(keyword.secondary_keywords),
       search_intent: stringCell(keyword.search_intent),
       article_type: stringCell(keyword.article_type),
       topic: stringCell(keyword.topic_angle) || stringCell(keyword.primary_keyword),
-      ...generatedFields,
+      title: "",
+      slug: "",
+      excerpt: "",
+      seo_title: "",
+      meta_description: "",
+      body_markdown: "",
+      tags: "",
+      source_urls: "",
+      internal_links: "",
       scheduled_publish_at: keyword.planned_publish_at ?? "",
-      quality_score: generated.quality_score,
-      qa_status: "pass",
+      quality_score: 0,
+      qa_status: "pending",
       qa_blockers: "",
       manual_required: false,
       revision_count: 0,
+      last_error: "",
       created_at: now,
       updated_at: now,
     };
     try {
-      Object.assign(
-        values,
-        await this.#prepareHeroImage({ ...values, __rowNumber: 0 } as Article),
-      );
+      await this.store.appendArticle(values);
+    } catch (error) {
+      const recovered = await this.store.findArticle(articleId);
+      if (!recovered) throw error;
+      return recovered;
+    }
+    const appended = await this.store.findArticle(articleId);
+    if (!appended) throw new Error(`Initial article placeholder was not committed: ${articleId}`);
+    return appended;
+  }
+
+  async #persistGeneratedText(articleId: string, generated: GeneratedArticle): Promise<Article> {
+    const now = new Date().toISOString();
+    const patch: Record<string, CellValue> = {
+      ...generatedArticleFields(generated),
+      status: "generating",
+      qa_status: "pending",
+      qa_blockers: generated.qa_blockers.join(","),
+      manual_required: generated.qa_blockers.some(isSemanticGeneratedQaBlocker),
+      quality_score: generated.quality_score,
+      last_error: "",
+      updated_at: now,
+    };
+    patch.content_hash = articleContentHash({ ...patch, __rowNumber: 0 });
+    return this.store.patchArticle(articleId, patch);
+  }
+
+  async #finishInitialArticle(keyword: SheetRecord, input: Article): Promise<void> {
+    const articleId = input.article_id;
+    let article = input;
+    if (article.status === "failed_generation") {
+      try {
+        article = await this.store.patchArticle(articleId, {
+          status: "generating",
+          last_error: "",
+          updated_at: new Date().toISOString(),
+        });
+      } catch (error) {
+        await this.#failKeyword(keyword, error, "article_persist");
+        return;
+      }
+    }
+    try {
+      let heroPatch: Record<string, CellValue> = {};
+      if (!stringCell(article.feature_image_url)) {
+        await this.#recordHeroImageAttempt(article);
+        heroPatch = await this.#prepareHeroImage(article);
+      }
+      article = await this.store.patchArticle(articleId, {
+        ...heroPatch,
+        status: "qa_pending",
+        last_error: "",
+        updated_at: new Date().toISOString(),
+      });
     } catch (error) {
       await this.#failKeyword(keyword, error, "hero_image");
       return;
     }
+
+    const modelBlockers = parseListCell(article.qa_blockers).filter(
+      (blocker): blocker is GeneratedQaBlockerCode =>
+        GENERATED_QA_BLOCKER_CODES.includes(blocker as GeneratedQaBlockerCode),
+    );
+    let quality: { blockers: string[]; manualRequired: boolean };
     try {
-      const quality = await this.#evaluateGeneratedCandidate(
-        { ...values, __rowNumber: 0 } as Article,
-        generated.qa_blockers,
-      );
-      values.qa_status = quality.blockers.length === 0 ? "pass" : "fail";
-      values.qa_blockers = quality.blockers.join(",");
-      values.manual_required = quality.manualRequired;
+      quality = await this.#evaluateGeneratedCandidate(article, modelBlockers);
     } catch (error) {
       await this.#failKeyword(keyword, error, "quality_gate");
       return;
     }
-    const finalStatus = stringCell(values.qa_status) === "pass" && !booleanCell(values.manual_required)
+    const qaStatus = quality.blockers.length === 0 ? "pass" : "fail";
+    const finalStatus = qaStatus === "pass" && !quality.manualRequired
       ? "needs_review"
       : "failed_qa";
-    values.status = finalStatus;
-    values.content_hash = articleContentHash({ ...values, __rowNumber: 0 } as SheetRecord);
-
     try {
-      await this.store.appendArticle(values);
+      const finalPatch: Record<string, CellValue> = {
+        status: finalStatus,
+        qa_status: qaStatus,
+        qa_blockers: quality.blockers.join(","),
+        manual_required: quality.manualRequired,
+        last_error: "",
+        updated_at: new Date().toISOString(),
+      };
+      finalPatch.content_hash = articleContentHash({ ...article, ...finalPatch });
+      article = await this.store.patchArticle(articleId, finalPatch);
     } catch (error) {
       const recovered = await this.store.findArticle(articleId);
-      if (!recovered) {
+      if (!recovered || !["needs_review", "failed_qa"].includes(recovered.status)) {
         await this.#failKeyword(keyword, error, "article_persist");
         return;
       }
-      this.logger.warn({ keywordId, articleId }, "Article append response failed but the article exists");
+      this.logger.warn(
+        { keywordId: stringCell(keyword.keyword_id), articleId },
+        "Article finalization response failed but the final article exists",
+      );
+      article = recovered;
     }
-    await this.#completeKeyword(keyword, articleId, finalStatus);
+    await this.#completeKeyword(keyword, articleId, article.status);
+  }
+
+  async #recordHeroImageAttempt(article: Article): Promise<void> {
+    const events = await this.store.listEvents(article.article_id);
+    const request = latestEvent(
+      events,
+      (event) =>
+        stringCell(event.event_type) === "generation_requested" &&
+        stringCell(event.actor_type) === "telegram_user" &&
+        stringCell(event.provider) === "telegram",
+    );
+    const requestId = stringCell(request?.provider_object_id) || "scheduled";
+    await this.store.appendEvent({
+      event_id: stableEventId("hero_image_attempt_started", `${article.article_id}:${requestId}`),
+      article_id: article.article_id,
+      event_type: "hero_image_attempt_started",
+      from_status: article.status,
+      to_status: article.status,
+      actor_type: "system",
+      actor_id: "hero-image-generator",
+      provider: "openai",
+      message: `Hero image attempt started for ${article.article_id}`,
+      payload_json: JSON.stringify({
+        keyword_id: stringCell(article.keyword_id),
+        request_id: requestId,
+        model: this.config.openAiImageModel,
+      }),
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  async #markArticleGenerationFailure(articleId: string, error: unknown): Promise<void> {
+    try {
+      await this.store.patchArticle(articleId, {
+        status: "failed_generation",
+        last_error: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+        updated_at: new Date().toISOString(),
+      });
+    } catch (patchError) {
+      this.logger.warn(
+        { articleId, err: patchError instanceof Error ? patchError.message : String(patchError) },
+        "Could not mark the saved article text as failed_generation",
+      );
+    }
+  }
+
+  async #removeInitialCheckpointBestEffort(articleId: string): Promise<void> {
+    if (!this.initialCheckpoints) return;
+    try {
+      await this.initialCheckpoints.remove(articleId);
+    } catch (error) {
+      this.logger.warn(
+        { articleId, err: error instanceof Error ? error.message : String(error) },
+        "Could not remove an obsolete initial-generation checkpoint",
+      );
+    }
   }
 
   async #completeKeyword(
@@ -773,7 +1198,7 @@ export class GenerationService {
         event_id: eventId,
         article_id: articleId,
         event_type: "generated",
-        from_status: CLAIMED_STATUS,
+        from_status: "generating",
         to_status: articleStatus,
         actor_type: "system",
         actor_id: "generator",
@@ -797,10 +1222,50 @@ export class GenerationService {
     const keywordId = stringCell(keyword.keyword_id);
     const articleId = stringCell(keyword.article_id);
     const message = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+    const reason = classifyOpenAiApiError(error);
     this.logger.error({ keywordId, err: message }, "Article generation failed");
     const now = new Date().toISOString();
-    const eventId = stableEventId("generation_failed", `${articleId}:${message}`);
     if (!articleId) throw new Error(`Keyword ${keywordId} has no reserved article ID`);
+    const failedFromStatus = (await this.store.findArticle(articleId))?.status ||
+      stringCell(keyword.status) || CLAIMED_STATUS;
+    const failureEvents = await this.store.listEvents(articleId);
+    const requestEvent = latestEvent(
+      failureEvents,
+      (event) =>
+        stringCell(event.event_type) === "generation_requested" &&
+        stringCell(event.actor_type) === "telegram_user" &&
+        stringCell(event.provider) === "telegram",
+    );
+    const requestId = stringCell(requestEvent?.provider_object_id) || "scheduled";
+    const attemptEvent = latestEvent(
+      failureEvents,
+      (event) => stringCell(event.event_type) === "generation_attempt_started",
+    );
+    const eventId = stableEventId(
+      "generation_failed",
+      `${articleId}:${requestId}:${stage}:${message}`,
+    );
+    const httpStatus = typeof (error as { status?: unknown })?.status === "number"
+      ? Number((error as { status: number }).status)
+      : undefined;
+    const retryProof = reason &&
+        stage === "article_generation" &&
+        requestEvent &&
+        attemptEvent &&
+        httpStatus !== undefined
+      ? openAiFailureRetryProof(
+          this.config.telegramBotToken,
+          eventId,
+          articleId,
+          keywordId,
+          stringCell(requestEvent.event_id),
+          requestId,
+          stringCell(attemptEvent.event_id),
+          stage,
+          reason,
+          httpStatus,
+        )
+      : undefined;
     await this.store.patchKeywordAndAppendEvent(
       keywordId,
       {
@@ -812,16 +1277,26 @@ export class GenerationService {
         event_id: eventId,
         article_id: articleId,
         event_type: "generation_failed",
-        from_status: CLAIMED_STATUS,
+        from_status: failedFromStatus,
         to_status: "paused",
         actor_type: "system",
         actor_id: "generator",
         provider: "openai",
         message,
-        payload_json: JSON.stringify({ keyword_id: keywordId, stage }),
+        payload_json: JSON.stringify({
+          keyword_id: keywordId,
+          stage,
+          request_id: requestId,
+          ...(requestEvent ? { request_event_id: stringCell(requestEvent.event_id) } : {}),
+          ...(attemptEvent ? { attempt_event_id: stringCell(attemptEvent.event_id) } : {}),
+          ...(httpStatus !== undefined ? { http_status: httpStatus } : {}),
+          ...(reason ? { reason } : {}),
+          ...(retryProof ? { retry_proof: retryProof } : {}),
+        }),
         created_at: now,
       },
     );
+    await this.#markArticleGenerationFailure(articleId, error);
   }
 
   async #blockKeyword(keyword: SheetRecord, reason: string): Promise<void> {
@@ -829,6 +1304,26 @@ export class GenerationService {
     const articleId = stringCell(keyword.article_id);
     if (!articleId) throw new Error(`Keyword ${keywordId} has no reserved article ID`);
     const now = new Date().toISOString();
+    const requestEvent = latestEvent(
+      await this.store.listEvents(articleId),
+      (event) =>
+        stringCell(event.event_type) === "generation_requested" &&
+        stringCell(event.actor_type) === "telegram_user" &&
+        stringCell(event.provider) === "telegram",
+    );
+    const requestId = stringCell(requestEvent?.provider_object_id) || "scheduled";
+    const eventId = stableEventId("generation_blocked", `${articleId}:${requestId}:${reason}`);
+    const retryProof = requestEvent
+      ? manualBlockRetryProof(
+          this.config.telegramBotToken,
+          eventId,
+          articleId,
+          keywordId,
+          stringCell(requestEvent.event_id),
+          requestId,
+          reason,
+        )
+      : undefined;
     await this.store.patchKeywordAndAppendEvent(
       keywordId,
       {
@@ -837,7 +1332,7 @@ export class GenerationService {
         updated_at: now,
       },
       {
-        event_id: stableEventId("generation_blocked", `${articleId}:${reason}`),
+        event_id: eventId,
         article_id: articleId,
         event_type: "generation_blocked",
         from_status: CLAIMED_STATUS,
@@ -846,7 +1341,13 @@ export class GenerationService {
         actor_id: "generator",
         provider: "system",
         message: reason,
-        payload_json: JSON.stringify({ keyword_id: keywordId, reason }),
+        payload_json: JSON.stringify({
+          keyword_id: keywordId,
+          reason,
+          request_id: requestId,
+          ...(requestEvent ? { request_event_id: stringCell(requestEvent.event_id) } : {}),
+          ...(retryProof ? { retry_proof: retryProof } : {}),
+        }),
         created_at: now,
       },
     );
@@ -903,7 +1404,8 @@ export class GenerationService {
     const articleId = stringCell(keyword.article_id);
     if (!articleId) return undefined;
     const events = await this.store.listEvents(articleId);
-    return events.find(
+    return latestEvent(
+      events,
       (candidate) =>
         stringCell(candidate.event_type) === "generation_requested" &&
         stringCell(candidate.actor_type) === "telegram_user" &&
@@ -971,6 +1473,7 @@ function requestedEvent(
   keywordRow: number,
   createdAt: string,
   signingSecret: string,
+  fromStatus: "ready" | "paused" = "ready",
 ): AuditEvent {
   const actorId = String(request.actorId);
   const signature = manualRequestSignature(
@@ -987,13 +1490,13 @@ function requestedEvent(
     event_id: stableEventId("generation_requested", request.providerObjectId),
     article_id: articleId,
     event_type: "generation_requested",
-    from_status: "ready",
+    from_status: fromStatus,
     to_status: CLAIMED_STATUS,
     actor_type: "telegram_user",
     actor_id: actorId,
     provider: "telegram",
     provider_object_id: request.providerObjectId,
-    message: `Next-keyword generation requested for ${keyword}`,
+    message: `${fromStatus === "paused" ? "Recovery" : "Next-keyword"} generation requested for ${keyword}`,
     payload_json: JSON.stringify({
       request_kind: "sheet_queue",
       keyword_id: keywordId,
@@ -1079,6 +1582,182 @@ function resultForExistingKeyword(keyword: SheetRecord): Exclude<ManualGeneratio
     keyword: normalizeManualKeyword(stringCell(keyword.primary_keyword)),
     rowNumber: keyword.__rowNumber,
   };
+}
+
+function latestEvent(
+  events: SheetRecord[],
+  predicate: (event: SheetRecord) => boolean,
+): SheetRecord | undefined {
+  return events
+    .filter(predicate)
+    .sort((left, right) =>
+      right.__rowNumber - left.__rowNumber ||
+      stringCell(right.created_at).localeCompare(stringCell(left.created_at)),
+    )[0];
+}
+
+function storedOpenAiFailureReason(
+  event: SheetRecord,
+  keyword: SheetRecord,
+  request: SheetRecord | undefined,
+  attempt: SheetRecord | undefined,
+  signingSecret: string,
+): OpenAiFailureReason | undefined {
+  if (
+    stringCell(event.event_type) !== "generation_failed" ||
+    stringCell(event.provider).toLowerCase() !== "openai" ||
+    stringCell(event.actor_type) !== "system" ||
+    stringCell(event.actor_id) !== "generator" ||
+    stringCell(event.to_status) !== "paused"
+  ) {
+    return undefined;
+  }
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(stringCell(event.payload_json)) as Record<string, unknown>;
+    if (payload.stage !== "article_generation") return undefined;
+    if (payload.keyword_id !== stringCell(keyword.keyword_id)) return undefined;
+    const reason = typeof payload.reason === "string" ? payload.reason : "";
+    if (OPENAI_FAILURE_REASONS.includes(reason as OpenAiFailureReason)) {
+      if (!request || !attempt) return undefined;
+      const typedReason = reason as OpenAiFailureReason;
+      const httpStatus = Number(payload.http_status);
+      if (!openAiFailureStatusMatchesReason(httpStatus, typedReason)) return undefined;
+      if (
+        payload.request_id !== stringCell(request.provider_object_id) ||
+        payload.request_event_id !== stringCell(request.event_id) ||
+        payload.attempt_event_id !== stringCell(attempt.event_id) ||
+        typeof payload.retry_proof !== "string"
+      ) {
+        return undefined;
+      }
+      const expected = openAiFailureRetryProof(
+        signingSecret,
+        stringCell(event.event_id),
+        stringCell(keyword.article_id),
+        stringCell(keyword.keyword_id),
+        stringCell(request.event_id),
+        stringCell(request.provider_object_id),
+        stringCell(attempt.event_id),
+        "article_generation",
+        typedReason,
+        httpStatus,
+      );
+      return signaturesEqual(payload.retry_proof, expected) ? typedReason : undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  const message = stringCell(event.message).trim();
+  if (
+    stringCell(keyword.keyword_id) === "KW-CLIENT-006" &&
+    stringCell(keyword.article_id) === "SEO-TG-4C9E16E19436" &&
+    stringCell(request?.event_id) === "evt-generation_requested-6edea860bb804cd700482de9" &&
+    stringCell(attempt?.event_id) === "evt-generation_attempt_started-797c1815321f60bfa6e57b2e" &&
+    stringCell(event.event_id) === "evt-generation_failed-731cd5df27d4390fcf50c865" &&
+    message ===
+      "429 You have no credits remaining. Add credits to continue using the API at https://platform.openai.com/settings/organization/billing/."
+  ) {
+    return "openai_credit_balance_exhausted";
+  }
+  return undefined;
+}
+
+function isExplicitlyRecoverableStop(
+  event: SheetRecord,
+  keyword: SheetRecord,
+  request: SheetRecord | undefined,
+  attempt: SheetRecord | undefined,
+  signingSecret: string,
+): boolean {
+  if (storedOpenAiFailureReason(event, keyword, request, attempt, signingSecret)) return true;
+  if (
+    stringCell(event.event_type) !== "generation_blocked" ||
+    stringCell(event.actor_type) !== "system" ||
+    stringCell(event.actor_id) !== "generator" ||
+    stringCell(event.provider) !== "system" ||
+    stringCell(event.to_status) !== "paused" ||
+    !request
+  ) {
+    return false;
+  }
+  try {
+    const payload = JSON.parse(stringCell(event.payload_json)) as Record<string, unknown>;
+    if (payload.keyword_id !== stringCell(keyword.keyword_id)) return false;
+    const reason = typeof payload.reason === "string" ? payload.reason : "";
+    if (!["ru_disabled", "locale_disabled", "no_internal_links"].includes(reason)) return false;
+    if (
+      payload.request_id !== stringCell(request.provider_object_id) ||
+      payload.request_event_id !== stringCell(request.event_id) ||
+      typeof payload.retry_proof !== "string"
+    ) {
+      return false;
+    }
+    const expected = manualBlockRetryProof(
+      signingSecret,
+      stringCell(event.event_id),
+      stringCell(keyword.article_id),
+      stringCell(keyword.keyword_id),
+      stringCell(request.event_id),
+      stringCell(request.provider_object_id),
+      reason,
+    );
+    return signaturesEqual(payload.retry_proof, expected);
+  } catch {
+    return false;
+  }
+}
+
+function openAiFailureStatusMatchesReason(status: number, reason: OpenAiFailureReason): boolean {
+  return reason === "openai_authentication_failed"
+    ? status === 401 || status === 403
+    : status === 429;
+}
+
+function openAiFailureRetryProof(
+  secret: string,
+  failureEventId: string,
+  articleId: string,
+  keywordId: string,
+  requestEventId: string,
+  requestProviderObjectId: string,
+  attemptEventId: string,
+  stage: GenerationFailureStage,
+  reason: OpenAiFailureReason,
+  httpStatus: number,
+): string {
+  return createHmac("sha256", secret).update([
+    "v1",
+    failureEventId,
+    articleId,
+    keywordId,
+    requestEventId,
+    requestProviderObjectId,
+    attemptEventId,
+    stage,
+    reason,
+    String(httpStatus),
+  ].join("\n")).digest("hex");
+}
+
+function manualBlockRetryProof(
+  secret: string,
+  blockEventId: string,
+  articleId: string,
+  keywordId: string,
+  requestEventId: string,
+  requestProviderObjectId: string,
+  reason: string,
+): string {
+  return createHmac("sha256", secret).update([
+    "v1",
+    blockEventId,
+    articleId,
+    keywordId,
+    requestEventId,
+    requestProviderObjectId,
+    reason,
+  ].join("\n")).digest("hex");
 }
 
 function isDue(keyword: SheetRecord, timeZone: string): boolean {
