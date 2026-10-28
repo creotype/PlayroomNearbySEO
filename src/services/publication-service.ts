@@ -870,7 +870,7 @@ function normalizeGhostHtml(value: string | null | undefined): string {
     .replace(/<!--\s*kg-card-(?:begin|end):\s*html\s*-->/giu, "")
     .replace(/(<h[1-6])\s+id="[^"]*"/giu, "$1")
     .replace(/\r\n?/gu, "\n")
-    .replace(/>\s+</gu, "><")
+    .replace(/>[^\S\n]*\n\s*</gu, "><")
     .trim();
 }
 
