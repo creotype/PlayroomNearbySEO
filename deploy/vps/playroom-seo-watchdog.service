@@ -1,0 +1,11 @@
+[Unit]
+Description=Restart only the Playroom SEO bot when Docker marks it unhealthy
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/playroom-seo-bot/repo/deploy/vps/watchdog.sh
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true

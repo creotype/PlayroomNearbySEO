@@ -12,6 +12,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+COPY assets/mascot/leo ./assets/mascot/leo
+RUN mkdir -p /app/data/hero-images && chown -R node:node /app/data
 USER node
 EXPOSE 8080
 CMD ["node", "dist/src/index.js"]

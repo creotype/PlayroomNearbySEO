@@ -39,6 +39,12 @@ describe("articleContentHash", () => {
       articleContentHash(article({ body_markdown: "A\nB" })),
     );
   });
+
+  it("normalizes scheduled publication across ISO and Google serial values", () => {
+    expect(
+      articleContentHash(article({ scheduled_publish_at: "2026-09-17T08:00:00.000Z" })),
+    ).toBe(articleContentHash(article({ scheduled_publish_at: 46282.416666666664 })));
+  });
 });
 
 describe("dateCell", () => {
