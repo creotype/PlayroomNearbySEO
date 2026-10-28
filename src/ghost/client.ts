@@ -8,6 +8,13 @@ export type GhostPost = {
   url: string;
   updated_at: string;
   published_at?: string | null;
+  html?: string;
+  custom_excerpt?: string | null;
+  meta_title?: string | null;
+  meta_description?: string | null;
+  feature_image?: string | null;
+  feature_image_alt?: string | null;
+  tags?: Array<{ name: string }>;
 };
 
 export type GhostUser = {
@@ -94,7 +101,7 @@ export class GhostAdminClient {
 
   async findPostBySlug(slug: string): Promise<GhostPost | undefined> {
     const response = await this.#request<GhostEnvelope>(
-      `posts/slug/${encodeURIComponent(slug)}/?fields=id,title,slug,status,url,updated_at,published_at`,
+      `posts/slug/${encodeURIComponent(slug)}/?formats=html&include=tags`,
       undefined,
       [404],
     );

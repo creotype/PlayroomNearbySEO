@@ -4,21 +4,10 @@ import { GhostAdminClient } from "../src/ghost/client.js";
 afterEach(() => vi.unstubAllGlobals());
 
 describe("GhostAdminClient post reads", () => {
-  it.each([
-    {
-      name: "id",
-      invoke: (client: GhostAdminClient) => client.readPost("post/id"),
-      pathname: "/internal/ghost/api/admin/posts/post%2Fid/",
-    },
-    {
-      name: "slug",
-      invoke: (client: GhostAdminClient) => client.findPostBySlug("article/slug"),
-      pathname: "/internal/ghost/api/admin/posts/slug/article%2Fslug/",
-    },
-  ])("reads a post by $name without requesting rendered content", async ({ invoke, pathname }) => {
+  it("reads a post by id without requesting rendered content", async () => {
     const fetchMock = vi.fn(async (input: string | URL) => {
       const url = new URL(String(input));
-      expect(url.pathname).toBe(pathname);
+      expect(url.pathname).toBe("/internal/ghost/api/admin/posts/post%2Fid/");
       expect(url.searchParams.get("fields")).toBe(
         "id,title,slug,status,url,updated_at,published_at",
       );
@@ -42,7 +31,43 @@ describe("GhostAdminClient post reads", () => {
       apiVersion: "v5.0",
     });
 
-    await expect(invoke(client)).resolves.toMatchObject({ id: "post-1", status: "draft" });
+    await expect(client.readPost("post/id")).resolves.toMatchObject({ id: "post-1", status: "draft" });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("reads the full post payload by slug for collision reconciliation", async () => {
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = new URL(String(input));
+      expect(url.pathname).toBe("/internal/ghost/api/admin/posts/slug/article%2Fslug/");
+      expect(url.searchParams.get("formats")).toBe("html");
+      expect(url.searchParams.get("include")).toBe("tags");
+      expect(url.searchParams.has("fields")).toBe(false);
+      return new Response(JSON.stringify({
+        posts: [{
+          id: "post-1",
+          title: "Article",
+          slug: "article",
+          status: "draft",
+          url: "https://example.com/article/",
+          updated_at: "2026-09-16T13:00:00.000Z",
+          published_at: null,
+          html: "<p>Body</p>",
+          tags: [{ name: "en" }],
+        }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new GhostAdminClient({
+      url: "https://example.com/internal",
+      apiKey: "abcdef:0123456789abcdef0123456789abcdef",
+      apiVersion: "v5.0",
+    });
+
+    await expect(client.findPostBySlug("article/slug")).resolves.toMatchObject({
+      id: "post-1",
+      html: "<p>Body</p>",
+      tags: [{ name: "en" }],
+    });
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 

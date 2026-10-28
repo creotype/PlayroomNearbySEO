@@ -4,7 +4,7 @@ import type { AppConfig } from "../config.js";
 import type { Article, CellValue, SheetRecord } from "../domain/article.js";
 import { articleContentHash, booleanCell, dateCell, stringCell } from "../domain/article.js";
 import { assertTransition } from "../domain/transitions.js";
-import type { GhostAdminClient, GhostPost } from "../ghost/client.js";
+import type { GhostAdminClient, GhostPost, GhostPostInput } from "../ghost/client.js";
 import { buildGhostPayload, ghostArticleSlug, publicArticleUrl } from "../ghost/payload.js";
 import { KeyedMutex } from "../lib/keyed-mutex.js";
 import type { GoogleSheetsStore } from "../sheets/google-sheets.js";
@@ -393,24 +393,31 @@ export class PublicationService {
       if (!post) throw new Error(`Stored Ghost post ${storedId} no longer exists`);
       if (post.slug !== expectedSlug) throw new Error(`Ghost slug conflict for stored post ${storedId}`);
     } else {
+      const draftPayload = await buildGhostPayload(article, "draft");
       const collision = await ghostStep(
         "Ghost preflight slug lookup failed",
         () => this.ghost.findPostBySlug(expectedSlug),
       );
-      if (collision) throw new Error(`Ghost slug already exists without matching ghost_post_id: ${expectedSlug}`);
-      const draftPayload = await buildGhostPayload(article, "draft");
-      const currentUser = await ghostStep(
-        "Ghost author lookup failed",
-        () => this.ghost.readCurrentUser(),
-      );
-      if (currentUser) draftPayload.authors = [{ id: currentUser.id }];
-      post = await ghostStep("Ghost draft creation failed", () => this.ghost.createPost(draftPayload));
-      await this.store.patchArticle(article.article_id, {
-        ghost_post_id: post.id,
-        ghost_updated_at: post.updated_at,
-        ghost_draft_url: post.url,
-        updated_at: new Date().toISOString(),
-      });
+      if (collision) {
+        if (!ghostDraftMatchesPayload(collision, draftPayload)) {
+          throw new Error(`Ghost slug already exists without matching ghost_post_id: ${expectedSlug}`);
+        }
+        await this.#bindReconciledGhostDraft(article, expectedHash, collision);
+        post = collision;
+      } else {
+        const currentUser = await ghostStep(
+          "Ghost author lookup failed",
+          () => this.ghost.readCurrentUser(),
+        );
+        if (currentUser) draftPayload.authors = [{ id: currentUser.id }];
+        post = await ghostStep("Ghost draft creation failed", () => this.ghost.createPost(draftPayload));
+        await this.store.patchArticle(article.article_id, {
+          ghost_post_id: post.id,
+          ghost_updated_at: post.updated_at,
+          ghost_draft_url: post.url,
+          updated_at: new Date().toISOString(),
+        });
+      }
     }
 
     const publishPayload = await buildGhostPayload(article, "published");
@@ -433,6 +440,52 @@ export class PublicationService {
       }));
   }
 
+  async #bindReconciledGhostDraft(
+    article: Article,
+    expectedHash: string,
+    post: GhostPost,
+  ): Promise<void> {
+    const current = await this.store.findArticle(article.article_id);
+    if (
+      !current ||
+      current.status !== "publishing" ||
+      articleContentHash(current) !== expectedHash ||
+      stringCell(current.content_hash) !== expectedHash ||
+      Boolean(stringCell(current.ghost_post_id))
+    ) {
+      throw new Error("Publication claim was changed before Ghost draft reconciliation");
+    }
+    const reconciledAt = new Date().toISOString();
+    await this.store.patchArticleAndAppendEvent(
+      article.article_id,
+      {
+        ghost_post_id: post.id,
+        ghost_updated_at: post.updated_at,
+        ghost_draft_url: post.url,
+        updated_at: reconciledAt,
+      },
+      {
+        event_id: randomUUID(),
+        article_id: article.article_id,
+        event_type: "ghost_post_reconciled",
+        from_status: "publishing",
+        to_status: "publishing",
+        actor_type: "system",
+        actor_id: "publisher",
+        provider: "ghost",
+        provider_object_id: post.id,
+        message: "Reconciled an existing Ghost draft with the approved Sheet article",
+        payload_json: JSON.stringify({
+          hash: expectedHash,
+          ghost_post_id: post.id,
+          ghost_slug: post.slug,
+          ghost_updated_at: post.updated_at,
+        }),
+        created_at: reconciledAt,
+      },
+    );
+  }
+
   async #recoverPublishing(articleId: string, timeZone: string): Promise<void> {
     const article = await this.store.findArticle(articleId);
     if (!article || article.status !== "publishing") return;
@@ -452,47 +505,68 @@ export class PublicationService {
       currentHash,
     );
     const storedId = stringCell(article.ghost_post_id);
+    let workingArticle = article;
+    let ghostPost: GhostPost | undefined;
     if (!storedId) {
       const collision = await this.ghost.findPostBySlug(ghostArticleSlug(article));
       if (collision) {
-        await this.#setConflict(
-          article,
-          "ghost_slug_collision",
-          "A Ghost post exists after a stale claim but is not bound by ghost_post_id",
-          { ghost_post_id: collision.id, ghost_status: collision.status },
-        );
-        return;
+        const expectedDraft = await buildGhostPayload(article, "draft");
+        if (!ghostDraftMatchesPayload(collision, expectedDraft)) {
+          await this.#setConflict(
+            article,
+            "ghost_slug_collision",
+            "A different Ghost post exists after a stale claim and owns the expected slug",
+            { ghost_post_id: collision.id, ghost_status: collision.status },
+          );
+          return;
+        }
+        try {
+          await this.#bindReconciledGhostDraft(article, currentHash, collision);
+        } catch (error) {
+          await this.#failPublishing(article, sanitizeError(error, this.config.ghostAdminApiKey));
+          return;
+        }
+        workingArticle = {
+          ...article,
+          ghost_post_id: collision.id,
+          ghost_updated_at: collision.updated_at,
+          ghost_draft_url: collision.url,
+        } as Article;
+        ghostPost = collision;
       }
-      if (hasManualPublishIntent) {
+      if (!collision && hasManualPublishIntent) {
         await this.#publishClaimed(article, currentHash);
         return;
       }
-      assertTransition("publishing", "approved");
-      await this.store.patchArticle(article.article_id, {
-        status: "approved",
-        last_error: "Recovered stale publishing claim before Ghost create",
-        updated_at: new Date().toISOString(),
-      });
-      await this.#event(
-        article,
-        "publishing_recovered",
-        "publishing",
-        "approved",
-        "Stale claim reset for safe retry",
-      );
-      return;
+      if (!collision) {
+        assertTransition("publishing", "approved");
+        await this.store.patchArticle(article.article_id, {
+          status: "approved",
+          last_error: "Recovered stale publishing claim before Ghost create",
+          updated_at: new Date().toISOString(),
+        });
+        await this.#event(
+          article,
+          "publishing_recovered",
+          "publishing",
+          "approved",
+          "Stale claim reset for safe retry",
+        );
+        return;
+      }
+    } else {
+      ghostPost = await this.ghost.readPost(storedId);
     }
 
-    const ghostPost = await this.ghost.readPost(storedId);
     if (!ghostPost) {
-      await this.#failPublishing(article, `Stored Ghost post ${storedId} no longer exists`);
+      await this.#failPublishing(workingArticle, `Stored Ghost post ${storedId} no longer exists`);
       return;
     }
     if (ghostPost.status === "published") {
-      await this.#finalizePublished(article, ghostPost, currentHash);
+      await this.#finalizePublished(workingArticle, ghostPost, currentHash);
       return;
     }
-    const scheduledAt = parseScheduledDate(article, timeZone);
+    const scheduledAt = parseScheduledDate(workingArticle, timeZone);
     if (
       ghostPost.status === "draft" &&
       !hasManualPublishIntent &&
@@ -500,7 +574,7 @@ export class PublicationService {
       now.getTime() - scheduledAt.getTime() > publicationGraceMs(await this.store.getSettings())
     ) {
       await this.#rescheduleMissedWindow(
-        article,
+        workingArticle,
         currentHash,
         scheduledAt,
         now,
@@ -510,10 +584,10 @@ export class PublicationService {
       return;
     }
     try {
-      const published = await this.#upsertAndPublish(article, currentHash);
-      await this.#finalizePublished(article, published, currentHash);
+      const published = await this.#upsertAndPublish(workingArticle, currentHash);
+      await this.#finalizePublished(workingArticle, published, currentHash);
     } catch (error) {
-      await this.#failPublishing(article, sanitizeError(error, this.config.ghostAdminApiKey));
+      await this.#failPublishing(workingArticle, sanitizeError(error, this.config.ghostAdminApiKey));
     }
   }
 
@@ -770,6 +844,34 @@ async function ghostStep<T>(label: string, operation: () => Promise<T>): Promise
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`${label}: ${detail}`, { cause: error });
   }
+}
+
+function ghostDraftMatchesPayload(post: GhostPost, expected: GhostPostInput): boolean {
+  if (post.status !== "draft") return false;
+  if (
+    post.title !== expected.title ||
+    post.slug !== expected.slug ||
+    normalizeGhostHtml(post.html) !== normalizeGhostHtml(expected.html) ||
+    stringCell(post.custom_excerpt ?? "") !== stringCell(expected.custom_excerpt ?? "") ||
+    stringCell(post.meta_title ?? "") !== stringCell(expected.meta_title ?? "") ||
+    stringCell(post.meta_description ?? "") !== stringCell(expected.meta_description ?? "") ||
+    stringCell(post.feature_image ?? "") !== stringCell(expected.feature_image ?? "") ||
+    stringCell(post.feature_image_alt ?? "") !== stringCell(expected.feature_image_alt ?? "")
+  ) {
+    return false;
+  }
+  const actualTags = (post.tags ?? []).map((tag) => tag.name.trim()).filter(Boolean).sort();
+  const expectedTags = expected.tags.map((tag) => tag.name.trim()).filter(Boolean).sort();
+  return JSON.stringify(actualTags) === JSON.stringify(expectedTags);
+}
+
+function normalizeGhostHtml(value: string | null | undefined): string {
+  return String(value ?? "")
+    .replace(/<!--\s*kg-card-(?:begin|end):\s*html\s*-->/giu, "")
+    .replace(/(<h[1-6])\s+id="[^"]*"/giu, "$1")
+    .replace(/\r\n?/gu, "\n")
+    .replace(/>\s+</gu, "><")
+    .trim();
 }
 
 function assertHeroImageReady(article: Article): void {

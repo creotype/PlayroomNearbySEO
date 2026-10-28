@@ -4,6 +4,7 @@ import type { AppConfig } from "../src/config.js";
 import type { Article, SheetRecord } from "../src/domain/article.js";
 import { articleContentHash } from "../src/domain/article.js";
 import type { GhostAdminClient } from "../src/ghost/client.js";
+import { buildGhostPayload } from "../src/ghost/payload.js";
 import { KeyedMutex } from "../src/lib/keyed-mutex.js";
 import type { GoogleSheetsStore } from "../src/sheets/google-sheets.js";
 import { ApprovalService, type TelegramActor } from "../src/services/approval-service.js";
@@ -1352,7 +1353,182 @@ describe("PublicationService.publishNow", () => {
     });
   });
 
-  it("fails closed when a failed unbound row collides with an existing Ghost slug", async () => {
+  it("rebinds and publishes an unbound Ghost draft only when every publishable field matches", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "failed_publish",
+      ghost_post_id: "",
+      last_error: "Sheet binding was lost after Ghost draft creation",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const expectedDraft = await buildGhostPayload(current, "draft");
+    const collision = {
+      ...draftPost(current),
+      ...expectedDraft,
+      html: `<!--kg-card-begin: html-->${expectedDraft.html
+        .replace("<h2>", '<h2 id="vodic">')
+        .replace(/>\s+</gu, "><")}<!--kg-card-end: html-->`,
+      id: "ghost-existing-exact-match",
+      status: "draft" as const,
+      updated_at: "2026-09-16T13:01:00.000Z",
+      url: "https://example.com/internal/ghost-existing-exact-match/",
+    };
+    const createPost = vi.fn();
+    const updatePost = vi.fn(async (_id: string, _input: Record<string, unknown>) => ({
+      ...collision,
+      status: "published" as const,
+      updated_at: "2026-09-16T13:02:00.000Z",
+      published_at: "2026-09-16T13:02:00.000Z",
+    }));
+    const ghost = {
+      findPostBySlug: vi.fn(async () => collision),
+      createPost,
+      updatePost,
+    } as unknown as GhostAdminClient;
+    const publicUrl = "https://example.com/rs/blog/kako-izabrati-igraonicu";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(`<link rel="canonical" href="${publicUrl}">`, { status: 200 }),
+      ),
+    );
+
+    try {
+      const result = await new PublicationService(
+        store,
+        ghost,
+        config,
+        logger,
+        new KeyedMutex(),
+      ).publishNow(current.article_id, { ...actor, providerObjectId: "message:-100:13-exact" });
+
+      expect(result).toMatchObject({
+        outcome: "published",
+        article: {
+          status: "published",
+          ghost_post_id: "ghost-existing-exact-match",
+        },
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(createPost).not.toHaveBeenCalled();
+    expect(updatePost).toHaveBeenCalledOnce();
+    expect(updatePost.mock.calls[0]?.[0]).toBe("ghost-existing-exact-match");
+    expect(events.some((event) => event.event_type === "ghost_post_reconciled")).toBe(true);
+  });
+
+  it("does not overwrite a concurrent Ghost binding added during reconciliation", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "failed_publish",
+      ghost_post_id: "",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const expectedDraft = await buildGhostPayload(current, "draft");
+    const collision = {
+      ...draftPost(current),
+      ...expectedDraft,
+      id: "ghost-collision-found-first",
+      status: "draft" as const,
+    };
+    const updatePost = vi.fn();
+    const ghost = {
+      findPostBySlug: vi.fn(async () => {
+        current = { ...current, ghost_post_id: "ghost-bound-by-admin" } as Article;
+        return collision;
+      }),
+      updatePost,
+    } as unknown as GhostAdminClient;
+
+    const result = await new PublicationService(
+      store,
+      ghost,
+      config,
+      logger,
+      new KeyedMutex(),
+    ).publishNow(current.article_id, { ...actor, providerObjectId: "message:-100:binding-race" });
+
+    expect(result).toMatchObject({
+      outcome: "failed",
+      article: { status: "failed_publish", ghost_post_id: "ghost-bound-by-admin" },
+    });
+    expect(updatePost).not.toHaveBeenCalled();
+    expect(events.some((event) => event.event_type === "ghost_post_reconciled")).toBe(false);
+  });
+
+  it("never adopts an already published Ghost post even when its payload matches", async () => {
+    let current = { ...approvedArticle(), status: "failed_publish", ghost_post_id: "" } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const expectedDraft = await buildGhostPayload(current, "draft");
+    const updatePost = vi.fn();
+    const ghost = {
+      findPostBySlug: vi.fn(async () => ({
+        ...draftPost(current),
+        ...expectedDraft,
+        id: "ghost-already-published",
+        status: "published" as const,
+      })),
+      updatePost,
+    } as unknown as GhostAdminClient;
+
+    const result = await new PublicationService(
+      mutablePublicationStore(() => current, (next) => { current = next; }, events),
+      ghost,
+      config,
+      logger,
+      new KeyedMutex(),
+    ).publishNow(current.article_id, { ...actor, providerObjectId: "message:-100:published-collision" });
+
+    expect(result).toMatchObject({ outcome: "failed", article: { status: "failed_publish" } });
+    expect(updatePost).not.toHaveBeenCalled();
+    expect(events.some((event) => event.event_type === "ghost_post_reconciled")).toBe(false);
+  });
+
+  it.each([
+    ["meta description", { meta_description: "Different metadata" }],
+    ["feature image", { feature_image: "https://example.com/different.webp" }],
+    ["tags", { tags: [{ name: "different-tag" }] }],
+  ])("rejects a Ghost draft with mismatching %s", async (_field, mismatch) => {
+    let current = { ...approvedArticle(), status: "failed_publish", ghost_post_id: "" } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [approvalEvent(current)];
+    const expectedDraft = await buildGhostPayload(current, "draft");
+    const updatePost = vi.fn();
+    const ghost = {
+      findPostBySlug: vi.fn(async () => ({
+        ...draftPost(current),
+        ...expectedDraft,
+        ...mismatch,
+        id: "ghost-mismatched-draft",
+        status: "draft" as const,
+      })),
+      updatePost,
+    } as unknown as GhostAdminClient;
+
+    const result = await new PublicationService(
+      mutablePublicationStore(() => current, (next) => { current = next; }, events),
+      ghost,
+      config,
+      logger,
+      new KeyedMutex(),
+    ).publishNow(current.article_id, {
+      ...actor,
+      providerObjectId: `message:-100:mismatch-${String(_field)}`,
+    });
+
+    expect(result).toMatchObject({ outcome: "failed", article: { status: "failed_publish" } });
+    expect(updatePost).not.toHaveBeenCalled();
+    expect(events.some((event) => event.event_type === "ghost_post_reconciled")).toBe(false);
+  });
+
+  it("fails closed when an unbound row collides with a different Ghost post", async () => {
     let current = {
       ...approvedArticle(),
       status: "failed_publish",
@@ -1364,8 +1540,14 @@ describe("PublicationService.publishNow", () => {
     const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
     const createPost = vi.fn();
     const updatePost = vi.fn();
+    const expectedDraft = await buildGhostPayload(current, "draft");
     const ghost = {
-      findPostBySlug: vi.fn(async () => draftPost(current)),
+      findPostBySlug: vi.fn(async () => ({
+        ...draftPost(current),
+        ...expectedDraft,
+        title: "Unrelated post that already owns this slug",
+        html: "<p>Different content</p>",
+      })),
       createPost,
       updatePost,
     } as unknown as GhostAdminClient;
@@ -1588,6 +1770,81 @@ describe("PublicationService.publishNow", () => {
     expect(current.scheduled_publish_at).toBe("2026-09-17T08:00:00.000Z");
     expect(events.some((event) => event.event_type === "publishing_recovered")).toBe(false);
     expect(events.some((event) => event.event_type === "publication_rescheduled")).toBe(false);
+  });
+
+  it("reconciles an exact Ghost draft while recovering a stale publishing claim", async () => {
+    let current = {
+      ...approvedArticle(),
+      status: "publishing",
+      ghost_post_id: "",
+      updated_at: "2026-09-16T08:00:00.000Z",
+    } as Article;
+    current.content_hash = articleContentHash(current);
+    const events: SheetRecord[] = [
+      approvalEvent(current),
+      {
+        __rowNumber: 3,
+        event_id: "manual-request-reconcile",
+        article_id: current.article_id,
+        event_type: "manual_publish_requested",
+        from_status: "approved",
+        to_status: "publishing",
+        actor_type: "telegram_user",
+        actor_id: "42",
+        provider: "telegram",
+        provider_object_id: "telegram:message:-100:reconcile",
+        payload_json: JSON.stringify({ hash: articleContentHash(current) }),
+      },
+    ];
+    const expectedDraft = await buildGhostPayload(current, "draft");
+    const collision = {
+      ...draftPost(current),
+      ...expectedDraft,
+      id: "ghost-stale-exact-match",
+      status: "draft" as const,
+      updated_at: "2026-09-16T12:55:00.000Z",
+    };
+    const store = mutablePublicationStore(() => current, (next) => { current = next; }, events);
+    const createPost = vi.fn();
+    const ghost = {
+      findPostBySlug: vi.fn(async () => collision),
+      createPost,
+      readPost: vi.fn(async () => collision),
+      updatePost: vi.fn(async () => ({
+        ...collision,
+        status: "published" as const,
+        updated_at: "2026-09-16T13:01:00.000Z",
+        published_at: "2026-09-16T13:01:00.000Z",
+      })),
+    } as unknown as GhostAdminClient;
+    const publicUrl = "https://example.com/rs/blog/kako-izabrati-igraonicu";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(`<link rel="canonical" href="${publicUrl}">`, { status: 200 }),
+      ),
+    );
+
+    try {
+      await new PublicationService(
+        store,
+        ghost,
+        config,
+        logger,
+        new KeyedMutex(),
+        () => new Date("2026-09-16T13:00:00.000Z"),
+      ).runOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(current).toMatchObject({
+      status: "published",
+      ghost_post_id: "ghost-stale-exact-match",
+    });
+    expect(createPost).not.toHaveBeenCalled();
+    expect(events.some((event) => event.event_type === "ghost_post_reconciled")).toBe(true);
+    expect(events.some((event) => event.event_type === "published")).toBe(true);
   });
 });
 
